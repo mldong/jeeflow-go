@@ -1,0 +1,227 @@
+package memory
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	"github.com/mldong/jeeflow-go/model"
+)
+
+type Repository struct {
+	mu        sync.RWMutex
+	defines   map[int64]*model.ProcessDefine
+	instances map[int64]*model.ProcessInstance
+	tasks     map[int64]*model.ProcessTask
+	actors    map[int64][]string
+	nextID    atomic.Int64
+}
+
+func New() *Repository {
+	r := &Repository{
+		defines:   make(map[int64]*model.ProcessDefine),
+		instances: make(map[int64]*model.ProcessInstance),
+		tasks:     make(map[int64]*model.ProcessTask),
+		actors:    make(map[int64][]string),
+	}
+	r.nextID.Store(1)
+	return r
+}
+
+func (r *Repository) AddDefine(def *model.ProcessDefine) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if def.ID == 0 { def.ID = r.nextID.Add(1) }
+	r.defines[def.ID] = def
+}
+
+func (r *Repository) FindDefineByID(id int64) (*model.ProcessDefine, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	d, ok := r.defines[id]
+	if !ok { return nil, nil }
+	cp := *d
+	return &cp, nil
+}
+
+func (r *Repository) FindInstanceByID(id int64) (*model.ProcessInstance, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	inst, ok := r.instances[id]
+	if !ok { return nil, nil }
+	cp := *inst
+	for _, t := range r.tasks {
+		if t.ProcessInstanceID == id {
+			tc := *t
+			tc.ActorIDs = r.actors[t.ID]
+			cp.Tasks = append(cp.Tasks, &tc)
+		}
+	}
+	return &cp, nil
+}
+
+func (r *Repository) SaveInstance(inst *model.ProcessInstance) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if inst.ID == 0 { inst.ID = r.nextID.Add(1) }
+	cp := *inst
+	cp.Tasks = nil
+	r.instances[inst.ID] = &cp
+	return nil
+}
+
+func (r *Repository) UpdateInstance(inst *model.ProcessInstance) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cp := *inst
+	cp.Tasks = nil
+	r.instances[inst.ID] = &cp
+	return nil
+}
+
+func (r *Repository) FindTaskByID(taskID int64) (*model.ProcessTask, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	t, ok := r.tasks[taskID]
+	if !ok { return nil, nil }
+	cp := *t
+	cp.ActorIDs = r.actors[taskID]
+	return &cp, nil
+}
+
+func (r *Repository) SaveTask(task *model.ProcessTask) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if task.ID == 0 { task.ID = r.nextID.Add(1) }
+	cp := *task
+	cp.ActorIDs = nil
+	r.tasks[task.ID] = &cp
+	if len(task.ActorIDs) > 0 {
+		r.actors[task.ID] = append([]string{}, task.ActorIDs...)
+	}
+	return nil
+}
+
+func (r *Repository) UpdateTask(task *model.ProcessTask) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cp := *task
+	cp.ActorIDs = nil
+	r.tasks[task.ID] = &cp
+	if len(task.ActorIDs) > 0 {
+		r.actors[task.ID] = append([]string{}, task.ActorIDs...)
+	}
+	return nil
+}
+
+func (r *Repository) FindDoingTasks(instanceID int64, taskNames []string) ([]*model.ProcessTask, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var result []*model.ProcessTask
+	for _, t := range r.tasks {
+		if t.ProcessInstanceID == instanceID && t.TaskState == model.TaskStateDoing {
+			if len(taskNames) > 0 {
+				found := false
+				for _, n := range taskNames {
+					if t.TaskName == n { found = true; break }
+				}
+				if !found { continue }
+			}
+			cp := *t
+			cp.ActorIDs = r.actors[t.ID]
+			result = append(result, &cp)
+		}
+	}
+	return result, nil
+}
+
+func (r *Repository) FindDoneTasks(instanceID int64, taskNames []string) ([]*model.ProcessTask, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var result []*model.ProcessTask
+	for _, t := range r.tasks {
+		if t.ProcessInstanceID == instanceID && t.TaskState == model.TaskStateDone {
+			cp := *t
+			cp.ActorIDs = r.actors[t.ID]
+			result = append(result, &cp)
+		}
+	}
+	return result, nil
+}
+
+func (r *Repository) FindHistoryTasks(instanceID int64) ([]*model.ProcessTask, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var result []*model.ProcessTask
+	for _, t := range r.tasks {
+		if t.ProcessInstanceID == instanceID {
+			cp := *t
+			cp.ActorIDs = r.actors[t.ID]
+			result = append(result, &cp)
+		}
+	}
+	return result, nil
+}
+
+func (r *Repository) FindTaskActors(taskID int64) ([]string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]string{}, r.actors[taskID]...), nil
+}
+
+func (r *Repository) AddTaskActor(taskID int64, actors []string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	existing := r.actors[taskID]
+	seen := make(map[string]bool)
+	for _, a := range existing { seen[a] = true }
+	for _, a := range actors {
+		if !seen[a] { existing = append(existing, a); seen[a] = true }
+	}
+	r.actors[taskID] = existing
+	return nil
+}
+
+func (r *Repository) RemoveTaskActor(taskID int64, actors []string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	remove := make(map[string]bool)
+	for _, a := range actors { remove[a] = true }
+	var kept []string
+	for _, a := range r.actors[taskID] {
+		if !remove[a] { kept = append(kept, a) }
+	}
+	r.actors[taskID] = kept
+	return nil
+}
+
+func (r *Repository) CreateCcInstance(instanceID int64, creator string, actorIDs ...string) error {
+	return fmt.Errorf("not implemented")
+}
+
+func (r *Repository) UpdateCcStatus(instanceID int64, actorID string) error {
+	return fmt.Errorf("not implemented")
+}
+
+// ─── Demo helpers ──────────────────────────────────────────────────────────────
+
+func (r *Repository) AllDefines() []*model.ProcessDefine {
+	r.mu.RLock(); defer r.mu.RUnlock()
+	var result []*model.ProcessDefine
+	for _, d := range r.defines { cp := *d; result = append(result, &cp) }
+	return result
+}
+
+func (r *Repository) AllInstances() []*model.ProcessInstance {
+	r.mu.RLock(); defer r.mu.RUnlock()
+	var result []*model.ProcessInstance
+	for _, inst := range r.instances { cp := *inst; result = append(result, &cp) }
+	return result
+}
+
+func (r *Repository) AllTasks() []*model.ProcessTask {
+	r.mu.RLock(); defer r.mu.RUnlock()
+	var result []*model.ProcessTask
+	for _, t := range r.tasks { cp := *t; cp.ActorIDs = r.actors[t.ID]; result = append(result, &cp) }
+	return result
+}

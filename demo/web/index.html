@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>jeeflow · Go 演示</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font:14px/1.6 system-ui,sans-serif;background:#f0f2f5;color:#333}
+header{background:#1677ff;color:#fff;padding:12px 24px;display:flex;align-items:center;gap:24px}
+header h1{font-size:18px;font-weight:600}
+main{max-width:960px;margin:24px auto;padding:0 16px}
+.card{background:#fff;border-radius:8px;padding:20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.card h3{margin-bottom:12px;font-size:15px}
+.stats{display:flex;gap:16px}
+.stat{flex:1;text-align:center;padding:16px;background:#f7f8fa;border-radius:8px}
+.stat .num{font-size:28px;font-weight:700;color:#1677ff}
+.stat .label{font-size:12px;color:#888;margin-top:4px}
+table{width:100%;border-collapse:collapse}
+th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #f0f0f0;font-size:13px}
+th{background:#fafafa;font-weight:600}
+.btn{padding:6px 16px;border:none;border-radius:4px;cursor:pointer;font-size:13px}
+.btn-primary{background:#1677ff;color:#fff}
+.btn-danger{background:#ff4d4f;color:#fff}
+.btn-sm{padding:2px 8px;font-size:12px}
+input,select{padding:6px 10px;border:1px solid #d9d9d9;border-radius:4px;font-size:13px;width:100%}
+.badge{display:inline-block;padding:0 6px;border-radius:4px;font-size:11px;line-height:20px}
+.badge-doing{background:#e6f7ff;color:#1677ff}
+.badge-done{background:#f6ffed;color:#52c41a}
+.badge-reject{background:#fff2f0;color:#ff4d4f}
+.flex-row{display:flex;gap:8px;align-items:center}
+.tab-bar{display:flex;gap:0;margin-left:12px}
+.tab-btn{padding:2px 12px;border:1px solid #d9d9d9;background:#fafafa;color:#666;cursor:pointer;font-size:12px;transition:all .2s}
+.tab-btn:first-child{border-radius:4px 0 0 4px}
+.tab-btn:last-child{border-radius:0 4px 4px 0}
+.tab-btn:not(:first-child){margin-left:-1px}
+.tab-btn:hover{color:#1677ff;background:#e6f7ff}
+.tab-btn.active{background:#1677ff;color:#fff;border-color:#1677ff;position:relative;z-index:1}
+.toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);padding:12px 24px;border-radius:6px;color:#fff;font-size:14px;z-index:200;display:none;max-width:400px;text-align:center}
+.toast.error{background:#ff4d4f}
+.toast.success{background:#52c41a}
+.toast.show{display:block}
+</style>
+</head>
+<body>
+<header><h1>🧊 jeeflow · Go</h1></header>
+<main id="app">
+  <div class="stats">
+    <div class="stat"><div class="num" id="todoCount">-</div><div class="label">我的待办</div></div>
+    <div class="stat"><div class="num" id="instCount">-</div><div class="label">我发起的流程</div></div>
+  </div>
+  <div class="card">
+    <h3>🚀 发起流程 <span style="font-size:12px;color:#888;font-weight:400" id="userLabel">（当前用户: 组长）</span></h3>
+    <div class="flex-row gap8">
+      <select id="defineSelect" style="flex:1"><option value="">-- 选择流程定义 --</option></select>
+      <input id="amountInput" placeholder="金额(报销流程)" style="width:120px">
+      <button class="btn btn-primary" onclick="startFlow()">发起</button>
+    </div>
+  </div>
+  <div class="card">
+    <h3>📋 我的待办 <span class="tab-bar" id="userTabs">
+      <button class="tab-btn" data-user="leader">组长</button>
+      <button class="tab-btn" data-user="manager">经理</button>
+      <button class="tab-btn" data-user="boss">老板</button>
+      <button class="tab-btn" data-user="director">总监</button>
+    </span></h3>
+    <table id="todoTable"><thead><tr><th>流程</th><th>任务</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card">
+    <h3>📝 我发起的流程</h3>
+    <table id="instTable"><thead><tr><th>ID</th><th>流程</th><th>状态</th><th>时间</th></tr></thead><tbody></tbody></table>
+  </div>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+var userNames={leader:'组长',manager:'经理',boss:'老板',director:'总监'};
+let currentUser = sessionStorage.getItem('jeeflow_user') || 'leader';
+
+async function api(url, body) {
+  let opts = {headers:{'Content-Type':'application/json'}};
+  if(body) { opts.method='POST'; opts.body=JSON.stringify(body); }
+  let r = await fetch(url, opts);
+  return r.json();
+}
+async function loadStats() {
+  let d = await api('/api/stats?userId=' + currentUser);
+  document.getElementById('todoCount').textContent = d.data.todoCount;
+  document.getElementById('instCount').textContent = d.data.myInstanceCount;
+}
+async function loadDefines() {
+  let r = await api('/wf/processDefine/page', {});
+  let rows = r.data.rows || [];
+  let sel = document.getElementById('defineSelect');
+  sel.innerHTML = '<option value="">-- 选择流程定义 --</option>';
+  rows.forEach(d => { sel.innerHTML += '<option value="'+d.id+'">'+d.displayName+'</option>'; });
+}
+async function loadTodo() {
+  let r = await api('/wf/processTask/todoList', {userId:currentUser});
+  let rows = r.data.rows || [];
+  let tbody = document.querySelector('#todoTable tbody');
+  tbody.innerHTML = rows.map(t => '<tr><td>'+h(t.processDefineDisplayName)+'</td><td>'+h(t.displayName)+'</td><td><span class="badge badge-doing">待处理</span></td><td>'+h(t.createTime)+'</td><td><div class="flex-row"><button class="btn btn-primary btn-sm" onclick="approve(\''+t.id+'\')">同意</button><button class="btn btn-danger btn-sm" onclick="reject(\''+t.id+'\')">拒绝</button></div></td></tr>').join('');
+  if(!rows.length) tbody.innerHTML = '<tr><td colspan="5" style="color:#aaa;text-align:center">暂无待办</td></tr>';
+}
+async function loadInstances() {
+  let r = await api('/wf/processInstance/page', {operator:currentUser});
+  let rows = r.data.rows || [];
+  let tbody = document.querySelector('#instTable tbody');
+  tbody.innerHTML = rows.map(i => {
+    let badge = i.state==10 ? '<span class="badge badge-doing">进行中</span>' :
+                i.state==20 ? '<span class="badge badge-done">已完成</span>' :
+                i.state==45 ? '<span class="badge badge-reject">已拒绝</span>' : i.state;
+    return '<tr><td>'+i.id+'</td><td>'+h(i.processDefineDisplayName)+'</td><td>'+badge+'</td><td>'+h(i.createTime)+'</td></tr>';
+  }).join('');
+  if(!rows.length) tbody.innerHTML = '<tr><td colspan="4" style="color:#aaa;text-align:center">暂无</td></tr>';
+}
+async function startFlow() {
+  let defId = document.getElementById('defineSelect').value;
+  if(!defId) return toast('请选择流程定义','error');
+  let body = {processDefineId:defId, operator:currentUser};
+  let amt = document.getElementById('amountInput').value;
+  if(amt) body.amount = amt;
+  let r = await api('/wf/processInstance/startAndExecute', body);
+  if(r.code===200) { toast('发起成功','success'); setTimeout(()=>location.reload(),500); }
+  else toast(r.message||'发起失败','error');
+}
+async function approve(taskId) { await doTask(taskId, 1); }
+async function reject(taskId) { await doTask(taskId, 2); }
+async function doTask(taskId, submitType) {
+  let r = await api('/wf/processTask/execute', {processTaskId:taskId, submitType:submitType, operator:currentUser});
+  if(r.code===200) { toast('处理成功','success'); setTimeout(()=>location.reload(),500); }
+  else toast(r.message||'处理失败','error');
+}
+function switchUser(u) { currentUser = u; sessionStorage.setItem('jeeflow_user', u); document.getElementById('userLabel').textContent = '（当前用户: ' + (userNames[u]||u) + '）'; updateActiveTab(); loadAll(); }
+function toast(msg, type) {
+  let t = document.getElementById('toast');
+  t.textContent = msg; t.className = 'toast ' + (type||'error') + ' show';
+  clearTimeout(t._tid); t._tid = setTimeout(() => t.classList.remove('show'), 3000);
+}
+function updateActiveTab() {
+  document.querySelectorAll('#userTabs .tab-btn').forEach(b => b.classList.toggle('active', b.dataset.user === currentUser));
+}
+function h(v) { return v || ''; }
+function loadAll() { loadStats(); loadDefines(); loadTodo(); loadInstances(); }
+document.querySelectorAll('#userTabs .tab-btn').forEach(b => b.addEventListener('click', () => switchUser(b.dataset.user)));
+document.getElementById('userLabel').textContent = '（当前用户: ' + (userNames[currentUser]||currentUser) + '）';
+updateActiveTab(); loadAll();
+</script>
+</body>
+</html>
