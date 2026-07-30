@@ -16,6 +16,7 @@ type EngineImpl struct {
 	idGen    spi.IDGenerator
 	exprEval spi.ExpressionEvaluator
 	ext      *Extensions
+	registry *HandlerRegistry
 }
 
 func New(repo spi.ProcessRepository, userProv spi.UserProvider, idGen spi.IDGenerator, exprEval spi.ExpressionEvaluator) *EngineImpl {
@@ -250,7 +251,28 @@ func (e *EngineImpl) executeNode(flow *model.FlowModel, inst *model.ProcessInsta
 }
 
 func (e *EngineImpl) evaluateDecision(flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}) error {
-	// 自定义决策处理器（优先级最高）
+	// 自定义决策处理器（Registry 优先）
+	if e.registry != nil {
+		handlerName, _ := node.Properties["decisionHandler"].(string)
+		if handlerName == "" {
+			handlerName, _ = node.Properties["assignmentHandler"].(string)
+		}
+		if handlerName != "" {
+			if h := e.registry.ResolveDecision(handlerName); h != nil {
+				branchID := h.Decide(node, inst, vars)
+				if branchID != "" {
+					for _, edge := range flow.Edges {
+						if edge.ID == branchID {
+							if target := findNode(flow, edge.TargetNodeID); target != nil {
+								return e.executeNode(flow, inst, target, operator, vars)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	// 自定义决策处理器（Extensions 兼容）
 	if e.ext != nil && e.ext.DecisionHandler != nil {
 		handlerName, _ := node.Properties["decisionHandler"].(string)
 		branchID := e.ext.DecisionHandler(handlerName, node, inst, vars)
@@ -339,7 +361,16 @@ func (e *EngineImpl) newTask(node *model.FlowNode, inst *model.ProcessInstance, 
 }
 
 func (e *EngineImpl) resolveActors(node *model.FlowNode) []string {
-	// 1. 动态指派（优先级最高）
+	// 1a. Registry 按名称解析（推荐，对标 Spring IoC）
+	if e.registry != nil {
+		handlerName, _ := node.Properties["assignmentHandler"].(string)
+		if handlerName != "" {
+			if h := e.registry.ResolveAssignment(handlerName); h != nil {
+				return h.Assign(node, nil)
+			}
+		}
+	}
+	// 1b. Extensions 兼容模式（旧 API）
 	if e.ext != nil && e.ext.AssignmentHandler != nil {
 		handlerName, _ := node.Properties["assignmentHandler"].(string)
 		if actors := e.ext.AssignmentHandler(handlerName, node, nil); len(actors) > 0 {
