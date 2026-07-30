@@ -252,7 +252,8 @@ func (e *EngineImpl) executeNode(flow *model.FlowModel, inst *model.ProcessInsta
 func (e *EngineImpl) evaluateDecision(flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}) error {
 	// 自定义决策处理器（优先级最高）
 	if e.ext != nil && e.ext.DecisionHandler != nil {
-		branchID := e.ext.DecisionHandler(node, inst, vars)
+		handlerName, _ := node.Properties["decisionHandler"].(string)
+		branchID := e.ext.DecisionHandler(handlerName, node, inst, vars)
 		if branchID != "" {
 			for _, edge := range flow.Edges {
 				if edge.ID == branchID {
@@ -340,7 +341,8 @@ func (e *EngineImpl) newTask(node *model.FlowNode, inst *model.ProcessInstance, 
 func (e *EngineImpl) resolveActors(node *model.FlowNode) []string {
 	// 1. 动态指派（优先级最高）
 	if e.ext != nil && e.ext.AssignmentHandler != nil {
-		if actors := e.ext.AssignmentHandler(node, nil); len(actors) > 0 {
+		handlerName, _ := node.Properties["assignmentHandler"].(string)
+		if actors := e.ext.AssignmentHandler(handlerName, node, nil); len(actors) > 0 {
 			return actors
 		}
 	}
