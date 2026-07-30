@@ -197,3 +197,50 @@ func Test09ActorNotAllowed(t *testing.T) {
 	if err == nil { t.Fatal("expected permission error") }
 	_ = inst
 }
+
+func Test10InterceptorAndEvents(t *testing.T) {
+	eng, repo := setup()
+	def := registerFlow(repo, "01-simple.json")
+
+	var preCalled, postCalled bool
+	var events []string
+
+	eng.SetExtensions(&engine.Extensions{
+		Interceptors: []engine.FlowInterceptor{
+			&testInterceptor{pre: func(node *model.FlowNode, inst *model.ProcessInstance) bool {
+				preCalled = true
+				return true
+			}, post: func(node *model.FlowNode, inst *model.ProcessInstance) {
+				postCalled = true
+			}, order: 1},
+		},
+		Listeners: []engine.ProcessEventListener{
+			func(evt engine.ProcessEvent) {
+				switch evt.Type {
+				case engine.EventProcessStart: events = append(events, "start")
+				case engine.EventTaskComplete: events = append(events, "taskDone")
+				case engine.EventProcessFinish: events = append(events, "finish")
+				}
+			},
+		},
+	})
+
+	inst, _ := eng.StartProcessInstanceByID(def.ID, "applicant", nil)
+	doing, _ := repo.FindDoingTasks(inst.ID, nil)
+	repo.AddTaskActor(doing[0].ID, []string{"applicant"})
+	doing[0].ActorIDs = append(doing[0].ActorIDs, "applicant")
+	eng.ExecuteProcessTask(doing[0].ID, "applicant", nil)
+
+	if !preCalled { t.Error("preHandle not called") }
+	if !postCalled { t.Error("postHandle not called") }
+	if len(events) != 3 { t.Errorf("expected 3 events, got %d: %v", len(events), events) }
+}
+
+type testInterceptor struct {
+	pre     func(node *model.FlowNode, inst *model.ProcessInstance) bool
+	post    func(node *model.FlowNode, inst *model.ProcessInstance)
+	order int
+}
+func (ic *testInterceptor) PreHandle(node *model.FlowNode, inst *model.ProcessInstance) bool { return ic.pre(node, inst) }
+func (ic *testInterceptor) PostHandle(node *model.FlowNode, inst *model.ProcessInstance) { ic.post(node, inst) }
+func (ic *testInterceptor) Order() int { return ic.order }

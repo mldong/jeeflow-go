@@ -80,6 +80,7 @@ func (e *EngineImpl) ExecuteProcessTask(taskID int64, operator string, args map[
 	task.UpdateUser = operator
 	task.Variables = vars
 	e.repo.UpdateTask(task)
+	e.fireEvent(ProcessEvent{Type: EventTaskComplete, InstanceID: inst.ID, TaskID: task.ID, NodeID: task.TaskName, Operator: operator})
 
 	var flow model.FlowModel
 	def, _ := e.repo.FindDefineByID(inst.DefineID)
@@ -120,11 +121,12 @@ func (e *EngineImpl) ExecuteProcessTask(taskID int64, operator string, args map[
 			}
 		}
 		for _, node := range followEdges(&flow, curNode.ID) {
-			if node.Type == model.TypeEnd {
-				inst.State = model.InstanceStateDone
-				inst.UpdateTime = time.Now()
-				inst.Variables = vars
-				e.repo.UpdateInstance(inst)
+				if node.Type == model.TypeEnd {
+					inst.State = model.InstanceStateDone
+					inst.UpdateTime = time.Now()
+					inst.Variables = vars
+					e.repo.UpdateInstance(inst)
+					e.fireEvent(ProcessEvent{Type: EventProcessFinish, InstanceID: inst.ID, Operator: operator})
 			} else {
 				e.executeNode(&flow, inst, node, operator, vars)
 			}
