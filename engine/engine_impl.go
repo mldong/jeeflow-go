@@ -15,6 +15,7 @@ type EngineImpl struct {
 	userProv spi.UserProvider
 	idGen    spi.IDGenerator
 	exprEval spi.ExpressionEvaluator
+	ext      *Extensions
 }
 
 func New(repo spi.ProcessRepository, userProv spi.UserProvider, idGen spi.IDGenerator, exprEval spi.ExpressionEvaluator) *EngineImpl {
@@ -45,6 +46,7 @@ func (e *EngineImpl) StartProcessInstanceByID(defineID int64, operator string, a
 		inst.BusinessNo = fmt.Sprint(v)
 	}
 	e.repo.SaveInstance(inst)
+	e.fireEvent(ProcessEvent{Type: EventProcessStart, InstanceID: inst.ID, Operator: operator})
 
 	startNode := findNodeByType(&flow, model.TypeStart)
 	if startNode == nil {
@@ -154,6 +156,7 @@ func (e *EngineImpl) ExecuteAndJumpToEnd(taskID int64, operator string, args map
 	inst.State = model.InstanceStateReject
 	inst.UpdateTime = now
 	e.repo.UpdateInstance(inst)
+	e.fireEvent(ProcessEvent{Type: EventProcessReject, InstanceID: inst.ID, TaskID: taskID, Operator: operator})
 	return inst, nil
 }
 
@@ -212,6 +215,9 @@ func (e *EngineImpl) loadAndCheck(taskID int64, operator string) (*model.Process
 }
 
 func (e *EngineImpl) executeNode(flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}) error {
+	if !e.firePreInterceptors(node, inst) { return nil }
+	defer e.firePostInterceptors(node, inst)
+
 	switch node.Type {
 	case model.TypeTask, model.TypeCustom:
 		return e.createTask(node, inst, operator, vars)
@@ -235,12 +241,27 @@ func (e *EngineImpl) executeNode(flow *model.FlowModel, inst *model.ProcessInsta
 		inst.UpdateTime = time.Now()
 		inst.Variables = vars
 		e.repo.UpdateInstance(inst)
+		e.fireEvent(ProcessEvent{Type: EventProcessFinish, InstanceID: inst.ID, Operator: operator})
 		return nil
 	}
 	return nil
 }
 
 func (e *EngineImpl) evaluateDecision(flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}) error {
+	// 自定义决策处理器（优先级最高）
+	if e.ext != nil && e.ext.DecisionHandler != nil {
+		branchID := e.ext.DecisionHandler(node, inst, vars)
+		if branchID != "" {
+			for _, edge := range flow.Edges {
+				if edge.ID == branchID {
+					if target := findNode(flow, edge.TargetNodeID); target != nil {
+						return e.executeNode(flow, inst, target, operator, vars)
+					}
+				}
+			}
+		}
+	}
+	// 表达式决策
 	for _, edge := range flow.Edges {
 		if edge.SourceNodeID != node.ID {
 			continue
@@ -315,6 +336,13 @@ func (e *EngineImpl) newTask(node *model.FlowNode, inst *model.ProcessInstance, 
 }
 
 func (e *EngineImpl) resolveActors(node *model.FlowNode) []string {
+	// 1. 动态指派（优先级最高）
+	if e.ext != nil && e.ext.AssignmentHandler != nil {
+		if actors := e.ext.AssignmentHandler(node, nil); len(actors) > 0 {
+			return actors
+		}
+	}
+	// 2. 固定指派 assignee
 	if v, ok := node.Properties["assignee"].(string); ok && v != "" {
 		var actors []string
 		for _, p := range strings.Split(v, ",") {
