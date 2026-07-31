@@ -180,6 +180,39 @@ func (e *EngineImpl) ExecuteAndJumpTask(taskID int64, operator string, args map[
 	return inst, nil
 }
 
+// ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）──────────────
+
+func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	task, inst, err := e.loadAndCheck(taskID, operator)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	// 聚合根：废弃所有进行中任务
+	for _, t := range inst.AbandonAllDoing(now) {
+		e.repo.UpdateTask(t)
+	}
+	// 子实体：完成任务
+	task.Finish(operator, task.Variables, now)
+	e.repo.UpdateTask(task)
+	// 找到第一个任务节点，强制参与者为发起人，重新执行
+	var flow model.FlowModel
+	def, _ := e.repo.FindDefineByID(inst.DefineID)
+	if def != nil {
+		json.Unmarshal(def.Content, &flow)
+	}
+	if start := findNodeByType(&flow, model.TypeStart); start != nil {
+		for _, node := range followEdges(&flow, start.ID) {
+			if node.Type == model.TypeTask || node.Type == model.TypeCustom {
+				node.Properties["assignee"] = inst.Operator
+				e.executeNode(&flow, inst, node, operator, inst.Variables)
+				break
+			}
+		}
+	}
+	return inst, nil
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 func (e *EngineImpl) loadAndCheck(taskID int64, operator string) (*model.ProcessTask, *model.ProcessInstance, error) {
