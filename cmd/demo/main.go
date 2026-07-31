@@ -9,8 +9,15 @@ import (
 func main() {
 	ctx := gctx.New()
 	s := g.Server()
-	s.SetServerRoot("demo/web")
 	s.SetPort(8081)
+	// CORS——允许 jeeflow-ui (localhost:5173) 跨域访问
+	s.SetConfigWithMap(g.Map{
+		"Cors": g.Map{
+			"AllowOrigin":  "*",
+			"AllowMethods": "POST, GET, OPTIONS, PUT, DELETE",
+			"AllowHeaders": "Content-Type, Authorization",
+		},
+	})
 
 	ctl := demo.New()
 	ctl.RegisterRoutes(s)

@@ -1,6 +1,10 @@
 package demo
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 
@@ -17,23 +21,41 @@ type Controller struct {
 
 func New() *Controller {
 	repo := memory.New()
-	eng := engine.New(repo, &demoUserProvider{}, &demoIDGen{}, nil)
+	eng := engine.New(repo, &demoUserProvider{}, &demoIDGen{}, &demoExprEval{})
 	loadFlows(repo)
 	return &Controller{engine: eng, repo: repo}
 }
 
 func loadFlows(repo *memory.Repository) {
-	type f struct {
-		name, display, content string
+	flowsDir := filepath.Join("..", "jeeflow-java", "jeeflow-core", "src", "test", "resources", "flows")
+	entries, err := os.ReadDir(flowsDir)
+	if err != nil {
+		// fallback: relative to working dir
+		flowsDir = filepath.Join("jeeflow-hub", "jeeflow-java", "jeeflow-core", "src", "test", "resources", "flows")
+		entries, err = os.ReadDir(flowsDir)
 	}
-	flows := []f{
-		{"leave", "请假审批", `{"name":"leave","displayName":"请假审批","type":"approval","nodes":[{"id":"start","type":"snaker:start","x":100,"y":200,"properties":{},"text":{"value":"开始"}},{"id":"task1","type":"snaker:task","x":300,"y":200,"properties":{"form":"leave-form","assignee":"leader","taskType":0,"performType":0},"text":{"value":"组长审批"}},{"id":"end","type":"snaker:end","x":500,"y":200,"properties":{},"text":{"value":"结束"}}],"edges":[{"id":"e1","sourceNodeId":"start","targetNodeId":"task1","properties":{}},{"id":"e2","sourceNodeId":"task1","targetNodeId":"end","properties":{}}]}`},
-		{"three-level", "三级审批", `{"name":"three-level","displayName":"三级审批","type":"approval","nodes":[{"id":"start","type":"snaker:start","x":100,"y":200,"properties":{},"text":{"value":"开始"}},{"id":"t1","type":"snaker:task","x":250,"y":200,"properties":{"form":"approval-form","assignee":"leader","taskType":0,"performType":0},"text":{"value":"组长审批"}},{"id":"t2","type":"snaker:task","x":400,"y":200,"properties":{"form":"approval-form","assignee":"manager","taskType":0,"performType":0},"text":{"value":"经理审批"}},{"id":"t3","type":"snaker:task","x":550,"y":200,"properties":{"form":"approval-form","assignee":"boss","taskType":0,"performType":0},"text":{"value":"总监审批"}},{"id":"end","type":"snaker:end","x":700,"y":200,"properties":{},"text":{"value":"结束"}}],"edges":[{"id":"e1","sourceNodeId":"start","targetNodeId":"t1","properties":{}},{"id":"e2","sourceNodeId":"t1","targetNodeId":"t2","properties":{}},{"id":"e3","sourceNodeId":"t2","targetNodeId":"t3","properties":{}},{"id":"e4","sourceNodeId":"t3","targetNodeId":"end","properties":{}}]}`},
-		{"expense", "报销审批", `{"name":"expense","displayName":"报销审批","type":"finance","nodes":[{"id":"start","type":"snaker:start","x":100,"y":200,"properties":{},"text":{"value":"开始"}},{"id":"apply","type":"snaker:task","x":300,"y":200,"properties":{"form":"expense-form","assignee":"leader","taskType":0,"performType":0},"text":{"value":"填写报销单"}},{"id":"decision","type":"snaker:decision","x":500,"y":200,"properties":{"expr":"amount > 1000"},"text":{"value":"金额>1000?"}},{"id":"manager","type":"snaker:task","x":700,"y":100,"properties":{"form":"expense-form","assignee":"manager","taskType":0,"performType":0},"text":{"value":"经理审批"}},{"id":"director","type":"snaker:task","x":700,"y":300,"properties":{"form":"expense-form","assignee":"director","taskType":0,"performType":0},"text":{"value":"总监审批"}},{"id":"end","type":"snaker:end","x":900,"y":200,"properties":{},"text":{"value":"结束"}}],"edges":[{"id":"e1","sourceNodeId":"start","targetNodeId":"apply","properties":{}},{"id":"e2","sourceNodeId":"apply","targetNodeId":"decision","properties":{}},{"id":"e3","sourceNodeId":"decision","targetNodeId":"manager","properties":{"expr":"amount > 1000"},"text":{"value":"金额>1000"}},{"id":"e4","sourceNodeId":"decision","targetNodeId":"director","properties":{"expr":"amount <= 1000"},"text":{"value":"金额≤1000"}},{"id":"e5","sourceNodeId":"manager","targetNodeId":"end","properties":{}},{"id":"e6","sourceNodeId":"director","targetNodeId":"end","properties":{}}]}`},
+	if err != nil {
+		panic("cannot find flows directory: " + err.Error())
 	}
-	for i, f := range flows {
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for i, e := range entries {
+		if filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(flowsDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var raw map[string]interface{}
+		json.Unmarshal(data, &raw)
+		name, _ := raw["name"].(string)
+		display, _ := raw["displayName"].(string)
+		typ, _ := raw["type"].(string)
+		if typ == "" {
+			typ = "approval"
+		}
 		repo.AddDefine(&model.ProcessDefine{
-			ID: int64(i + 1), Name: f.name, DisplayName: f.display, Type: "approval", State: 1, Content: []byte(f.content),
+			ID: int64(i + 1), Name: name, DisplayName: display, Type: typ, State: 1, Content: data,
 		})
 	}
 }
@@ -41,6 +63,7 @@ func loadFlows(repo *memory.Repository) {
 func (c *Controller) RegisterRoutes(s *ghttp.Server) {
 	s.Group("/wf", func(g *ghttp.RouterGroup) {
 		g.POST("/processDefine/page", c.definePage)
+		g.POST("/processDefine/detail", c.defineDetail)
 		g.POST("/processInstance/startAndExecute", c.startFlow)
 		g.POST("/processInstance/page", c.instancePage)
 		g.POST("/processInstance/detail", c.instanceDetail)
@@ -63,25 +86,50 @@ func (c *Controller) definePage(r *ghttp.Request) {
 	r.Response.WriteJson(M{"code": 200, "data": M{"rows": rows}})
 }
 
-func (c *Controller) startFlow(r *ghttp.Request) {
-	var p struct {
-		ProcessDefineID string `json:"processDefineId"`
-		Operator        string `json:"operator"`
-		Amount          string `json:"amount"`
-	}
+func (c *Controller) defineDetail(r *ghttp.Request) {
+	var p struct{ ID string `json:"id"` }
 	r.Parse(&p)
-	defineID, _ := strconv.ParseInt(p.ProcessDefineID, 10, 64)
-	args := M{"BUSINESS_NO": "BIZ-1000000"}
-	if v, err := strconv.ParseFloat(p.Amount, 64); err == nil {
-		args["amount"] = v
-	}
-	inst, err := c.engine.StartProcessInstanceByID(defineID, p.Operator, args)
-	if err != nil {
-		r.Response.WriteJson(M{"code": 500, "message": err.Error()})
+	id, _ := strconv.ParseInt(p.ID, 10, 64)
+	def, err := c.repo.FindDefineByID(id)
+	if err != nil || def == nil {
+		r.Response.WriteJson(M{"code": 500, "message": "流程定义不存在"})
 		return
 	}
-	r.Response.WriteJson(M{"code": 200, "data": M{"processInstanceId": strconv.FormatInt(inst.ID, 10)}})
+	graphData := M{}
+	json.Unmarshal(def.Content, &graphData)
+	r.Response.WriteJson(M{"code": 200, "data": M{
+		"id": def.ID, "name": def.Name, "displayName": def.DisplayName,
+		"type": def.Type, "state": def.State, "version": def.Version,
+		"graphData": graphData,
+	}})
 }
+
+func (c *Controller) startFlow(r *ghttp.Request) {
+		var p struct {
+			ProcessDefineID string `json:"processDefineId"`
+			Operator        string `json:"operator"`
+			Amount          string `json:"amount"`
+		}
+		r.Parse(&p)
+		defineID, _ := strconv.ParseInt(p.ProcessDefineID, 10, 64)
+		args := M{"BUSINESS_NO": "BIZ-1000000"}
+		if v, err := strconv.ParseFloat(p.Amount, 64); err == nil {
+			args["amount"] = v
+		}
+		inst, err := c.engine.StartProcessInstanceByID(defineID, p.Operator, args)
+		if err != nil {
+			r.Response.WriteJson(M{"code": 500, "message": err.Error()})
+			return
+		}
+		// boot2 契约：自动完成申请节点（assignee="applicant"）
+		doing, _ := c.repo.FindDoingTasks(inst.ID, nil)
+		for _, task := range doing {
+			c.repo.AddTaskActor(task.ID, []string{p.Operator})
+			args["submitType"] = 0 // APPLY
+			c.engine.ExecuteProcessTask(task.ID, p.Operator, args)
+		}
+		r.Response.WriteJson(M{"code": 200, "data": M{"processInstanceId": strconv.FormatInt(inst.ID, 10)}})
+	}
 
 func (c *Controller) instancePage(r *ghttp.Request) {
 	insts := c.repo.AllInstances()
@@ -144,23 +192,25 @@ func (c *Controller) todoList(r *ghttp.Request) {
 }
 
 func (c *Controller) executeTask(r *ghttp.Request) {
-	var p struct {
-		ProcessTaskID string `json:"processTaskId"`
-		Operator      string `json:"operator"`
-		SubmitType    string `json:"submitType"`
+		var p struct {
+			ProcessTaskID string `json:"processTaskId"`
+			Operator      string `json:"operator"`
+			SubmitType    string `json:"submitType"`
+		}
+		r.Parse(&p)
+		taskID, _ := strconv.ParseInt(p.ProcessTaskID, 10, 64)
+		submitType, _ := strconv.Atoi(p.SubmitType)
+		var err error
+		args := M{"submitType": submitType}
+		switch submitType {
+		case 0, 1: // APPLY or AGREE
+			_, err = c.engine.ExecuteProcessTask(taskID, p.Operator, args)
+		case 2: // REJECT → jump back to apply node
+			_, err = c.engine.ExecuteAndJumpTask(taskID, p.Operator, args, "apply")
+		}
+		if err != nil { r.Response.WriteJson(M{"code": 500, "message": err.Error()}); return }
+		r.Response.WriteJson(M{"code": 200, "data": M{"message": "处理成功"}})
 	}
-	r.Parse(&p)
-	taskID, _ := strconv.ParseInt(p.ProcessTaskID, 10, 64)
-	submitType, _ := strconv.Atoi(p.SubmitType)
-	var err error
-	args := M{"submitType": submitType}
-	switch submitType {
-	case 1: _, err = c.engine.ExecuteProcessTask(taskID, p.Operator, args)
-	case 2: _, err = c.engine.ExecuteAndJumpToEnd(taskID, p.Operator, args)
-	}
-	if err != nil { r.Response.WriteJson(M{"code": 500, "message": err.Error()}); return }
-	r.Response.WriteJson(M{"code": 200, "data": M{"message": "处理成功"}})
-}
 
 func (c *Controller) stats(r *ghttp.Request) {
 	userID := r.Get("userId", "user1").String()
@@ -192,5 +242,36 @@ func (p *demoUserProvider) GetUser(userID string) (*model.UserInfo, error) {
 type demoIDGen struct{ n int64 }
 
 func (g *demoIDGen) NextID() int64 { g.n++; return g.n }
+
+type demoExprEval struct{}
+
+func (e *demoExprEval) Eval(expr string, vars map[string]interface{}) (interface{}, error) {
+	// 简单数值比较：amount > 1000, amount <= 1000
+	v, ok := vars["amount"]
+	if !ok { return false, nil }
+	amt, ok := toFloat(v)
+	if !ok { return false, nil }
+	switch expr {
+	case "amount > 1000": return amt > 1000, nil
+	case "amount >= 1000": return amt >= 1000, nil
+	case "amount < 1000": return amt < 1000, nil
+	case "amount <= 1000": return amt <= 1000, nil
+	case "amount == 1000": return amt == 1000, nil
+	case "amount != 1000": return amt != 1000, nil
+	}
+	return false, nil
+}
+
+func toFloat(v interface{}) (float64, bool) {
+	switch val := v.(type) {
+	case float64: return val, true
+	case int: return float64(val), true
+	case int64: return float64(val), true
+	case json.Number:
+		f, err := val.Float64()
+		return f, err == nil
+	}
+	return 0, false
+}
 
 var _ = time.Now // suppress import error
