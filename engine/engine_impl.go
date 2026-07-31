@@ -38,14 +38,8 @@ func (e *EngineImpl) StartProcessInstanceByID(defineID int64, operator string, a
 	e.addUserInfo(operator, vars)
 
 	now := time.Now()
-	inst := &model.ProcessInstance{
-		ID: e.nextID(), DefineID: defineID, State: model.InstanceStateDoing,
-		Operator: operator, Variables: vars,
-		CreateTime: now, UpdateTime: now, CreateUser: operator, UpdateUser: operator,
-	}
-	if v, ok := vars[KeyBusinessNo]; ok {
-		inst.BusinessNo = fmt.Sprint(v)
-	}
+	// 聚合根工厂创建实例
+	inst := model.NewProcessInstance(e.nextID(), defineID, operator, vars, now)
 	e.repo.SaveInstance(inst)
 	e.fireEvent(ProcessEvent{Type: EventProcessStart, InstanceID: inst.ID, Operator: operator})
 
@@ -74,12 +68,8 @@ func (e *EngineImpl) ExecuteProcessTask(taskID int64, operator string, args map[
 	e.addUserInfo(operator, vars)
 
 	now := time.Now()
-	task.TaskState = model.TaskStateDone
-	task.ActorID = operator
-	task.FinishTime = &now
-	task.UpdateTime = now
-	task.UpdateUser = operator
-	task.Variables = vars
+	// 聚合根：完成任务（子实体状态转换 + 实例变量合并）
+	inst.CompleteTask(task, operator, vars, now)
 	e.repo.UpdateTask(task)
 	e.fireEvent(ProcessEvent{Type: EventTaskComplete, InstanceID: inst.ID, TaskID: task.ID, NodeID: task.TaskName, Operator: operator})
 
@@ -99,7 +89,8 @@ func (e *EngineImpl) ExecuteProcessTask(taskID int64, operator string, args map[
 			if len(doing) == 0 {
 				actors, lc := getCsState(vars, curNode.ID)
 				if actors != nil && lc+1 < len(actors) {
-					nt := e.newTask(curNode, inst, actors[lc+1], operator, now)
+					// 聚合根：创建串行会签下一步任务
+					nt := inst.CreateTask(e.nextID(), curNode.ID, curNode.Text.Value, actors[lc+1], operator, formKeyOf(curNode), now)
 					nt.Variables = map[string]interface{}{
 						prefixKey("nrOfInstances", curNode.ID): len(actors),
 						prefixKey("loopCounter", curNode.ID):   lc + 1,
@@ -122,12 +113,12 @@ func (e *EngineImpl) ExecuteProcessTask(taskID int64, operator string, args map[
 			}
 		}
 		for _, node := range followEdges(&flow, curNode.ID) {
-				if node.Type == model.TypeEnd {
-					inst.State = model.InstanceStateDone
-					inst.UpdateTime = time.Now()
-					inst.Variables = vars
-					e.repo.UpdateInstance(inst)
-					e.fireEvent(ProcessEvent{Type: EventProcessFinish, InstanceID: inst.ID, Operator: operator})
+			if node.Type == model.TypeEnd {
+				// 聚合根：流程完成
+				inst.Finish(time.Now())
+				inst.Variables = vars
+				e.repo.UpdateInstance(inst)
+				e.fireEvent(ProcessEvent{Type: EventProcessFinish, InstanceID: inst.ID, Operator: operator})
 			} else {
 				e.executeNode(&flow, inst, node, operator, vars)
 			}
@@ -145,19 +136,15 @@ func (e *EngineImpl) ExecuteAndJumpToEnd(taskID int64, operator string, args map
 		return nil, err
 	}
 	now := time.Now()
-	doing, _ := e.repo.FindDoingTasks(inst.ID, nil)
-	for _, t := range doing {
-		t.TaskState = model.TaskStateAbandoned
-		t.UpdateTime = now
+	// 聚合根：废弃所有进行中任务
+	for _, t := range inst.AbandonAllDoing(now) {
 		e.repo.UpdateTask(t)
 	}
-	task.TaskState = model.TaskStateDone
-	task.ActorID = operator
-	task.FinishTime = &now
-	task.UpdateTime = now
+	// 子实体：完成任务
+	task.Finish(operator, task.Variables, now)
 	e.repo.UpdateTask(task)
-	inst.State = model.InstanceStateReject
-	inst.UpdateTime = now
+	// 聚合根：驳回
+	inst.Reject(now)
 	e.repo.UpdateInstance(inst)
 	e.fireEvent(ProcessEvent{Type: EventProcessReject, InstanceID: inst.ID, TaskID: taskID, Operator: operator})
 	return inst, nil
@@ -171,16 +158,12 @@ func (e *EngineImpl) ExecuteAndJumpTask(taskID int64, operator string, args map[
 		return nil, err
 	}
 	now := time.Now()
-	doing, _ := e.repo.FindDoingTasks(inst.ID, nil)
-	for _, t := range doing {
-		t.TaskState = model.TaskStateAbandoned
-		t.UpdateTime = now
+	// 聚合根：废弃所有进行中任务
+	for _, t := range inst.AbandonAllDoing(now) {
 		e.repo.UpdateTask(t)
 	}
-	task.TaskState = model.TaskStateDone
-	task.ActorID = operator
-	task.FinishTime = &now
-	task.UpdateTime = now
+	// 子实体：完成任务
+	task.Finish(operator, task.Variables, now)
 	e.repo.UpdateTask(task)
 
 	if targetTaskName != "" {
@@ -240,8 +223,7 @@ func (e *EngineImpl) executeNode(flow *model.FlowModel, inst *model.ProcessInsta
 		}
 		return nil
 	case model.TypeEnd:
-		inst.State = model.InstanceStateDone
-		inst.UpdateTime = time.Now()
+		inst.Finish(time.Now())
 		inst.Variables = vars
 		e.repo.UpdateInstance(inst)
 		e.fireEvent(ProcessEvent{Type: EventProcessFinish, InstanceID: inst.ID, Operator: operator})
@@ -322,15 +304,16 @@ func (e *EngineImpl) createTask(node *model.FlowNode, inst *model.ProcessInstanc
 	performType, _ := intFromProps(node.Properties, "performType")
 	ct, _ := stringFromProps(node.Properties, "countersignType")
 	now := time.Now()
+	form := formKeyOf(node)
 
 	if performType == 1 && ct != "" {
 		switch ct {
 		case "PARALLEL":
 			for _, actor := range actors {
-				e.repo.SaveTask(e.newTask(node, inst, actor, operator, now))
+				e.repo.SaveTask(inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now))
 			}
 		case "SEQUENTIAL":
-			nt := e.newTask(node, inst, actors[0], operator, now)
+			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now)
 			nt.Variables = map[string]interface{}{
 				prefixKey("nrOfInstances", node.ID): len(actors),
 				prefixKey("loopCounter", node.ID):   0,
@@ -339,25 +322,17 @@ func (e *EngineImpl) createTask(node *model.FlowNode, inst *model.ProcessInstanc
 			e.repo.SaveTask(nt)
 		default:
 			for _, actor := range actors {
-				e.repo.SaveTask(e.newTask(node, inst, actor, operator, now))
+				e.repo.SaveTask(inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now))
 			}
 		}
 		return nil
 	}
-	return e.repo.SaveTask(e.newTask(node, inst, actors[0], operator, now))
+	return e.repo.SaveTask(inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now))
 }
 
-func (e *EngineImpl) newTask(node *model.FlowNode, inst *model.ProcessInstance, actor string, operator string, now time.Time) *model.ProcessTask {
-	task := &model.ProcessTask{
-		ID: e.nextID(), ProcessInstanceID: inst.ID,
-		TaskName: node.ID, DisplayName: node.Text.Value, TaskState: model.TaskStateDoing,
-		ActorIDs: []string{actor},
-		CreateTime: now, UpdateTime: now, CreateUser: operator, UpdateUser: operator,
-	}
-	if form, ok := node.Properties["form"].(string); ok {
-		task.FormKey = form
-	}
-	return task
+func formKeyOf(node *model.FlowNode) string {
+	form, _ := node.Properties["form"].(string)
+	return form
 }
 
 func (e *EngineImpl) resolveActors(node *model.FlowNode) []string {
@@ -392,11 +367,11 @@ func (e *EngineImpl) resolveActors(node *model.FlowNode) []string {
 }
 
 func (e *EngineImpl) isAllowed(task *model.ProcessTask, operator string) bool {
-	for _, a := range task.ActorIDs {
-		if a == operator {
-			return true
-		}
+	// 子实体：actorIds 权限判断
+	if task.IsAllowed(operator) {
+		return true
 	}
+	// 仓储兜底：任务参与人表
 	actors, _ := e.repo.FindTaskActors(task.ID)
 	for _, a := range actors {
 		if a == operator {

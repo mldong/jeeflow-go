@@ -52,10 +52,23 @@ func toFloat(v interface{}) float64 {
 
 var _ spi.ProcessRepository // ensure import
 
+// 模拟 boot2 startAndExecute 契约：启动后自动完成申请节点
+func startAndExecute(eng *engine.EngineImpl, repo *memory.Repository, defineID int64, operator string, args map[string]interface{}) *model.ProcessInstance {
+	inst, _ := eng.StartProcessInstanceByID(defineID, operator, args)
+	doing, _ := repo.FindDoingTasks(inst.ID, nil)
+	for _, task := range doing {
+		if task.TaskName == "apply" {
+			repo.AddTaskActor(task.ID, []string{operator})
+			eng.ExecuteProcessTask(task.ID, operator, nil)
+		}
+	}
+	return inst
+}
+
 func Test01SimpleFlow(t *testing.T) {
 	eng, repo := setup()
 	def := registerFlow(repo, "01-simple.json")
-	inst, _ := eng.StartProcessInstanceByID(def.ID, "applicant", nil)
+	inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
 	doing, _ := repo.FindDoingTasks(inst.ID, nil)
 	if len(doing) != 1 || doing[0].TaskName != "task1" { t.Fatal("expected task1") }
 	repo.AddTaskActor(doing[0].ID, []string{"applicant"})
@@ -67,7 +80,7 @@ func Test01SimpleFlow(t *testing.T) {
 func Test02MultiTask(t *testing.T) {
 	eng, repo := setup()
 	def := registerFlow(repo, "02-multi-task.json")
-	inst, _ := eng.StartProcessInstanceByID(def.ID, "applicant", nil)
+	inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
 	doing, _ := repo.FindDoingTasks(inst.ID, nil)
 	if len(doing) != 1 || doing[0].TaskName != "task1" { t.Fatal("expected task1") }
 	// t1→t2
@@ -92,7 +105,7 @@ func Test02MultiTask(t *testing.T) {
 func Test03DecisionExpr(t *testing.T) {
 	eng, repo := setup()
 	def := registerFlow(repo, "03-decision-expr.json")
-	inst, _ := eng.StartProcessInstanceByID(def.ID, "applicant", map[string]interface{}{"amount": float64(3000)})
+	inst := startAndExecute(eng, repo, def.ID, "applicant", map[string]interface{}{"amount": float64(3000)})
 	doing, _ := repo.FindDoingTasks(inst.ID, nil)
 	repo.AddTaskActor(doing[0].ID, []string{"applicant"})
 	doing[0].ActorIDs = append(doing[0].ActorIDs, "applicant")
@@ -104,7 +117,7 @@ func Test03DecisionExpr(t *testing.T) {
 func Test04ForkJoin(t *testing.T) {
 	eng, repo := setup()
 	def := registerFlow(repo, "04-fork-join.json")
-	inst, _ := eng.StartProcessInstanceByID(def.ID, "applicant", nil)
+	inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
 	doing, _ := repo.FindDoingTasks(inst.ID, nil)
 	if len(doing) != 2 { t.Fatalf("expected 2, got %d", len(doing)) }
 	var tA, tB *model.ProcessTask
@@ -125,7 +138,7 @@ func Test04ForkJoin(t *testing.T) {
 func Test05CountersignParallel(t *testing.T) {
 	eng, repo := setup()
 	def := registerFlow(repo, "05-countersign-parallel.json")
-	inst, _ := eng.StartProcessInstanceByID(def.ID, "applicant", nil)
+	inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
 	doing, _ := repo.FindDoingTasks(inst.ID, nil)
 	if len(doing) != 3 { t.Fatalf("expected 3, got %d", len(doing)) }
 	for _, a := range []string{"userA", "userB", "userC"} {
@@ -142,7 +155,7 @@ func Test05CountersignParallel(t *testing.T) {
 func Test06CountersignSequential(t *testing.T) {
 	eng, repo := setup()
 	def := registerFlow(repo, "06-countersign-sequential.json")
-	inst, _ := eng.StartProcessInstanceByID(def.ID, "applicant", nil)
+	inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
 	doing, _ := repo.FindDoingTasks(inst.ID, nil)
 	if len(doing) != 1 { t.Fatalf("expected 1, got %d", len(doing)) }
 	task := doing[0]
@@ -161,7 +174,7 @@ func Test06CountersignSequential(t *testing.T) {
 func Test07CountersignRatio(t *testing.T) {
 	eng, repo := setup()
 	def := registerFlow(repo, "07-countersign-ratio.json")
-	inst, _ := eng.StartProcessInstanceByID(def.ID, "applicant", nil)
+	inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
 	doing, _ := repo.FindDoingTasks(inst.ID, nil)
 	if len(doing) != 4 { t.Fatalf("expected 4, got %d", len(doing)) }
 	for _, a := range []string{"userA", "userB", "userC", "userD"} {
@@ -178,7 +191,7 @@ func Test07CountersignRatio(t *testing.T) {
 func Test08Reject(t *testing.T) {
 	eng, repo := setup()
 	def := registerFlow(repo, "02-multi-task.json")
-	inst, _ := eng.StartProcessInstanceByID(def.ID, "applicant", nil)
+	inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
 	doing, _ := repo.FindDoingTasks(inst.ID, nil)
 	repo.AddTaskActor(doing[0].ID, []string{"applicant"})
 	doing[0].ActorIDs = append(doing[0].ActorIDs, "applicant")
@@ -189,7 +202,7 @@ func Test08Reject(t *testing.T) {
 func Test09ActorNotAllowed(t *testing.T) {
 	eng, repo := setup()
 	def := registerFlow(repo, "02-multi-task.json")
-	inst, _ := eng.StartProcessInstanceByID(def.ID, "applicant", nil)
+	inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
 	doing, _ := repo.FindDoingTasks(inst.ID, nil)
 	repo.AddTaskActor(doing[0].ID, []string{"leader"})
 	doing[0].ActorIDs = []string{"leader"}
@@ -225,15 +238,15 @@ func Test10InterceptorAndEvents(t *testing.T) {
 		},
 	})
 
-	inst, _ := eng.StartProcessInstanceByID(def.ID, "applicant", nil)
+	inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
 	doing, _ := repo.FindDoingTasks(inst.ID, nil)
-	repo.AddTaskActor(doing[0].ID, []string{"applicant"})
-	doing[0].ActorIDs = append(doing[0].ActorIDs, "applicant")
-	eng.ExecuteProcessTask(doing[0].ID, "applicant", nil)
+	repo.AddTaskActor(doing[0].ID, []string{"leader"})
+	doing[0].ActorIDs = append(doing[0].ActorIDs, "leader")
+	eng.ExecuteProcessTask(doing[0].ID, "leader", nil)
 
 	if !preCalled { t.Error("preHandle not called") }
 	if !postCalled { t.Error("postHandle not called") }
-	if len(events) != 3 { t.Errorf("expected 3 events, got %d: %v", len(events), events) }
+	if len(events) != 4 { t.Errorf("expected 4 events (start+apply+task+finish), got %d: %v", len(events), events) }
 }
 
 type testInterceptor struct {
