@@ -16,7 +16,7 @@ go build -o demo.exe ./cmd/demo
 # → http://localhost:8081
 ```
 
-> 演示站从 `jeeflow-java` 的共享流程 JSON 加载 10 个示例流程（候选路径链兼容不同启动目录）。对接 jeeflow-ui（:5173）时右上角切到 `🔷 Go :8081`；接口规范见[文档站 REST API 指南](https://jeeflow-doc.mldong.com/guides/03-api)。
+> 演示站从 `jeeflow-java` 的共享流程 JSON 加载 10 个示例流程（候选路径链兼容不同启动目录）。对接 jeeflow-ui（:5173）时右上角切到 `🔷 Go :8081`；接口规范见[文档站 REST API 指南](../../guides/03-api)。
 
 ## 快速验证
 
@@ -41,7 +41,7 @@ go build -o demo ./cmd/demo
 ./demo
 ```
 
-生产接入：实现 `ProcessRepository` SPI（内存/DB 随意），映射 [SPEC §2](https://jeeflow-doc.mldong.com/spec/) 的 5 张表。
+生产接入：实现 `ProcessRepository` SPI（内存/DB 随意），映射 [SPEC §2](../../spec/) 的 5 张表。
 
 ## 常见问题
 

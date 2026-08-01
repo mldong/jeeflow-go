@@ -1,6 +1,6 @@
 # jeeflow-go 文档
 
-> jeeflow 引擎的 **Go 实现**——对齐 Java 参考实现的行为语义。本文档面向 Go 开发者，内容也聚合到[文档站语言指南](https://jeeflow-doc.mldong.com/languages/go/)。
+> jeeflow 引擎的 **Go 实现**——对齐 Java 参考实现的行为语义。本文档面向 Go 开发者，内容也聚合到[文档站语言指南](../../)。
 
 ## SDK 集成
 
@@ -20,5 +20,5 @@
 
 ## 相关
 
-- 引擎规范（唯一事实来源）：[SPEC](https://jeeflow-doc.mldong.com/spec/)
-- 设计原理 / 通用指南：[jeeflow-doc](https://jeeflow-doc.mldong.com/)
+- 引擎规范（唯一事实来源）：[SPEC](../../spec/)
+- 设计原理 / 通用指南：[jeeflow-doc](../../)
