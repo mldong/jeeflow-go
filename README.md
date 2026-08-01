@@ -1,7 +1,7 @@
 # jeeflow-go · Go 版工作流引擎
 
 [![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go)](https://go.dev)
-[![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+[![License](https://img.shields.io/badge/license-Apache-2.0-orange)](./LICENSE)
 
 [jeeflow](https://github.com/mldong/jeeflow-doc) 引擎规范的 **Go 语言实现**，零外部依赖，纯 stdlib。
 
@@ -85,7 +85,7 @@ jeeflow-go/
 
 ## License
 
-MIT
+Apache-2.0
 
 ## 文档
 
