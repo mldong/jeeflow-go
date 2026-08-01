@@ -1,8 +1,10 @@
-// Package jdbc 提供 ProcessRepository 的 MySQL/JDBC 参考实现。
+// Package jdbc 提供 ProcessRepository 的 JDBC 参考实现。
 //
 // 对齐 spec §7.4 事务约定：仓储方法接收 ctx，WithTx 把事务连接绑定到 ctx，
 // 同事务内所有仓储调用走同一连接；无事务上下文时回退为独立连接。
-// 引擎核心零依赖，本包依赖 database/sql（stdlib）+ 驱动（调用方引入）。
+// 引擎核心零依赖，本包依赖 database/sql（stdlib）+ 驱动（调用方引入）——
+// 换数据库只需换驱动 import 与 DSN（database/sql 统一抽象，占位符 `?` 由驱动转换）。
+// 建表 SQL 见本包 schema/ 目录（mysql.sql / postgres.sql，各语言统一）。
 package jdbc
 
 import (

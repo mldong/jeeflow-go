@@ -31,15 +31,29 @@ type ProcessRepository interface {
 **内置实现**：
 
 - `memory.New()` — 内存仓储，测试/演示用
-- `jdbc.New(db)` — **MySQL 参考实现**（`repository/jdbc`，仅依赖 stdlib `database/sql` + 驱动）：
+- `jdbc.New(db)` — **JDBC 参考实现**（`repository/jdbc`，仅依赖 stdlib `database/sql` + 驱动）。
+  `database/sql` 是标准抽象（同 Java `javax.sql.DataSource`），**换数据库 = 换驱动 import + DSN**，
+  占位符统一 `?` 由驱动转换：
 
 ```go
-import "github.com/mldong/jeeflow-go/repository/jdbc"
-
+// MySQL
+import (
+    "database/sql"
+    _ "github.com/go-sql-driver/mysql"
+    "github.com/mldong/jeeflow-go/repository/jdbc"
+)
 db, _ := sql.Open("mysql", "root:pwd@tcp(127.0.0.1:3306)/jeeflow?parseTime=true")
+
+// PostgreSQL（换驱动即可，代码零改动）
+// import _ "github.com/jackc/pgx/v5/stdlib"
+// db, _ := sql.Open("pgx", "postgres://root:pwd@127.0.0.1/jeeflow")
+
 repo := jdbc.New(db)                // 关系表主键用内置时间戳 ID 生成器
 // repo := jdbc.NewWithIDGen(db, mySnowflake)  // 自定义 ID 生成器
 ```
+
+> **新增数据库** = 驱动 + 建表 SQL（`repository/jdbc/schema/<db>.sql`，与各语言统一）。
+> 核心零驱动依赖：`_ import` 驱动只出现在调用方/测试。
 
 仓储方法自动映射 `wf_*` 5 张表（spec §2）。`content` 为流程定义 JSON，`variable` 为变量 JSON。
 
