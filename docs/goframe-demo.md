@@ -14,7 +14,7 @@ go run ./cmd/demo/
 
 ```
 demo/
-├── controller.go      ← REST 控制器（13 个端点，boot2 对齐）
+├── controller.go      ← REST 控制器（13 个端点，mldong 对齐）
 ├── web/index.html     ← 前端页面
 cmd/demo/main.go       ← 入口
 ```
