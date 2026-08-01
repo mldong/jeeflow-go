@@ -16,10 +16,13 @@ type ProcessRepository interface {
     SaveTask(task *model.ProcessTask) error
     UpdateTask(task *model.ProcessTask) error
     FindDoingTasks(instanceID int64, taskNames []string) ([]*model.ProcessTask, error)
+    FindDoneTasks(instanceID int64, taskNames []string) ([]*model.ProcessTask, error)
     FindHistoryTasks(instanceID int64) ([]*model.ProcessTask, error)
     FindTaskActors(taskID int64) ([]string, error)
     AddTaskActor(taskID int64, actors []string) error
     RemoveTaskActor(taskID int64, actors []string) error
+    CreateCcInstance(instanceID int64, creator string, actorIDs ...string) error
+    UpdateCcStatus(instanceID int64, actorID string) error
 }
 ```
 

@@ -8,6 +8,7 @@ type Engine interface {
     ExecuteProcessTask(taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
     ExecuteAndJumpToEnd(taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
     ExecuteAndJumpTask(taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error)
+    ExecuteAndJumpToFirstTaskNode(taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
 }
 ```
 
