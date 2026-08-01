@@ -2,9 +2,11 @@
 //
 // 对齐 spec §7.4 事务约定：仓储方法接收 ctx，WithTx 把事务连接绑定到 ctx，
 // 同事务内所有仓储调用走同一连接；无事务上下文时回退为独立连接。
-// 引擎核心零依赖，本包依赖 database/sql（stdlib）+ 驱动（调用方引入）——
-// 换数据库只需换驱动 import 与 DSN（database/sql 统一抽象，占位符 `?` 由驱动转换）。
-// 建表 SQL 唯一来源在 jeeflow-java 仓 resources/（schema-h2/mysql/postgres.sql，各语言统一）。
+// 引擎核心零依赖，本包依赖 database/sql（stdlib）+ 驱动（调用方引入）。
+// 占位符统一 `?`，New 时按驱动自动转换（mysql → `?` 原生；pgx → `$n`），
+// 与 Python/Node 的 convert_placeholder 同一约定。
+// 建表 SQL 各语言自带（repository/jdbc/schema/schema-<db>.sql；维护者改
+// jeeflow-java 仓 resources 后用 jeeflow-hub/scripts/sync-schema.sh 分发）。
 package jdbc
 
 import (
@@ -12,6 +14,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mldong/jeeflow-go/model"
@@ -21,22 +25,66 @@ import (
 // txKey 是 context 中事务连接的键
 type txKey struct{}
 
-// Repository 是 ProcessRepository 的 MySQL 实现。
+// Repository 是 ProcessRepository 的 JDBC 实现。
 type Repository struct {
-	db    *sql.DB
-	idGen spi.IDGenerator
+	db      *sql.DB
+	idGen   spi.IDGenerator
+	phStyle string // "?" 原生 / "$n"（PostgreSQL）
 }
 
 // New 构造仓储（db 由调用方创建，支持连接池）。
 // 关系表（task_actor / cc_instance）主键使用内置时间戳生成器；
 // 需要自定义（如雪花）时用 NewWithIDGen。
+// 占位符风格按驱动自动检测（mysql → `?`；pgx 等 → `$n`）。
 func New(db *sql.DB) *Repository {
-	return &Repository{db: db, idGen: &tsIDGen{}}
+	return &Repository{db: db, idGen: &tsIDGen{}, phStyle: detectPlaceholder(db)}
 }
 
-// NewWithIDGen 构造仓储并注入 ID 生成器。
+// NewWithIDGen 构造仓储并注入 ID 生成器（占位符风格同样自动检测）。
 func NewWithIDGen(db *sql.DB, idGen spi.IDGenerator) *Repository {
-	return &Repository{db: db, idGen: idGen}
+	return &Repository{db: db, idGen: idGen, phStyle: detectPlaceholder(db)}
+}
+
+// detectPlaceholder 按驱动类型名推断占位符风格（零驱动依赖，字符串匹配）
+func detectPlaceholder(db *sql.DB) string {
+	name := fmt.Sprintf("%T", db.Driver())
+	switch {
+	case strings.Contains(name, "mysql"):
+		return "?"
+	case strings.Contains(name, "pgx"), strings.Contains(name, "stdlib"):
+		return "$n"
+	default:
+		return "?"
+	}
+}
+
+// ConvertPlaceholder 把 SQL 的统一 `?` 占位符转换为目标风格（与 Python/Node 同一约定）。
+// style: "?" 原样返回；"$n" 按出现顺序编号（$1, $2, ...）。
+func ConvertPlaceholder(sql, style string) string {
+	if style != "$n" {
+		return sql
+	}
+	var b strings.Builder
+	n := 0
+	for _, r := range sql {
+		if r == '?' {
+			n++
+			b.WriteString(fmt.Sprintf("$%d", n))
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// ph 转换当前仓储占位符风格
+func (r *Repository) ph(sql string) string {
+	return ConvertPlaceholder(sql, r.phStyle)
+}
+
+// repeatPh 生成 n 个 `?` 占位符（用于 IN 列表）
+func repeatPh(n int) string {
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
 }
 
 // tsIDGen 对齐 Java 默认 nextId：时间戳毫秒 + 同毫秒内递增序号
@@ -80,14 +128,33 @@ type queryer interface {
 }
 
 // conn 返回当前连接：有事务绑定用事务连接，否则用池连接。
-func (r *Repository) conn(ctx context.Context) (interface {
-	execer
-	queryer
-}) {
+// 返回包装类型，SQL 统一 `?` 占位符按驱动风格转换（调用点零改动）。
+func (r *Repository) conn(ctx context.Context) phConn {
 	if tx, ok := ctx.Value(txKey{}).(*sql.Tx); ok {
-		return tx
+		return phConn{inner: tx, phStyle: r.phStyle}
 	}
-	return r.db
+	return phConn{inner: r.db, phStyle: r.phStyle}
+}
+
+// phConn 包装连接：执行前转换占位符
+type phConn struct {
+	inner interface {
+		execer
+		queryer
+	}
+	phStyle string
+}
+
+func (c phConn) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	return c.inner.ExecContext(ctx, ConvertPlaceholder(query, c.phStyle), args...)
+}
+
+func (c phConn) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	return c.inner.QueryContext(ctx, ConvertPlaceholder(query, c.phStyle), args...)
+}
+
+func (c phConn) QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	return c.inner.QueryRowContext(ctx, ConvertPlaceholder(query, c.phStyle), args...)
 }
 
 // ─── ProcessDefine ─────────────────────────────────────────────────────────────

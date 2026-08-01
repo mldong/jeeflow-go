@@ -52,8 +52,9 @@ repo := jdbc.New(db)                // 关系表主键用内置时间戳 ID 生�
 // repo := jdbc.NewWithIDGen(db, mySnowflake)  // 自定义 ID 生成器
 ```
 
-> **新增数据库** = 驱动 + 建表 SQL（唯一来源：jeeflow-java 仓
-> `jeeflow-repository-jdbc/src/test/resources/schema-<db>.sql`，与各语言统一）。
+> **新增数据库** = 驱动 + 建表 SQL（各语言自带：本包 `schema/schema-<db>.sql`，
+> 使用者单语言下载即用；维护者改 jeeflow-java 仓 resources 后跑
+> `jeeflow-hub/scripts/sync-schema.sh` 分发）。
 > 核心零驱动依赖：`_ import` 驱动只出现在调用方/测试。
 
 仓储方法自动映射 `wf_*` 5 张表（spec §2）。`content` 为流程定义 JSON，`variable` 为变量 JSON。

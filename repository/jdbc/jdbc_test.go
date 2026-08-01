@@ -1,8 +1,13 @@
-// Package jdbc_test 对 MySQL 参考实现做集成测试。
+// Package jdbc_test 对 JDBC 参考实现做集成测试（MySQL / PostgreSQL 双库可跑）。
+//
+// 用法：go test ./repository/jdbc/           # 默认 MySQL（开发服务器）
+//
+//	JEFFLOW_DB_DRIVER=pgx JEFFLOW_DB_DSN='postgres://postgres:pwd@host:5432/jeeflow' go test ./repository/jdbc/
 //
 // 前置条件：
-//   - 开发服务器 MySQL（192.168.1.160:3306，库 jeeflow，root/8Eli#gr#AUk）
-//   - 5 张 wf_* 表已建（缺表时先执行建表 SQL）
+//   - 目标库已建 5 张 wf_* 表（建表 SQL 各语言自带：repository/jdbc/schema/schema-<db>.sql；
+//     维护者改 jeeflow-java 仓 resources 后用 scripts/sync-schema.sh 分发）
+//   - 连接信息用环境变量覆盖（使用者指向自己的库），默认开发服务器 MySQL
 //
 // 测试数据用固定 define ID=900001，可重复执行（开头清理）。
 package jdbc_test
@@ -18,20 +23,42 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/mldong/jeeflow-go/engine"
 	"github.com/mldong/jeeflow-go/model"
 	"github.com/mldong/jeeflow-go/repository/jdbc"
 	"github.com/mldong/jeeflow-go/spi"
 )
 
-const (
-	dsn      = "root:8Eli#gr#AUk@tcp(192.168.1.160:3306)/jeeflow?parseTime=true&charset=utf8mb4"
-	defineID = int64(900001)
-)
+const defineID = int64(900001)
+
+// driver / dsn 环境变量可覆盖（默认开发服务器 MySQL）
+func testDriver() string {
+	if d := os.Getenv("JEFFLOW_DB_DRIVER"); d != "" {
+		return d
+	}
+	return "mysql"
+}
+
+func testDSN() string {
+	if d := os.Getenv("JEFFLOW_DB_DSN"); d != "" {
+		return d
+	}
+	return "root:8Eli#gr#AUk@tcp(192.168.1.160:3306)/jeeflow?parseTime=true&charset=utf8mb4"
+}
+
+// ph 测试直查 SQL 占位符转换（与 jdbc.ConvertPlaceholder 同一约定）
+func ph(sql string) string {
+	style := "?"
+	if testDriver() == "pgx" {
+		style = "$n"
+	}
+	return jdbc.ConvertPlaceholder(sql, style)
+}
 
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open(testDriver(), testDSN())
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -39,7 +66,7 @@ func openDB(t *testing.T) *sql.DB {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
-		t.Fatalf("ping db(192.168.1.160 jeeflow): %v", err)
+		t.Fatalf("ping db(%s jeeflow): %v", testDriver(), err)
 	}
 	return db
 }
@@ -56,7 +83,7 @@ func cleanup(t *testing.T, db *sql.DB) {
 		"DELETE FROM wf_process_define WHERE id = ?",
 	}
 	for _, s := range stmts {
-		if _, err := db.ExecContext(ctx, s, defineID); err != nil {
+		if _, err := db.ExecContext(ctx, ph(s), defineID); err != nil {
 			t.Fatalf("cleanup: %v", err)
 		}
 	}
@@ -90,8 +117,8 @@ func insertDefine(t *testing.T, db *sql.DB, name string, content []byte) {
 		display, _ = raw["displayName"].(string)
 		typ, _ = raw["type"].(string)
 	}
-	if _, err := db.ExecContext(ctx,
-		"INSERT INTO wf_process_define (id, name, display_name, type, state, content, version, create_time, create_user, update_time, update_user) VALUES (?,?,?,?,1,?,1,?,?,?,?)",
+	if _, err := db.ExecContext(ctx, ph(
+		"INSERT INTO wf_process_define (id, name, display_name, type, state, content, version, create_time, create_user, update_time, update_user) VALUES (?,?,?,?,1,?,1,?,?,?,?)"),
 		defineID, name, display, typ, content, now, "go-test", now, "go-test"); err != nil {
 		t.Fatalf("insert define: %v", err)
 	}
@@ -194,15 +221,15 @@ func TestFlowSimpleEndToEnd(t *testing.T) {
 	db2 := openDB(t)
 	defer db2.Close()
 	var state int
-	if err := db2.QueryRowContext(ctx, "SELECT state FROM wf_process_instance WHERE id = ?", inst.ID).Scan(&state); err != nil {
+	if err := db2.QueryRowContext(ctx, ph("SELECT state FROM wf_process_instance WHERE id = ?"), inst.ID).Scan(&state); err != nil {
 		t.Fatalf("persist instance: %v", err)
 	}
 	if state != int(model.InstanceStateDone) {
 		t.Fatalf("persisted state = %d, want 20", state)
 	}
 	var taskCnt, actorCnt int
-	_ = db2.QueryRowContext(ctx, "SELECT COUNT(*) FROM wf_process_task WHERE process_instance_id = ?", inst.ID).Scan(&taskCnt)
-	_ = db2.QueryRowContext(ctx, "SELECT COUNT(*) FROM wf_process_task_actor WHERE process_task_id IN (SELECT id FROM wf_process_task WHERE process_instance_id = ?)", inst.ID).Scan(&actorCnt)
+	_ = db2.QueryRowContext(ctx, ph("SELECT COUNT(*) FROM wf_process_task WHERE process_instance_id = ?"), inst.ID).Scan(&taskCnt)
+	_ = db2.QueryRowContext(ctx, ph("SELECT COUNT(*) FROM wf_process_task_actor WHERE process_task_id IN (SELECT id FROM wf_process_task WHERE process_instance_id = ?)"), inst.ID).Scan(&actorCnt)
 	if taskCnt != 2 || actorCnt != 2 {
 		t.Fatalf("persisted task=%d actor=%d, want 2/2", taskCnt, actorCnt)
 	}
@@ -300,11 +327,11 @@ func TestWithTx(t *testing.T) {
 		t.Fatalf("tx commit: %v", err)
 	}
 	var n int
-	_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM wf_process_instance WHERE id = 900002").Scan(&n)
+	_ = db.QueryRowContext(ctx, ph("SELECT COUNT(*) FROM wf_process_instance WHERE id = 900002")).Scan(&n)
 	if n != 1 {
 		t.Fatalf("tx commit not persisted, n=%d", n)
 	}
-	_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = 900002").Scan(&n)
+	_ = db.QueryRowContext(ctx, ph("SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = 900002")).Scan(&n)
 	if n != 2 {
 		t.Fatalf("cc rows = %d, want 2", n)
 	}
@@ -326,14 +353,14 @@ func TestWithTx(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expect tx error, got nil")
 	}
-	_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM wf_process_instance WHERE id = 900003").Scan(&n)
+	_ = db.QueryRowContext(ctx, ph("SELECT COUNT(*) FROM wf_process_instance WHERE id = 900003")).Scan(&n)
 	if n != 0 {
 		t.Fatalf("rollback failed, instance rows = %d", n)
 	}
-	_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = 900003").Scan(&n)
+	_ = db.QueryRowContext(ctx, ph("SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = 900003")).Scan(&n)
 	if n != 0 {
 		t.Fatalf("rollback failed, cc rows = %d", n)
 	}
-	_ = db.QueryRowContext(ctx, "DELETE FROM wf_process_instance WHERE id = 900002").Scan(&n)
-	_, _ = db.ExecContext(ctx, "DELETE FROM wf_process_cc_instance WHERE process_instance_id = 900002")
+	_ = db.QueryRowContext(ctx, ph("DELETE FROM wf_process_instance WHERE id = 900002")).Scan(&n)
+	_, _ = db.ExecContext(ctx, ph("DELETE FROM wf_process_cc_instance WHERE process_instance_id = 900002"))
 }
