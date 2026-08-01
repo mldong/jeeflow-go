@@ -5,6 +5,7 @@ go 1.21
 require github.com/gogf/gf/v2 v2.7.2
 
 require (
+	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/BurntSushi/toml v1.3.2 // indirect
 	github.com/clbanning/mxj/v2 v2.7.0 // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect
@@ -12,6 +13,7 @@ require (
 	github.com/fsnotify/fsnotify v1.7.0 // indirect
 	github.com/go-logr/logr v1.2.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/go-sql-driver/mysql v1.8.1 // indirect
 	github.com/gorilla/websocket v1.5.1 // indirect
 	github.com/grokify/html-strip-tags-go v0.1.0 // indirect
 	github.com/magiconair/properties v1.8.7 // indirect

@@ -1,28 +1,32 @@
 package spi
 
-import "github.com/mldong/jeeflow-go/model"
+import (
+	"context"
+
+	"github.com/mldong/jeeflow-go/model"
+)
 
 // ProcessRepository 流程仓储接口（方法名对齐 Java/Node camelCase）
 type ProcessRepository interface {
-	FindDefineByID(id int64) (*model.ProcessDefine, error)
+	FindDefineByID(ctx context.Context, id int64) (*model.ProcessDefine, error)
 
-	FindInstanceByID(id int64) (*model.ProcessInstance, error)
-	SaveInstance(inst *model.ProcessInstance) error
-	UpdateInstance(inst *model.ProcessInstance) error
+	FindInstanceByID(ctx context.Context, id int64) (*model.ProcessInstance, error)
+	SaveInstance(ctx context.Context, inst *model.ProcessInstance) error
+	UpdateInstance(ctx context.Context, inst *model.ProcessInstance) error
 
-	FindTaskByID(taskID int64) (*model.ProcessTask, error)
-	SaveTask(task *model.ProcessTask) error
-	UpdateTask(task *model.ProcessTask) error
-	FindDoingTasks(instanceID int64, taskNames []string) ([]*model.ProcessTask, error)
-	FindDoneTasks(instanceID int64, taskNames []string) ([]*model.ProcessTask, error)
-	FindHistoryTasks(instanceID int64) ([]*model.ProcessTask, error)
+	FindTaskByID(ctx context.Context, taskID int64) (*model.ProcessTask, error)
+	SaveTask(ctx context.Context, task *model.ProcessTask) error
+	UpdateTask(ctx context.Context, task *model.ProcessTask) error
+	FindDoingTasks(ctx context.Context, instanceID int64, taskNames []string) ([]*model.ProcessTask, error)
+	FindDoneTasks(ctx context.Context, instanceID int64, taskNames []string) ([]*model.ProcessTask, error)
+	FindHistoryTasks(ctx context.Context, instanceID int64) ([]*model.ProcessTask, error)
 
-	FindTaskActors(taskID int64) ([]string, error)
-	AddTaskActor(taskID int64, actors []string) error
-	RemoveTaskActor(taskID int64, actors []string) error
+	FindTaskActors(ctx context.Context, taskID int64) ([]string, error)
+	AddTaskActor(ctx context.Context, taskID int64, actors []string) error
+	RemoveTaskActor(ctx context.Context, taskID int64, actors []string) error
 
-	CreateCcInstance(instanceID int64, creator string, actorIDs ...string) error
-	UpdateCcStatus(instanceID int64, actorID string) error
+	CreateCcInstance(ctx context.Context, instanceID int64, creator string, actorIDs ...string) error
+	UpdateCcStatus(ctx context.Context, instanceID int64, actorID string) error
 }
 
 // UserProvider 用户信息提供者

@@ -104,7 +104,7 @@ func (c *Controller) defineDetail(r *ghttp.Request) {
 	var p struct{ ID string `json:"id"` }
 	r.Parse(&p)
 	id, _ := strconv.ParseInt(p.ID, 10, 64)
-	def, err := c.repo.FindDefineByID(id)
+	def, err := c.repo.FindDefineByID(r.Context(), id)
 	if err != nil || def == nil {
 		r.Response.WriteJson(M{"code": 99999999, "msg": "流程定义不存在"})
 		return
@@ -130,17 +130,17 @@ func (c *Controller) startFlow(r *ghttp.Request) {
 		if v, err := strconv.ParseFloat(p.Amount, 64); err == nil {
 			args["amount"] = v
 		}
-		inst, err := c.engine.StartProcessInstanceByID(defineID, p.Operator, args)
+		inst, err := c.engine.StartProcessInstanceByID(r.Context(), defineID, p.Operator, args)
 		if err != nil {
 			r.Response.WriteJson(M{"code": 99999999, "msg": err.Error()})
 			return
 		}
 		// boot2 startAndExecute：自动完成申请节点
-		doing, _ := c.repo.FindDoingTasks(inst.ID, nil)
+		doing, _ := c.repo.FindDoingTasks(r.Context(), inst.ID, nil)
 		for _, task := range doing {
-			c.repo.AddTaskActor(task.ID, []string{p.Operator})
+			c.repo.AddTaskActor(r.Context(), task.ID, []string{p.Operator})
 			args["submitType"] = 0 // APPLY
-			c.engine.ExecuteProcessTask(task.ID, p.Operator, args)
+			c.engine.ExecuteProcessTask(r.Context(), task.ID, p.Operator, args)
 		}
 		r.Response.WriteJson(M{"code": 0, "msg": "成功"})
 	}
@@ -152,7 +152,7 @@ func (c *Controller) instancePage(r *ghttp.Request) {
 	rows := make([]M, 0)
 	for _, inst := range insts {
 		if inst.Operator != p.Operator { continue }
-		def, _ := c.repo.FindDefineByID(inst.DefineID)
+		def, _ := c.repo.FindDefineByID(r.Context(), inst.DefineID)
 		dn := ""
 		if def != nil { dn = def.DisplayName }
 		rows = append(rows, M{"id": inst.ID, "processDefineId": inst.DefineID, "state": int(inst.State),
@@ -167,12 +167,12 @@ func (c *Controller) instanceDetail(r *ghttp.Request) {
 	var p struct{ ID string `json:"id"` }
 	r.Parse(&p)
 	id, _ := strconv.ParseInt(p.ID, 10, 64)
-	inst, err := c.repo.FindInstanceByID(id)
+	inst, err := c.repo.FindInstanceByID(r.Context(), id)
 	if err != nil || inst == nil {
 		r.Response.WriteJson(M{"code": 99999999, "msg": "实例不存在"})
 		return
 	}
-	def, _ := c.repo.FindDefineByID(inst.DefineID)
+	def, _ := c.repo.FindDefineByID(r.Context(), inst.DefineID)
 	dn := ""
 	if def != nil { dn = def.DisplayName }
 	// activeTaskList：进行中任务
@@ -194,7 +194,7 @@ func (c *Controller) instanceHighLight(r *ghttp.Request) {
 	var p struct{ ID string `json:"id"` }
 	r.Parse(&p)
 	id, _ := strconv.ParseInt(p.ID, 10, 64)
-	inst, err := c.repo.FindInstanceByID(id)
+	inst, err := c.repo.FindInstanceByID(r.Context(), id)
 	if err != nil || inst == nil {
 		r.Response.WriteJson(M{"code": 99999999, "msg": "实例不存在"})
 		return
@@ -211,7 +211,7 @@ func (c *Controller) instanceHighLight(r *ghttp.Request) {
 	// 已完成边
 	finishedEdges := make([]string, 0)
 	var graph M
-	if def, _ := c.repo.FindDefineByID(inst.DefineID); def != nil {
+	if def, _ := c.repo.FindDefineByID(r.Context(), inst.DefineID); def != nil {
 		json.Unmarshal(def.Content, &graph)
 	}
 	if edges, ok := graph["edges"].([]interface{}); ok {
@@ -233,12 +233,12 @@ func (c *Controller) instanceApprovalRecord(r *ghttp.Request) {
 	var p struct{ ID string `json:"id"` }
 	r.Parse(&p)
 	id, _ := strconv.ParseInt(p.ID, 10, 64)
-	inst, err := c.repo.FindInstanceByID(id)
+	inst, err := c.repo.FindInstanceByID(r.Context(), id)
 	if err != nil || inst == nil {
 		r.Response.WriteJson(M{"code": 99999999, "msg": "实例不存在"})
 		return
 	}
-	def, _ := c.repo.FindDefineByID(inst.DefineID)
+	def, _ := c.repo.FindDefineByID(r.Context(), inst.DefineID)
 	rows := make([]M, 0)
 	for _, t := range inst.Tasks {
 		rows = append(rows, c.taskVO(t, inst, def))
@@ -269,10 +269,10 @@ func (c *Controller) todoList(r *ghttp.Request) {
 	var rows []M
 	for _, t := range c.repo.AllTasks() {
 		if t.TaskState != model.TaskStateDoing { continue }
-		actors, _ := c.repo.FindTaskActors(t.ID)
+		actors, _ := c.repo.FindTaskActors(r.Context(), t.ID)
 		if !contains(t.ActorIDs, p.UserID) && !contains(actors, p.UserID) { continue }
-		inst, _ := c.repo.FindInstanceByID(t.ProcessInstanceID)
-		def, _ := c.repo.FindDefineByID(inst.DefineID)
+		inst, _ := c.repo.FindInstanceByID(r.Context(), t.ProcessInstanceID)
+		def, _ := c.repo.FindDefineByID(r.Context(), inst.DefineID)
 		rows = append(rows, c.taskVO(t, inst, def))
 	}
 	if rows == nil { rows = []M{} }
@@ -286,8 +286,8 @@ func (c *Controller) doneList(r *ghttp.Request) {
 	for _, t := range c.repo.AllTasks() {
 		if t.TaskState != model.TaskStateDone { continue }
 		if !contains(t.ActorIDs, p.UserID) && t.ActorID != p.UserID { continue }
-		inst, _ := c.repo.FindInstanceByID(t.ProcessInstanceID)
-		def, _ := c.repo.FindDefineByID(inst.DefineID)
+		inst, _ := c.repo.FindInstanceByID(r.Context(), t.ProcessInstanceID)
+		def, _ := c.repo.FindDefineByID(r.Context(), inst.DefineID)
 		rows = append(rows, c.taskVO(t, inst, def))
 	}
 	if rows == nil { rows = []M{} }
@@ -309,20 +309,20 @@ func (c *Controller) executeTask(r *ghttp.Request) {
 		args := M{"submitType": submitType}
 		switch submitType {
 		case 0, 1, 5: // APPLY / AGREE / RE_APPLY
-			_, err = c.engine.ExecuteProcessTask(taskID, p.Operator, args)
+			_, err = c.engine.ExecuteProcessTask(r.Context(), taskID, p.Operator, args)
 		case 2: // REJECT → 跳结束
-			_, err = c.engine.ExecuteAndJumpToEnd(taskID, p.Operator, args)
+			_, err = c.engine.ExecuteAndJumpToEnd(r.Context(), taskID, p.Operator, args)
 		case 3: // ROLLBACK → 退回上一步
-			_, err = c.engine.ExecuteAndJumpTask(taskID, p.Operator, args, "")
+			_, err = c.engine.ExecuteAndJumpTask(r.Context(), taskID, p.Operator, args, "")
 		case 4: // JUMP → 跳指定节点
-			_, err = c.engine.ExecuteAndJumpTask(taskID, p.Operator, args, p.TaskName)
+			_, err = c.engine.ExecuteAndJumpTask(r.Context(), taskID, p.Operator, args, p.TaskName)
 		case 6: // ROLLBACK_TO_OPERATOR → 退回发起人
-			_, err = c.engine.ExecuteAndJumpToFirstTaskNode(taskID, p.Operator, args)
+			_, err = c.engine.ExecuteAndJumpToFirstTaskNode(r.Context(), taskID, p.Operator, args)
 		case 20: // COUNTERSIGN_DISAGREE
 			args["countersignDisagreeFlag"] = 1
-			_, err = c.engine.ExecuteProcessTask(taskID, p.Operator, args)
+			_, err = c.engine.ExecuteProcessTask(r.Context(), taskID, p.Operator, args)
 		default:
-			_, err = c.engine.ExecuteProcessTask(taskID, p.Operator, args)
+			_, err = c.engine.ExecuteProcessTask(r.Context(), taskID, p.Operator, args)
 		}
 		if err != nil { r.Response.WriteJson(M{"code": 99999999, "msg": err.Error()}); return }
 		r.Response.WriteJson(M{"code": 0, "msg": "成功"})
@@ -332,7 +332,7 @@ func (c *Controller) jumpAbleTaskNameList(r *ghttp.Request) {
 	var p struct{ ProcessInstanceID string `json:"processInstanceId"` }
 	r.Parse(&p)
 	instID, _ := strconv.ParseInt(p.ProcessInstanceID, 10, 64)
-	done, _ := c.repo.FindDoneTasks(instID, nil)
+	done, _ := c.repo.FindDoneTasks(r.Context(), instID, nil)
 	seen := map[string]bool{}
 	rows := make([]M, 0)
 	for _, t := range done {
@@ -349,7 +349,7 @@ func (c *Controller) stats(r *ghttp.Request) {
 	count := 0
 	for _, t := range c.repo.AllTasks() {
 		if t.TaskState == model.TaskStateDoing {
-			actors, _ := c.repo.FindTaskActors(t.ID)
+			actors, _ := c.repo.FindTaskActors(r.Context(), t.ID)
 			if contains(t.ActorIDs, userID) || contains(actors, userID) { count++ }
 		}
 	}

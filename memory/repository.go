@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -35,7 +36,7 @@ func (r *Repository) AddDefine(def *model.ProcessDefine) {
 	r.defines[def.ID] = def
 }
 
-func (r *Repository) FindDefineByID(id int64) (*model.ProcessDefine, error) {
+func (r *Repository) FindDefineByID(ctx context.Context, id int64) (*model.ProcessDefine, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	d, ok := r.defines[id]
@@ -44,7 +45,7 @@ func (r *Repository) FindDefineByID(id int64) (*model.ProcessDefine, error) {
 	return &cp, nil
 }
 
-func (r *Repository) FindInstanceByID(id int64) (*model.ProcessInstance, error) {
+func (r *Repository) FindInstanceByID(ctx context.Context, id int64) (*model.ProcessInstance, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	inst, ok := r.instances[id]
@@ -60,7 +61,7 @@ func (r *Repository) FindInstanceByID(id int64) (*model.ProcessInstance, error) 
 	return &cp, nil
 }
 
-func (r *Repository) SaveInstance(inst *model.ProcessInstance) error {
+func (r *Repository) SaveInstance(ctx context.Context, inst *model.ProcessInstance) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if inst.ID == 0 { inst.ID = r.nextID.Add(1) }
@@ -70,7 +71,7 @@ func (r *Repository) SaveInstance(inst *model.ProcessInstance) error {
 	return nil
 }
 
-func (r *Repository) UpdateInstance(inst *model.ProcessInstance) error {
+func (r *Repository) UpdateInstance(ctx context.Context, inst *model.ProcessInstance) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	cp := *inst
@@ -79,7 +80,7 @@ func (r *Repository) UpdateInstance(inst *model.ProcessInstance) error {
 	return nil
 }
 
-func (r *Repository) FindTaskByID(taskID int64) (*model.ProcessTask, error) {
+func (r *Repository) FindTaskByID(ctx context.Context, taskID int64) (*model.ProcessTask, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	t, ok := r.tasks[taskID]
@@ -89,7 +90,7 @@ func (r *Repository) FindTaskByID(taskID int64) (*model.ProcessTask, error) {
 	return &cp, nil
 }
 
-func (r *Repository) SaveTask(task *model.ProcessTask) error {
+func (r *Repository) SaveTask(ctx context.Context, task *model.ProcessTask) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if task.ID == 0 { task.ID = r.nextID.Add(1) }
@@ -102,7 +103,7 @@ func (r *Repository) SaveTask(task *model.ProcessTask) error {
 	return nil
 }
 
-func (r *Repository) UpdateTask(task *model.ProcessTask) error {
+func (r *Repository) UpdateTask(ctx context.Context, task *model.ProcessTask) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	cp := *task
@@ -114,7 +115,7 @@ func (r *Repository) UpdateTask(task *model.ProcessTask) error {
 	return nil
 }
 
-func (r *Repository) FindDoingTasks(instanceID int64, taskNames []string) ([]*model.ProcessTask, error) {
+func (r *Repository) FindDoingTasks(ctx context.Context, instanceID int64, taskNames []string) ([]*model.ProcessTask, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var result []*model.ProcessTask
@@ -135,7 +136,7 @@ func (r *Repository) FindDoingTasks(instanceID int64, taskNames []string) ([]*mo
 	return result, nil
 }
 
-func (r *Repository) FindDoneTasks(instanceID int64, taskNames []string) ([]*model.ProcessTask, error) {
+func (r *Repository) FindDoneTasks(ctx context.Context, instanceID int64, taskNames []string) ([]*model.ProcessTask, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var result []*model.ProcessTask
@@ -149,7 +150,7 @@ func (r *Repository) FindDoneTasks(instanceID int64, taskNames []string) ([]*mod
 	return result, nil
 }
 
-func (r *Repository) FindHistoryTasks(instanceID int64) ([]*model.ProcessTask, error) {
+func (r *Repository) FindHistoryTasks(ctx context.Context, instanceID int64) ([]*model.ProcessTask, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	var result []*model.ProcessTask
@@ -163,13 +164,13 @@ func (r *Repository) FindHistoryTasks(instanceID int64) ([]*model.ProcessTask, e
 	return result, nil
 }
 
-func (r *Repository) FindTaskActors(taskID int64) ([]string, error) {
+func (r *Repository) FindTaskActors(ctx context.Context, taskID int64) ([]string, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return append([]string{}, r.actors[taskID]...), nil
 }
 
-func (r *Repository) AddTaskActor(taskID int64, actors []string) error {
+func (r *Repository) AddTaskActor(ctx context.Context, taskID int64, actors []string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	existing := r.actors[taskID]
@@ -182,7 +183,7 @@ func (r *Repository) AddTaskActor(taskID int64, actors []string) error {
 	return nil
 }
 
-func (r *Repository) RemoveTaskActor(taskID int64, actors []string) error {
+func (r *Repository) RemoveTaskActor(ctx context.Context, taskID int64, actors []string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	remove := make(map[string]bool)
@@ -195,11 +196,11 @@ func (r *Repository) RemoveTaskActor(taskID int64, actors []string) error {
 	return nil
 }
 
-func (r *Repository) CreateCcInstance(instanceID int64, creator string, actorIDs ...string) error {
+func (r *Repository) CreateCcInstance(ctx context.Context, instanceID int64, creator string, actorIDs ...string) error {
 	return fmt.Errorf("not implemented")
 }
 
-func (r *Repository) UpdateCcStatus(instanceID int64, actorID string) error {
+func (r *Repository) UpdateCcStatus(ctx context.Context, instanceID int64, actorID string) error {
 	return fmt.Errorf("not implemented")
 }
 

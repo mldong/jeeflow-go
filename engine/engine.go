@@ -1,14 +1,18 @@
 // Package engine 引擎接口 + 常量
 package engine
 
-import "github.com/mldong/jeeflow-go/model"
+import (
+	"context"
+
+	"github.com/mldong/jeeflow-go/model"
+)
 
 type Engine interface {
-	StartProcessInstanceByID(defineID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
-	ExecuteProcessTask(taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
-	ExecuteAndJumpToEnd(taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
-	ExecuteAndJumpTask(taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error)
-	ExecuteAndJumpToFirstTaskNode(taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
+	StartProcessInstanceByID(ctx context.Context, defineID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
+	ExecuteProcessTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
+	ExecuteAndJumpToEnd(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
+	ExecuteAndJumpTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error)
+	ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
 }
 
 const (

@@ -60,6 +60,7 @@ jeeflow-go/
 ├── model/           ← 域类型 + LogicFlow 模型
 ├── spi/             ← SPI 接口（对标 SPEC.md §6）
 ├── memory/          ← 内存仓储（测试用）
+├── repository/jdbc/ ← MySQL 参考实现（含集成测试）
 ├── demo/            ← GoFrame REST 演示
 ├── cmd/demo/        ← 演示入口
 └── engine_test.go   ← 合规测试

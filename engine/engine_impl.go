@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -25,8 +26,8 @@ func New(repo spi.ProcessRepository, userProv spi.UserProvider, idGen spi.IDGene
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
 
-func (e *EngineImpl) StartProcessInstanceByID(defineID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	def, err := e.repo.FindDefineByID(defineID)
+func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	def, err := e.repo.FindDefineByID(ctx, defineID)
 	if err != nil || def == nil {
 		return nil, fmt.Errorf("define not found: %d", defineID)
 	}
@@ -40,7 +41,7 @@ func (e *EngineImpl) StartProcessInstanceByID(defineID int64, operator string, a
 	now := time.Now()
 	// 聚合根工厂创建实例
 	inst := model.NewProcessInstance(e.nextID(), defineID, operator, vars, now)
-	e.repo.SaveInstance(inst)
+	e.repo.SaveInstance(ctx, inst)
 	e.fireEvent(ProcessEvent{Type: EventProcessStart, InstanceID: inst.ID, Operator: operator})
 
 	startNode := findNodeByType(&flow, model.TypeStart)
@@ -48,16 +49,16 @@ func (e *EngineImpl) StartProcessInstanceByID(defineID int64, operator string, a
 		return nil, fmt.Errorf("no start node")
 	}
 	for _, node := range followEdges(&flow, startNode.ID) {
-		e.executeNode(&flow, inst, node, operator, vars)
+		e.executeNode(ctx, &flow, inst, node, operator, vars)
 	}
-	inst, _ = e.repo.FindInstanceByID(inst.ID)
+	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
 	return inst, nil
 }
 
 // ─── Execute ───────────────────────────────────────────────────────────────────
 
-func (e *EngineImpl) ExecuteProcessTask(taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	task, inst, err := e.loadAndCheck(taskID, operator)
+func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	task, inst, err := e.loadAndCheck(ctx, taskID, operator)
 	if err != nil {
 		return nil, err
 	}
@@ -70,22 +71,22 @@ func (e *EngineImpl) ExecuteProcessTask(taskID int64, operator string, args map[
 	now := time.Now()
 	// 聚合根：完成任务（子实体状态转换 + 实例变量合并）
 	inst.CompleteTask(task, operator, vars, now)
-	e.repo.UpdateTask(task)
+	e.repo.UpdateTask(ctx, task)
 	e.fireEvent(ProcessEvent{Type: EventTaskComplete, InstanceID: inst.ID, TaskID: task.ID, NodeID: task.TaskName, Operator: operator})
 
 	var flow model.FlowModel
-	def, _ := e.repo.FindDefineByID(inst.DefineID)
+	def, _ := e.repo.FindDefineByID(ctx, inst.DefineID)
 	if def != nil {
 		json.Unmarshal(def.Content, &flow)
 	}
 	inst.Variables = vars
-	e.repo.UpdateInstance(inst)
+	e.repo.UpdateInstance(ctx, inst)
 
 	curNode := findNode(&flow, task.TaskName)
 	if curNode != nil {
 		ct, _ := stringFromProps(curNode.Properties, "countersignType")
 		if ct == "SEQUENTIAL" {
-			doing, _ := e.repo.FindDoingTasks(inst.ID, nil)
+			doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
 			if len(doing) == 0 {
 				actors, lc := getCsState(vars, curNode.ID)
 				if actors != nil && lc+1 < len(actors) {
@@ -96,19 +97,19 @@ func (e *EngineImpl) ExecuteProcessTask(taskID int64, operator string, args map[
 						prefixKey("loopCounter", curNode.ID):   lc + 1,
 						prefixKey("operatorList", curNode.ID):  actors,
 					}
-					e.repo.SaveTask(nt)
-					inst, _ = e.repo.FindInstanceByID(inst.ID)
+					e.repo.SaveTask(ctx, nt)
+					inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
 					return inst, nil
 				}
 			} else {
-				inst, _ = e.repo.FindInstanceByID(inst.ID)
+				inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
 				return inst, nil
 			}
 		}
 		if ct == "PARALLEL" || strings.HasPrefix(ct, "RATIO") {
-			doing, _ := e.repo.FindDoingTasks(inst.ID, nil)
+			doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
 			if len(doing) > 0 {
-				inst, _ = e.repo.FindInstanceByID(inst.ID)
+				inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
 				return inst, nil
 			}
 		}
@@ -117,64 +118,64 @@ func (e *EngineImpl) ExecuteProcessTask(taskID int64, operator string, args map[
 				// 聚合根：流程完成
 				inst.Finish(time.Now())
 				inst.Variables = vars
-				e.repo.UpdateInstance(inst)
+				e.repo.UpdateInstance(ctx, inst)
 				e.fireEvent(ProcessEvent{Type: EventProcessFinish, InstanceID: inst.ID, Operator: operator})
 			} else {
-				e.executeNode(&flow, inst, node, operator, vars)
+				e.executeNode(ctx, &flow, inst, node, operator, vars)
 			}
 		}
 	}
-	inst, _ = e.repo.FindInstanceByID(inst.ID)
+	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
 	return inst, nil
 }
 
 // ─── Reject ────────────────────────────────────────────────────────────────────
 
-func (e *EngineImpl) ExecuteAndJumpToEnd(taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	task, inst, err := e.loadAndCheck(taskID, operator)
+func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	task, inst, err := e.loadAndCheck(ctx, taskID, operator)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now()
 	// 聚合根：废弃所有进行中任务
 	for _, t := range inst.AbandonAllDoing(now) {
-		e.repo.UpdateTask(t)
+		e.repo.UpdateTask(ctx, t)
 	}
 	// 子实体：完成任务
 	task.Finish(operator, task.Variables, now)
-	e.repo.UpdateTask(task)
+	e.repo.UpdateTask(ctx, task)
 	// 聚合根：驳回
 	inst.Reject(now)
-	e.repo.UpdateInstance(inst)
+	e.repo.UpdateInstance(ctx, inst)
 	e.fireEvent(ProcessEvent{Type: EventProcessReject, InstanceID: inst.ID, TaskID: taskID, Operator: operator})
 	return inst, nil
 }
 
 // ─── Jump ─────────────────────────────────────────────────────────────────────
 
-func (e *EngineImpl) ExecuteAndJumpTask(taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
-	task, inst, err := e.loadAndCheck(taskID, operator)
+func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
+	task, inst, err := e.loadAndCheck(ctx, taskID, operator)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now()
 	// 聚合根：废弃所有进行中任务
 	for _, t := range inst.AbandonAllDoing(now) {
-		e.repo.UpdateTask(t)
+		e.repo.UpdateTask(ctx, t)
 	}
 	// 子实体：完成任务
 	task.Finish(operator, task.Variables, now)
-	e.repo.UpdateTask(task)
+	e.repo.UpdateTask(ctx, task)
 
 	if targetTaskName != "" {
 		var flow model.FlowModel
-		def, _ := e.repo.FindDefineByID(inst.DefineID)
+		def, _ := e.repo.FindDefineByID(ctx, inst.DefineID)
 		if def != nil {
 			json.Unmarshal(def.Content, &flow)
 		}
 		target := findNode(&flow, targetTaskName)
 		if target != nil {
-			e.executeNode(&flow, inst, target, operator, inst.Variables)
+			e.executeNode(ctx, &flow, inst, target, operator, inst.Variables)
 		}
 	}
 	return inst, nil
@@ -182,22 +183,22 @@ func (e *EngineImpl) ExecuteAndJumpTask(taskID int64, operator string, args map[
 
 // ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）──────────────
 
-func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	task, inst, err := e.loadAndCheck(taskID, operator)
+func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	task, inst, err := e.loadAndCheck(ctx, taskID, operator)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now()
 	// 聚合根：废弃所有进行中任务
 	for _, t := range inst.AbandonAllDoing(now) {
-		e.repo.UpdateTask(t)
+		e.repo.UpdateTask(ctx, t)
 	}
 	// 子实体：完成任务
 	task.Finish(operator, task.Variables, now)
-	e.repo.UpdateTask(task)
+	e.repo.UpdateTask(ctx, task)
 	// 找到第一个任务节点，强制参与者为发起人，重新执行
 	var flow model.FlowModel
-	def, _ := e.repo.FindDefineByID(inst.DefineID)
+	def, _ := e.repo.FindDefineByID(ctx, inst.DefineID)
 	if def != nil {
 		json.Unmarshal(def.Content, &flow)
 	}
@@ -205,7 +206,7 @@ func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(taskID int64, operator string
 		for _, node := range followEdges(&flow, start.ID) {
 			if node.Type == model.TypeTask || node.Type == model.TypeCustom {
 				node.Properties["assignee"] = inst.Operator
-				e.executeNode(&flow, inst, node, operator, inst.Variables)
+				e.executeNode(ctx, &flow, inst, node, operator, inst.Variables)
 				break
 			}
 		}
@@ -215,8 +216,8 @@ func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(taskID int64, operator string
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
-func (e *EngineImpl) loadAndCheck(taskID int64, operator string) (*model.ProcessTask, *model.ProcessInstance, error) {
-	task, err := e.repo.FindTaskByID(taskID)
+func (e *EngineImpl) loadAndCheck(ctx context.Context, taskID int64, operator string) (*model.ProcessTask, *model.ProcessInstance, error) {
+	task, err := e.repo.FindTaskByID(ctx, taskID)
 	if err != nil || task == nil {
 		return nil, nil, fmt.Errorf("task not found: %d", taskID)
 	}
@@ -226,46 +227,46 @@ func (e *EngineImpl) loadAndCheck(taskID int64, operator string) (*model.Process
 	if !e.isAllowed(task, operator) {
 		return nil, nil, fmt.Errorf("operator %s not allowed", operator)
 	}
-	inst, err := e.repo.FindInstanceByID(task.ProcessInstanceID)
+	inst, err := e.repo.FindInstanceByID(ctx, task.ProcessInstanceID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("instance not found: %w", err)
 	}
 	return task, inst, nil
 }
 
-func (e *EngineImpl) executeNode(flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}) error {
+func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}) error {
 	if !e.firePreInterceptors(node, inst) { return nil }
 	defer e.firePostInterceptors(node, inst)
 
 	switch node.Type {
 	case model.TypeTask, model.TypeCustom:
-		return e.createTask(node, inst, operator, vars)
+		return e.createTask(ctx, node, inst, operator, vars)
 	case model.TypeDecision:
-		return e.evaluateDecision(flow, inst, node, operator, vars)
+		return e.evaluateDecision(ctx, flow, inst, node, operator, vars)
 	case model.TypeFork:
 		for _, n := range followEdges(flow, node.ID) {
-			e.executeNode(flow, inst, n, operator, vars)
+			e.executeNode(ctx, flow, inst, n, operator, vars)
 		}
 		return nil
 	case model.TypeJoin:
-		doing, _ := e.repo.FindDoingTasks(inst.ID, nil)
+		doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
 		if len(doing) == 0 {
 			for _, n := range followEdges(flow, node.ID) {
-				e.executeNode(flow, inst, n, operator, vars)
+				e.executeNode(ctx, flow, inst, n, operator, vars)
 			}
 		}
 		return nil
 	case model.TypeEnd:
 		inst.Finish(time.Now())
 		inst.Variables = vars
-		e.repo.UpdateInstance(inst)
+		e.repo.UpdateInstance(ctx, inst)
 		e.fireEvent(ProcessEvent{Type: EventProcessFinish, InstanceID: inst.ID, Operator: operator})
 		return nil
 	}
 	return nil
 }
 
-func (e *EngineImpl) evaluateDecision(flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}) error {
+func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}) error {
 	// 自定义决策处理器（Registry 优先）
 	if e.registry != nil {
 		handlerName, _ := node.Properties["decisionHandler"].(string)
@@ -279,7 +280,7 @@ func (e *EngineImpl) evaluateDecision(flow *model.FlowModel, inst *model.Process
 					for _, edge := range flow.Edges {
 						if edge.ID == branchID {
 							if target := findNode(flow, edge.TargetNodeID); target != nil {
-								return e.executeNode(flow, inst, target, operator, vars)
+								return e.executeNode(ctx, flow, inst, target, operator, vars)
 							}
 						}
 					}
@@ -295,7 +296,7 @@ func (e *EngineImpl) evaluateDecision(flow *model.FlowModel, inst *model.Process
 			for _, edge := range flow.Edges {
 				if edge.ID == branchID {
 					if target := findNode(flow, edge.TargetNodeID); target != nil {
-						return e.executeNode(flow, inst, target, operator, vars)
+						return e.executeNode(ctx, flow, inst, target, operator, vars)
 					}
 				}
 			}
@@ -309,7 +310,7 @@ func (e *EngineImpl) evaluateDecision(flow *model.FlowModel, inst *model.Process
 		expr, _ := edge.Properties["expr"].(string)
 		if expr == "" {
 			if target := findNode(flow, edge.TargetNodeID); target != nil {
-				return e.executeNode(flow, inst, target, operator, vars)
+				return e.executeNode(ctx, flow, inst, target, operator, vars)
 			}
 			return nil
 		}
@@ -320,7 +321,7 @@ func (e *EngineImpl) evaluateDecision(flow *model.FlowModel, inst *model.Process
 			}
 			if isTruthy(result) {
 				if target := findNode(flow, edge.TargetNodeID); target != nil {
-					return e.executeNode(flow, inst, target, operator, vars)
+					return e.executeNode(ctx, flow, inst, target, operator, vars)
 				}
 				return nil
 			}
@@ -329,8 +330,8 @@ func (e *EngineImpl) evaluateDecision(flow *model.FlowModel, inst *model.Process
 	return nil
 }
 
-func (e *EngineImpl) createTask(node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}) error {
-	actors := e.resolveActors(node)
+func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}) error {
+	actors := e.resolveActors(node, inst)
 	if len(actors) == 0 {
 		return nil
 	}
@@ -343,7 +344,7 @@ func (e *EngineImpl) createTask(node *model.FlowNode, inst *model.ProcessInstanc
 		switch ct {
 		case "PARALLEL":
 			for _, actor := range actors {
-				e.repo.SaveTask(inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now))
+				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now))
 			}
 		case "SEQUENTIAL":
 			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now)
@@ -352,15 +353,15 @@ func (e *EngineImpl) createTask(node *model.FlowNode, inst *model.ProcessInstanc
 				prefixKey("loopCounter", node.ID):   0,
 				prefixKey("operatorList", node.ID):  actors,
 			}
-			e.repo.SaveTask(nt)
+			e.repo.SaveTask(ctx, nt)
 		default:
 			for _, actor := range actors {
-				e.repo.SaveTask(inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now))
+				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now))
 			}
 		}
 		return nil
 	}
-	return e.repo.SaveTask(inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now))
+	return e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now))
 }
 
 func formKeyOf(node *model.FlowNode) string {
@@ -368,7 +369,7 @@ func formKeyOf(node *model.FlowNode) string {
 	return form
 }
 
-func (e *EngineImpl) resolveActors(node *model.FlowNode) []string {
+func (e *EngineImpl) resolveActors(node *model.FlowNode, inst *model.ProcessInstance) []string {
 	// 1a. Registry 按名称解析（推荐，对标 Spring IoC）
 	if e.registry != nil {
 		handlerName, _ := node.Properties["assignmentHandler"].(string)
@@ -385,12 +386,15 @@ func (e *EngineImpl) resolveActors(node *model.FlowNode) []string {
 			return actors
 		}
 	}
-	// 2. 固定指派 assignee
+	// 2. 固定指派 assignee（spec §5：特殊值 "applicant" → 流程发起人）
 	if v, ok := node.Properties["assignee"].(string); ok && v != "" {
 		var actors []string
 		for _, p := range strings.Split(v, ",") {
 			p = strings.TrimSpace(p)
 			if p != "" {
+				if p == "applicant" {
+					p = inst.Operator
+				}
 				actors = append(actors, p)
 			}
 		}
@@ -405,7 +409,7 @@ func (e *EngineImpl) isAllowed(task *model.ProcessTask, operator string) bool {
 		return true
 	}
 	// 仓储兜底：任务参与人表
-	actors, _ := e.repo.FindTaskActors(task.ID)
+	actors, _ := e.repo.FindTaskActors(context.Background(), task.ID)
 	for _, a := range actors {
 		if a == operator {
 			return true
