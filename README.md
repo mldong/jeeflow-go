@@ -3,7 +3,7 @@
 [![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go)](https://go.dev)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-[jeeflow](https://github.com/mldong/jeeflow-spec) 引擎规范的 **Go 语言实现**，零外部依赖，纯 stdlib。
+[jeeflow](https://github.com/mldong/jeeflow-doc) 引擎规范的 **Go 语言实现**，零外部依赖，纯 stdlib。
 
 ---
 
@@ -81,7 +81,7 @@ jeeflow-go/
 
 ## 规范
 
-对齐 [jeeflow-spec](https://github.com/mldong/jeeflow-spec) v1.0，与 Java 版共享同一套流程 JSON 文件驱动测试。
+对齐 [jeeflow-doc](https://github.com/mldong/jeeflow-doc) v1.0，与 Java 版共享同一套流程 JSON 文件驱动测试。
 
 ## License
 
