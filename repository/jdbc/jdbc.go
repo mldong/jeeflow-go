@@ -4,7 +4,7 @@
 // 同事务内所有仓储调用走同一连接；无事务上下文时回退为独立连接。
 // 引擎核心零依赖，本包依赖 database/sql（stdlib）+ 驱动（调用方引入）——
 // 换数据库只需换驱动 import 与 DSN（database/sql 统一抽象，占位符 `?` 由驱动转换）。
-// 建表 SQL 见本包 schema/ 目录（mysql.sql / postgres.sql，各语言统一）。
+// 建表 SQL 唯一来源在 jeeflow-java 仓 resources/（schema-h2/mysql/postgres.sql，各语言统一）。
 package jdbc
 
 import (
