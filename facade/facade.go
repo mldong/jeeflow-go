@@ -350,6 +350,24 @@ func (f *Facade) designDetail(args map[string]interface{}) (interface{}, error) 
 			data["jsonObject"] = graph
 		}
 	}
+	// issues/07：jsonObject 缺失基本信息时从设计表补齐（对齐 boot3 ProcessDesignServiceImpl.findById）
+	jo, _ := data["jsonObject"].(map[string]interface{})
+	if jo == nil {
+		jo = map[string]interface{}{}
+	}
+	if _, ok := jo["name"]; !ok {
+		jo["name"] = design.Name
+	}
+	if _, ok := jo["displayName"]; !ok {
+		jo["displayName"] = design.DisplayName
+	}
+	if _, ok := jo["type"]; !ok {
+		jo["type"] = design.Type
+	}
+	if _, ok := jo["processDesignId"]; !ok {
+		jo["processDesignId"] = design.ID
+	}
+	data["jsonObject"] = jo
 	data["his"] = hisList
 	return data, nil
 }
