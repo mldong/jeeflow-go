@@ -49,6 +49,23 @@ func (r *Repository) FindDefineByID(ctx context.Context, id int64) (*model.Proce
 	return &cp, nil
 }
 
+// FindDefineByName 按流程编码查最新一条定义（id 倒序取首条）
+func (r *Repository) FindDefineByName(ctx context.Context, name string) (*model.ProcessDefine, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var latest *model.ProcessDefine
+	for _, d := range r.defines {
+		if d.Name == name && (latest == nil || d.ID > latest.ID) {
+			latest = d
+		}
+	}
+	if latest == nil {
+		return nil, nil
+	}
+	cp := *latest
+	return &cp, nil
+}
+
 // ─── 定义写操作（v1.0.1，对齐 SPI） ──────────────────────────────────────────
 
 func (r *Repository) SaveDefine(ctx context.Context, def *model.ProcessDefine) error {

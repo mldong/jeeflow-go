@@ -9,6 +9,8 @@ import (
 // ProcessRepository 流程仓储接口（方法名对齐 Java/Node camelCase）
 type ProcessRepository interface {
 	FindDefineByID(ctx context.Context, id int64) (*model.ProcessDefine, error)
+	// FindDefineByName 按流程编码查最新一条定义（v1.1.0，Facade deploy 版本管理用）
+	FindDefineByName(ctx context.Context, name string) (*model.ProcessDefine, error)
 	// 定义写操作（v1.0.1，集成反馈①）：保存/更新/启停/删除流程定义
 	SaveDefine(ctx context.Context, def *model.ProcessDefine) error
 	UpdateDefine(ctx context.Context, def *model.ProcessDefine) error

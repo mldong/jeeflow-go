@@ -178,6 +178,26 @@ func (r *Repository) FindDefineByID(ctx context.Context, id int64) (*model.Proce
 	return def, nil
 }
 
+// FindDefineByName 按流程编码查最新一条定义（id 倒序取首条，deploy 版本管理用）
+func (r *Repository) FindDefineByName(ctx context.Context, name string) (*model.ProcessDefine, error) {
+	c := r.conn(ctx)
+	row := c.QueryRowContext(ctx,
+		"SELECT id, name, display_name, type, state, content, version, create_time, create_user, update_time, update_user FROM wf_process_define WHERE name = ? ORDER BY version DESC LIMIT 1",
+		name)
+	def := &model.ProcessDefine{}
+	var content []byte
+	err := row.Scan(&def.ID, &def.Name, &def.DisplayName, &def.Type, &def.State, &content, &def.Version,
+		&def.CreateTime, &def.CreateUser, &def.UpdateTime, &def.UpdateUser)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	def.Content = content
+	return def, nil
+}
+
 // 定义写操作（v1.0.1，集成反馈①）。SQL 与 jeeflow-java JdbcProcessRepository 对齐；
 // State/Version 零值按 Java null 语义默认 1。
 
