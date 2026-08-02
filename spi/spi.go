@@ -34,6 +34,10 @@ type ProcessRepository interface {
 
 	CreateCcInstance(ctx context.Context, instanceID int64, creator string, actorIDs ...string) error
 	UpdateCcStatus(ctx context.Context, instanceID int64, actorID string) error
+
+	// PageCcInstances 我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：
+	// 按抄送人 actorID 过滤实例列表，返回行数据（含关联定义名/版本）+ 总数
+	PageCcInstances(ctx context.Context, query PageQuery, actorID string) ([]*model.CcInstanceRow, int, error)
 }
 
 // UserProvider 用户信息提供者

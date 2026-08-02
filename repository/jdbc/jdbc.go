@@ -509,7 +509,29 @@ func (r *Repository) insertTaskActors(ctx context.Context, c interface {
 }
 
 func (r *Repository) AddTaskActor(ctx context.Context, taskID int64, actors []string) error {
-	return r.insertTaskActors(ctx, r.conn(ctx), taskID, actors)
+	if len(actors) == 0 {
+		return nil
+	}
+	// 追加语义（对齐 boot2/boot3，issues/03）：查已有参与者，去重后仅插入新增，不清空原参与者
+	existing, err := r.findTaskActors(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]bool)
+	for _, a := range existing {
+		seen[a] = true
+	}
+	var toAdd []string
+	for _, a := range actors {
+		if !seen[a] {
+			seen[a] = true
+			toAdd = append(toAdd, a)
+		}
+	}
+	if len(toAdd) == 0 {
+		return nil
+	}
+	return r.insertTaskActors(ctx, r.conn(ctx), taskID, toAdd)
 }
 
 func (r *Repository) RemoveTaskActor(ctx context.Context, taskID int64, actors []string) error {
@@ -547,6 +569,66 @@ func (r *Repository) UpdateCcStatus(ctx context.Context, instanceID int64, actor
 		"UPDATE wf_process_cc_instance SET state=1, update_time=? WHERE process_instance_id=? AND actor_id=?",
 		time.Now(), instanceID, actorID)
 	return err
+}
+
+// PageCcInstances 我的抄送分页（v1.3.0）：cc 表 join 实例 + 定义，按抄送人过滤（对齐 Java pageCcInstances）
+func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, actorID string) ([]*model.CcInstanceRow, int, error) {
+	pageNum, pageSize := query.PageNum, query.PageSize
+	if pageNum <= 0 {
+		pageNum = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 10
+	}
+	where := " FROM wf_process_instance t" +
+		" LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id" +
+		" LEFT JOIN wf_process_cc_instance cc ON t.id = cc.process_instance_id" +
+		" WHERE cc.actor_id = ?"
+
+	var total int
+	if err := r.conn(ctx).QueryRowContext(ctx, "SELECT COUNT(*) "+where, actorID).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	cols := "t.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no," +
+		" t.operator, t.expire_time, t.variable, t.create_time, t.create_user, t.update_time, t.update_user," +
+		" pd.name, pd.display_name, pd.version"
+	sqlStr := "SELECT " + cols + where + " ORDER BY t.id ASC LIMIT ? OFFSET ?"
+	rows, err := r.conn(ctx).QueryContext(ctx, sqlStr, actorID, pageSize, (pageNum-1)*pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var result []*model.CcInstanceRow
+	for rows.Next() {
+		row := &model.CcInstanceRow{}
+		var parentID sql.NullInt64
+		var expire sql.NullTime
+		var variable []byte
+		var defineVersion sql.NullInt64
+		if err := rows.Scan(&row.ID, &parentID, &row.DefineID, &row.State, &row.ParentNodeName,
+			&row.BusinessNo, &row.Operator, &expire, &variable, &row.CreateTime, &row.CreateUser,
+			&row.UpdateTime, &row.UpdateUser, &row.DefineName, &row.DefineDisplayName, &defineVersion); err != nil {
+			return nil, 0, err
+		}
+		if parentID.Valid {
+			v := parentID.Int64
+			row.ParentID = &v
+		}
+		if expire.Valid {
+			t := expire.Time
+			row.ExpireTime = &t
+		}
+		if len(variable) > 0 {
+			_ = json.Unmarshal(variable, &row.Variables)
+		}
+		if defineVersion.Valid {
+			row.DefineVersion = int(defineVersion.Int64)
+		}
+		result = append(result, row)
+	}
+	return result, total, rows.Err()
 }
 
 // 编译期断言：实现 spi.ProcessRepository

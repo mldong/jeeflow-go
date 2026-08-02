@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/mldong/jeeflow-go/model"
+	"github.com/mldong/jeeflow-go/spi"
 )
 
 type Repository struct {
@@ -298,6 +299,70 @@ func (r *Repository) CreateCcInstance(ctx context.Context, instanceID int64, cre
 
 func (r *Repository) UpdateCcStatus(ctx context.Context, instanceID int64, actorID string) error {
 	return nil // 内存实现无已读状态
+}
+
+// PageCcInstances 我的抄送分页（v1.3.0）：按抄送人 actorID 过滤，join 实例 + 定义
+func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, actorID string) ([]*model.CcInstanceRow, int, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	pageNum, pageSize := query.PageNum, query.PageSize
+	if pageNum <= 0 {
+		pageNum = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 10
+	}
+	var rows []*model.CcInstanceRow
+	for instID, actors := range r.ccInstances {
+		if actorID != "" {
+			hit := false
+			for _, a := range actors {
+				if a == actorID {
+					hit = true
+					break
+				}
+			}
+			if !hit {
+				continue
+			}
+		}
+		inst, ok := r.instances[instID]
+		if !ok {
+			continue
+		}
+		row := &model.CcInstanceRow{
+			ID:             inst.ID,
+			ParentID:       inst.ParentID,
+			DefineID:       inst.DefineID,
+			State:          inst.State,
+			ParentNodeName: inst.ParentNodeName,
+			BusinessNo:     inst.BusinessNo,
+			Operator:       inst.Operator,
+			ExpireTime:     inst.ExpireTime,
+			Variables:      inst.Variables,
+			CreateTime:     inst.CreateTime,
+			CreateUser:     inst.CreateUser,
+			UpdateTime:     inst.UpdateTime,
+			UpdateUser:     inst.UpdateUser,
+		}
+		if def, ok := r.defines[inst.DefineID]; ok {
+			row.DefineName = def.Name
+			row.DefineDisplayName = def.DisplayName
+			row.DefineVersion = def.Version
+		}
+		rows = append(rows, row)
+	}
+	total := len(rows)
+	// 简单分页（对齐 Java 按 id 升序的默认行为）
+	start := (pageNum - 1) * pageSize
+	if start >= total {
+		return []*model.CcInstanceRow{}, total, nil
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	return rows[start:end], total, nil
 }
 
 // ─── Demo helpers ──────────────────────────────────────────────────────────────

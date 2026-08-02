@@ -124,3 +124,23 @@ type UserInfo struct {
 	PostID   string
 	PostName string
 }
+
+// CcInstanceRow 抄送实例行数据（ccList 分页，v1.3.0，对齐 Java InstanceRow 字段）
+type CcInstanceRow struct {
+	ID                int64
+	ParentID          *int64
+	DefineID          int64
+	State             InstanceState
+	ParentNodeName    string
+	BusinessNo        string
+	Operator          string
+	ExpireTime        *time.Time
+	Variables         map[string]interface{}
+	CreateTime        time.Time
+	CreateUser        string
+	UpdateTime        time.Time
+	UpdateUser        string
+	DefineName        string
+	DefineDisplayName string
+	DefineVersion     int
+}

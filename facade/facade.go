@@ -103,7 +103,7 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 	case "processInstance/updateCCStatus":
 		err = f.updateCCStatus(args)
 	case "processInstance/ccList":
-		err = errors.New("ccList 需要核心分页 SPI（pageCcInstances），当前语言 1.3.0 补齐")
+		data, err = f.ccList(args)
 	case "processTask/detail":
 		data, err = f.taskDetail(args)
 	case "processTask/jumpAbleTaskNameList":
@@ -672,6 +672,17 @@ func (f *Facade) updateCCStatus(args map[string]interface{}) error {
 	}
 	operator := toStr(args["operator"], "user1")
 	return f.repo.UpdateCcStatus(context.Background(), instanceID, operator)
+}
+
+// ccList 我的抄送分页（v1.3.0）：operator 作为抄送人过滤
+func (f *Facade) ccList(args map[string]interface{}) (interface{}, error) {
+	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10)}
+	actorID := toStr(args["operator"], "user1")
+	rows, total, err := f.repo.PageCcInstances(context.Background(), query, actorID)
+	if err != nil {
+		return nil, err
+	}
+	return pageData(query.PageNum, query.PageSize, total, rows), nil
 }
 
 func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {

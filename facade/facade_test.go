@@ -292,7 +292,7 @@ func TestFacadeViewEndpoints(t *testing.T) {
 		t.Fatalf("taskLatest = %v, want task1", name)
 	}
 
-	// 抄送：创建 + 已读（ccList 未实现，当前语言）
+	// 抄送：创建 + 已读 + 列表（ccList v1.3.0 补齐）
 	if err := f.Flow("processInstance/createCCInstance", map[string]interface{}{
 		"processInstanceId": instanceID, "operator": "zhangsan", "actorIds": []string{"lisi"},
 	})["code"].(int); err != 0 {
@@ -305,8 +305,13 @@ func TestFacadeViewEndpoints(t *testing.T) {
 		t.Fatalf("updateCCStatus failed: %v", r)
 	}
 	r = f.Flow("processInstance/ccList", map[string]interface{}{"operator": "lisi"})
-	if code, _ := r["code"].(int); code != 99999999 {
-		t.Fatalf("ccList should be unimplemented, got %v", r)
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("ccList failed: %v", r)
+	}
+	ccData := r["data"].(map[string]interface{})
+	ccRows := ccData["rows"].([]*model.CcInstanceRow)
+	if len(ccRows) != 1 {
+		t.Fatalf("ccList rows = %d, want 1", len(ccRows))
 	}
 
 	// 加签/转交
