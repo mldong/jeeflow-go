@@ -2,6 +2,8 @@ package memory
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -409,12 +411,15 @@ func (r *Repository) PageDefines(ctx context.Context, query spi.PageQuery) ([]*m
 	defer r.mu.RUnlock()
 	var rows []*model.DefineRow
 	for _, d := range r.defines {
-		rows = append(rows, &model.DefineRow{
+		row := &model.DefineRow{
 			ID: d.ID, Name: d.Name, DisplayName: d.DisplayName, Type: d.Type,
 			State: d.State, Version: d.Version,
 			CreateTime: d.CreateTime, CreateUser: d.CreateUser,
 			UpdateTime: d.UpdateTime, UpdateUser: d.UpdateUser,
-		})
+		}
+		if matchConditions(query.Conditions, defineFields(row)) {
+			rows = append(rows, row)
+		}
 	}
 	return slicePage(rows, query), len(rows), nil
 }
@@ -440,7 +445,9 @@ func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, ope
 			row.DefineDisplayName = def.DisplayName
 			row.DefineVersion = def.Version
 		}
-		rows = append(rows, row)
+		if matchConditions(query.Conditions, instanceFields(row)) {
+			rows = append(rows, row)
+		}
 	}
 	return slicePage(rows, query), len(rows), nil
 }
@@ -466,7 +473,12 @@ func (r *Repository) PageTodoTasks(ctx context.Context, query spi.PageQuery, act
 				continue
 			}
 		}
-		rows = append(rows, r.taskRow(t))
+		row := r.taskRow(t)
+		fields := taskFields(row)
+		fields["pta.actor_id"] = r.actors[t.ID]
+		if matchConditions(query.Conditions, fields) {
+			rows = append(rows, row)
+		}
 	}
 	return slicePage(rows, query), len(rows), nil
 }
@@ -483,9 +495,167 @@ func (r *Repository) PageDoneTasks(ctx context.Context, query spi.PageQuery, ope
 		if operator != "" && t.ActorID != operator {
 			continue
 		}
-		rows = append(rows, r.taskRow(t))
+		row := r.taskRow(t)
+		if matchConditions(query.Conditions, taskFields(row)) {
+			rows = append(rows, row)
+		}
 	}
 	return slicePage(rows, query), len(rows), nil
+}
+
+// ═══ 条件匹配基建（issues/05-5，对齐 JDBC 白名单语义） ═══
+
+// 行字段映射（列名 → 行属性，白名单列均可匹配）
+func taskFields(r *model.TaskRow) map[string]interface{} {
+	return map[string]interface{}{
+		"t.id": r.ID, "t.task_name": r.TaskName, "t.display_name": r.DisplayName,
+		"t.task_type": r.TaskType, "t.perform_type": r.PerformType, "t.task_state": r.TaskState,
+		"t.operator": r.Operator, "t.form_key": r.FormKey, "t.create_time": r.CreateTime,
+		"t.finish_time": r.FinishTime, "t.expire_time": r.ExpireTime,
+		"t.process_instance_id": r.ProcessInstanceID, "t.task_parent_id": r.TaskParentID,
+		"pd.name": r.ProcessDefineName, "pd.display_name": r.ProcessDefineDisplayName,
+		"pd.version": r.DefineVersion,
+	}
+}
+
+func instanceFields(r *model.InstanceRow) map[string]interface{} {
+	return map[string]interface{}{
+		"t.id": r.ID, "t.parent_id": r.ParentID, "t.process_define_id": r.DefineID,
+		"t.state": r.State, "t.parent_node_name": r.ParentNodeName, "t.business_no": r.BusinessNo,
+		"t.operator": r.Operator, "t.expire_time": r.ExpireTime, "t.create_time": r.CreateTime,
+		"pd.name": r.DefineName, "pd.display_name": r.DefineDisplayName, "pd.version": r.DefineVersion,
+	}
+}
+
+func defineFields(r *model.DefineRow) map[string]interface{} {
+	return map[string]interface{}{
+		"t.id": r.ID, "t.name": r.Name, "t.display_name": r.DisplayName, "t.type": r.Type,
+		"t.state": r.State, "t.version": r.Version, "t.create_time": r.CreateTime,
+		"t.update_time": r.UpdateTime,
+	}
+}
+
+// matchConditions 条件全匹配（操作符对齐 JDBC buildWhere；列不在字段中则跳过）
+func matchConditions(conditions []spi.Condition, fields map[string]interface{}) bool {
+	for _, c := range conditions {
+		v, ok := fields[c.Column]
+		if !ok || v == nil {
+			continue
+		}
+		expect := c.Value
+		if expect == nil {
+			continue
+		}
+		switch strings.ToUpper(c.Operator) {
+		case "EQ":
+			if !eqValue(v, expect) {
+				return false
+			}
+		case "NE":
+			if eqValue(v, expect) {
+				return false
+			}
+		case "LIKE":
+			if !strings.Contains(fmt.Sprint(v), fmt.Sprint(expect)) {
+				return false
+			}
+		case "LLIKE":
+			if !strings.HasSuffix(fmt.Sprint(v), fmt.Sprint(expect)) {
+				return false
+			}
+		case "RLIKE":
+			if !strings.HasPrefix(fmt.Sprint(v), fmt.Sprint(expect)) {
+				return false
+			}
+		case "GT":
+			if compareValues(v, expect) <= 0 {
+				return false
+			}
+		case "GE":
+			if compareValues(v, expect) < 0 {
+				return false
+			}
+		case "LT":
+			if compareValues(v, expect) >= 0 {
+				return false
+			}
+		case "LE":
+			if compareValues(v, expect) > 0 {
+				return false
+			}
+		case "IN":
+			if list, ok := expect.([]interface{}); ok && !containsAny(list, v) {
+				return false
+			}
+		case "NIN":
+			if list, ok := expect.([]interface{}); ok && containsAny(list, v) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// eqValue EQ 判断：值或集合包含（pta.actor_id/cc.actor_id 为切片）
+func eqValue(v, expect interface{}) bool {
+	if list, ok := v.([]string); ok {
+		for _, a := range list {
+			if a == fmt.Sprint(expect) {
+				return true
+			}
+		}
+		return false
+	}
+	return fmt.Sprint(v) == fmt.Sprint(expect)
+}
+
+func containsAny(list []interface{}, v interface{}) bool {
+	sv := fmt.Sprint(v)
+	for _, item := range list {
+		if fmt.Sprint(item) == sv {
+			return true
+		}
+	}
+	return false
+}
+
+// compareValues 值比较：数字可比则数值比较，否则字符串比较
+func compareValues(a, b interface{}) int {
+	af, aok := toFloat64(a)
+	bf, bok := toFloat64(b)
+	if aok && bok {
+		switch {
+		case af < bf:
+			return -1
+		case af > bf:
+			return 1
+		default:
+			return 0
+		}
+	}
+	as, bs := fmt.Sprint(a), fmt.Sprint(b)
+	switch {
+	case as < bs:
+		return -1
+	case as > bs:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func toFloat64(v interface{}) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	}
+	return 0, false
 }
 
 // taskRow 构造任务行（join 实例 + 定义）

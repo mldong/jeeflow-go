@@ -35,10 +35,19 @@ type ProcessExtRepository interface {
 	GetSurrogate(ctx context.Context, operator, processName string, at time.Time) (*model.ProcessSurrogate, error)
 }
 
+// Condition 查询条件（issues/05-5：m_ 前缀参数解析产物，对齐 Java PageQuery.Condition）
+type Condition struct {
+	Column   string
+	Operator string
+	Value    interface{}
+}
+
 // PageQuery 分页查询参数（v1.1.0，扩展仓储分页用）
 type PageQuery struct {
 	PageNum  int
 	PageSize int
 	// 简单条件：字段名（无别名）→ 值，EQ 匹配（扩展仓储分页的最小集）
 	Filters map[string]interface{}
+	// 通用条件（issues/05-5）：白名单 + 参数化过滤（对齐 Java buildWhere）
+	Conditions []Condition
 }

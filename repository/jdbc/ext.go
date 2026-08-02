@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mldong/jeeflow-go/model"
@@ -96,6 +98,12 @@ func (r *ExtRepository) PageDesigns(ctx context.Context, query spi.PageQuery) ([
 			args2 = append(args2, val)
 		}
 	}
+	// m_ 条件（issues/05-5）：LIKE/EQ 等走白名单
+	condSQL, condArgs := buildExtWhere(query.Conditions, designWhitelist)
+	sqlStr += condSQL
+	countStr += condSQL
+	args = append(args, condArgs...)
+	args2 = append(args2, condArgs...)
 	var total int
 	_ = r.conn(ctx).QueryRowContext(ctx, countStr, args2...).Scan(&total)
 
@@ -207,6 +215,58 @@ func (r *ExtRepository) RemoveSurrogate(ctx context.Context, id int64) error {
 	return err
 }
 
+// ═══ 列白名单 + m_ 条件 WHERE 构建（issues/05-5） ═══
+
+var designWhitelist = map[string]bool{
+	"t.id": true, "t.name": true, "t.display_name": true, "t.type": true,
+	"t.is_deployed": true, "t.remark": true, "t.create_time": true, "t.update_time": true,
+}
+
+var surrogateWhitelist = map[string]bool{
+	"t.id": true, "t.process_name": true, "t.operator": true, "t.surrogate": true,
+	"t.enabled": true, "t.start_time": true, "t.end_time": true,
+	"t.create_time": true, "t.update_time": true,
+}
+
+// buildExtWhere m_ 条件 WHERE 构建（白名单 + 参数化）
+func buildExtWhere(conditions []spi.Condition, whitelist map[string]bool) (string, []interface{}) {
+	var b strings.Builder
+	var params []interface{}
+	for _, c := range conditions {
+		if !whitelist[c.Column] {
+			continue
+		}
+		val := c.Value
+		if val == nil {
+			continue
+		}
+		if sv, ok := val.(string); ok && sv == "" {
+			continue
+		}
+		switch strings.ToUpper(c.Operator) {
+		case "EQ":
+			b.WriteString(" AND " + c.Column + " = ?")
+			params = append(params, val)
+		case "LIKE":
+			b.WriteString(" AND " + c.Column + " LIKE ?")
+			params = append(params, "%"+fmt.Sprint(val)+"%")
+		case "LLIKE":
+			b.WriteString(" AND " + c.Column + " LIKE ?")
+			params = append(params, "%"+fmt.Sprint(val))
+		case "RLIKE":
+			b.WriteString(" AND " + c.Column + " LIKE ?")
+			params = append(params, fmt.Sprint(val)+"%")
+		case "IN":
+			if list, ok := val.([]interface{}); ok && len(list) > 0 {
+				marks := strings.TrimSuffix(strings.Repeat("?,", len(list)), ",")
+				b.WriteString(" AND " + c.Column + " IN (" + marks + ")")
+				params = append(params, list...)
+			}
+		}
+	}
+	return b.String(), params
+}
+
 func (r *ExtRepository) PageSurrogates(ctx context.Context, query spi.PageQuery) ([]*model.ProcessSurrogate, int, error) {
 	countStr := "SELECT COUNT(*) FROM wf_process_surrogate t WHERE 1=1"
 	sqlStr := "SELECT " + surrogateCols + " FROM wf_process_surrogate t WHERE 1=1"
@@ -221,6 +281,12 @@ func (r *ExtRepository) PageSurrogates(ctx context.Context, query spi.PageQuery)
 			args = append(args, val)
 		}
 	}
+	// m_ 条件（issues/05-5）
+	condSQL, condArgs := buildExtWhere(query.Conditions, surrogateWhitelist)
+	countStr += condSQL
+	sqlStr += condSQL
+	args2 = append(args2, condArgs...)
+	args = append(args, condArgs...)
 	var total int
 	_ = r.conn(ctx).QueryRowContext(ctx, countStr, args2...).Scan(&total)
 

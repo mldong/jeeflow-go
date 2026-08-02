@@ -317,7 +317,7 @@ func (f *Facade) execute(args map[string]interface{}) error {
 
 func (f *Facade) designPage(args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
-	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10)}
+	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
 	rows, total, err := ext.PageDesigns(context.Background(), query)
 	if err != nil {
 		return nil, err
@@ -452,7 +452,7 @@ func (f *Facade) designDeploy(args map[string]interface{}) (interface{}, error) 
 
 func (f *Facade) surrogatePage(args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
-	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10)}
+	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
 	if v, ok := args["operator"]; ok {
 		query.Filters = map[string]interface{}{"operator": toStr(v, "")}
 	}
@@ -737,7 +737,7 @@ func (f *Facade) updateCCStatus(args map[string]interface{}) error {
 
 // ccList 我的抄送分页（v1.3.0）：operator 作为抄送人过滤
 func (f *Facade) ccList(args map[string]interface{}) (interface{}, error) {
-	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10)}
+	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
 	actorID := toStr(args["operator"], "user1")
 	rows, total, err := f.repo.PageCcInstances(context.Background(), query, actorID)
 	if err != nil {
@@ -1038,7 +1038,7 @@ func toIntDef(v interface{}, def int) int {
 
 // definePage 流程定义分页
 func (f *Facade) definePage(args map[string]interface{}) (interface{}, error) {
-	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10)}
+	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
 	rows, total, err := f.repo.PageDefines(context.Background(), query)
 	if err != nil {
 		return nil, err
@@ -1077,7 +1077,7 @@ func (f *Facade) defineDetail(args map[string]interface{}) (interface{}, error) 
 
 // instancePage 我发起的流程实例分页（operator 过滤）
 func (f *Facade) instancePage(args map[string]interface{}) (interface{}, error) {
-	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10)}
+	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
 	operator := toStr(args["operator"], "user1")
 	rows, total, err := f.repo.PageInstances(context.Background(), query, operator)
 	if err != nil {
@@ -1151,7 +1151,7 @@ func firstTaskNodeIDOf(graph map[string]interface{}) string {
 
 // todoList 我的待办分页（operator 作为抄送…待办人过滤，对齐 Java pta.actor_id EQ）
 func (f *Facade) todoList(args map[string]interface{}) (interface{}, error) {
-	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10)}
+	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
 	actorID := toStr(args["operator"], "user1")
 	rows, total, err := f.repo.PageTodoTasks(context.Background(), query, actorID)
 	if err != nil {
@@ -1166,7 +1166,7 @@ func (f *Facade) todoList(args map[string]interface{}) (interface{}, error) {
 
 // doneList 我的已办分页（operator 过滤，非进行中任务）
 func (f *Facade) doneList(args map[string]interface{}) (interface{}, error) {
-	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10)}
+	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
 	operator := toStr(args["operator"], "user1")
 	rows, total, err := f.repo.PageDoneTasks(context.Background(), query, operator)
 	if err != nil {
@@ -1189,6 +1189,51 @@ func (f *Facade) taskVo(t *model.ProcessTask) map[string]interface{} {
 		"variable": t.Variables, "createTime": t.CreateTime, "createUser": t.CreateUser,
 		"updateTime": t.UpdateTime, "updateUser": t.UpdateUser, "taskActorIdList": t.ActorIDs,
 	}
+}
+
+// parseMQuery m_ 前缀查询参数解析（issues/05-5，对齐 Java JeeflowQueryParser）：
+// m_EQ_taskName → t.task_name EQ；m_pd_LIKE_displayName → pd.display_name LIKE
+func parseMQuery(args map[string]interface{}) []spi.Condition {
+	var out []spi.Condition
+	for key, value := range args {
+		if !strings.HasPrefix(key, "m_") {
+			continue
+		}
+		if value == nil {
+			continue
+		}
+		if sv, ok := value.(string); ok && sv == "" {
+			continue
+		}
+		parts := strings.Split(key[2:], "_")
+		if len(parts) < 2 {
+			continue
+		}
+		var column, operator string
+		if len(parts) == 2 {
+			// 无别名 → 默认主表别名 t（对齐 Java，白名单列均带表别名）
+			operator = parts[0]
+			column = "t." + toUnderscore(parts[1])
+		} else {
+			operator = parts[1]
+			column = parts[0] + "." + toUnderscore(parts[2])
+		}
+		out = append(out, spi.Condition{Column: column, Operator: strings.ToUpper(operator), Value: value})
+	}
+	return out
+}
+
+func toUnderscore(camel string) string {
+	var b strings.Builder
+	for _, c := range camel {
+		if c >= 'A' && c <= 'Z' {
+			b.WriteByte('_')
+			b.WriteRune(c + 32)
+		} else {
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
 }
 
 // ═══ 行输出转换（issues/05-2 字段契约 + 05-3 时间格式）═══

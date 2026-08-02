@@ -580,21 +580,24 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 	if pageSize <= 0 {
 		pageSize = 10
 	}
+	condSQL, condArgs := buildWhere(query.Conditions, ccWhitelist)
 	where := " FROM wf_process_instance t" +
 		" LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id" +
 		" LEFT JOIN wf_process_cc_instance cc ON t.id = cc.process_instance_id" +
-		" WHERE cc.actor_id = ?"
+		" WHERE cc.actor_id = ?" + condSQL
+	ccArgs := append([]interface{}{actorID}, condArgs...)
 
 	var total int
-	if err := r.conn(ctx).QueryRowContext(ctx, "SELECT COUNT(*) "+where, actorID).Scan(&total); err != nil {
+	if err := r.conn(ctx).QueryRowContext(ctx, "SELECT COUNT(*) "+where, ccArgs...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
 	cols := "t.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no," +
 		" t.operator, t.expire_time, t.variable, t.create_time, t.create_user, t.update_time, t.update_user," +
 		" pd.name, pd.display_name, pd.version"
+	ccArgs = append(ccArgs, pageSize, (pageNum-1)*pageSize)
 	sqlStr := "SELECT " + cols + where + " ORDER BY t.id ASC LIMIT ? OFFSET ?"
-	rows, err := r.conn(ctx).QueryContext(ctx, sqlStr, actorID, pageSize, (pageNum-1)*pageSize)
+	rows, err := r.conn(ctx).QueryContext(ctx, sqlStr, ccArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -639,14 +642,17 @@ var _ spi.ProcessRepository = (*Repository)(nil)
 // PageDefines 流程定义分页
 func (r *Repository) PageDefines(ctx context.Context, query spi.PageQuery) ([]*model.DefineRow, int, error) {
 	pageNum, pageSize := normPage(query)
+	condSQL, condArgs := buildWhere(query.Conditions, defineWhitelist)
+	where := " FROM wf_process_define t WHERE 1=1" + condSQL
 	var total int
-	if err := r.conn(ctx).QueryRowContext(ctx, "SELECT COUNT(*) FROM wf_process_define t").Scan(&total); err != nil {
+	if err := r.conn(ctx).QueryRowContext(ctx, "SELECT COUNT(*) "+where, condArgs...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
+	args := append(append([]interface{}{}, condArgs...), pageSize, (pageNum-1)*pageSize)
 	rows, err := r.conn(ctx).QueryContext(ctx,
 		"SELECT id, name, display_name, type, state, version, create_time, create_user, update_time, update_user"+
-			" FROM wf_process_define t ORDER BY t.id DESC LIMIT ? OFFSET ?",
-		pageSize, (pageNum-1)*pageSize)
+			where+" ORDER BY t.id DESC LIMIT ? OFFSET ?",
+		args...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -666,16 +672,19 @@ func (r *Repository) PageDefines(ctx context.Context, query spi.PageQuery) ([]*m
 // PageInstances 我发起的流程实例分页（operator 过滤，join 定义）
 func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, operator string) ([]*model.InstanceRow, int, error) {
 	pageNum, pageSize := normPage(query)
-	where := " FROM wf_process_instance t LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id WHERE t.operator = ?"
+	condSQL, condArgs := buildWhere(query.Conditions, instanceWhitelist)
+	where := " FROM wf_process_instance t LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id WHERE t.operator = ?" + condSQL
 	var total int
-	if err := r.conn(ctx).QueryRowContext(ctx, "SELECT COUNT(*) "+where, operator).Scan(&total); err != nil {
+	if err := r.conn(ctx).QueryRowContext(ctx, "SELECT COUNT(*) "+where, append([]interface{}{operator}, condArgs...)...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 	cols := "t.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no," +
 		" t.operator, t.expire_time, t.variable, t.create_time, t.create_user, t.update_time, t.update_user," +
 		" pd.name, pd.display_name, pd.version"
+	args := append([]interface{}{operator}, condArgs...)
+	args = append(args, pageSize, (pageNum-1)*pageSize)
 	rows, err := r.conn(ctx).QueryContext(ctx,
-		"SELECT "+cols+where+" ORDER BY t.id DESC LIMIT ? OFFSET ?", operator, pageSize, (pageNum-1)*pageSize)
+		"SELECT "+cols+where+" ORDER BY t.id DESC LIMIT ? OFFSET ?", args...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -724,12 +733,13 @@ func (r *Repository) PageDoneTasks(ctx context.Context, query spi.PageQuery, ope
 // pageTasks 待办/已办分页（对齐 Java pageTasks：todo 按 actor 过滤、done 按操作人过滤）
 func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bool, filter string) ([]*model.TaskRow, int, error) {
 	pageNum, pageSize := normPage(query)
+	condSQL, condArgs := buildWhere(query.Conditions, taskWhitelist)
 	where := " FROM wf_process_task t" +
 		" LEFT JOIN wf_process_instance pi ON t.process_instance_id = pi.id" +
 		" LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id" +
 		" LEFT JOIN wf_process_task_actor pta ON t.id = pta.process_task_id" +
-		" WHERE 1=1" + filterWhere(done, filter)
-	args := []interface{}{filter}
+		" WHERE 1=1" + filterWhere(done, filter) + condSQL
+	args := append([]interface{}{filter}, condArgs...)
 	var total int
 	if err := r.conn(ctx).QueryRowContext(ctx, "SELECT COUNT(DISTINCT t.id) "+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
@@ -786,6 +796,94 @@ func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bo
 }
 
 // filterWhere 待办（task_state=10 + pta.actor_id 过滤）/ 已办（非进行中 + t.operator 过滤）
+// ═══ 列白名单 + m_ 条件 WHERE 构建（issues/05-5，对齐 Java buildWhere） ═══
+
+var taskWhitelist = map[string]bool{
+	"t.id": true, "t.task_name": true, "t.display_name": true, "t.task_type": true,
+	"t.perform_type": true, "t.task_state": true, "t.operator": true, "t.form_key": true,
+	"t.create_time": true, "t.finish_time": true, "t.expire_time": true,
+	"t.process_instance_id": true, "t.task_parent_id": true, "t.variable": true,
+	"pi.id": true, "pi.business_no": true, "pi.operator": true, "pi.create_time": true, "pi.state": true,
+	"pd.name": true, "pd.display_name": true, "pd.type": true,
+	"pta.actor_id": true, "pta.process_task_id": true,
+}
+
+var instanceWhitelist = map[string]bool{
+	"t.id": true, "t.parent_id": true, "t.process_define_id": true, "t.state": true,
+	"t.business_no": true, "t.operator": true, "t.create_time": true, "t.expire_time": true,
+	"t.variable": true, "pd.name": true, "pd.display_name": true, "pd.type": true, "pd.version": true,
+}
+
+var ccWhitelist = map[string]bool{
+	"t.id": true, "t.process_define_id": true, "t.state": true, "t.business_no": true,
+	"t.operator": true, "t.create_time": true, "t.variable": true,
+	"pd.name": true, "pd.display_name": true, "pd.type": true, "pd.version": true,
+	"cc.actor_id": true, "cc.state": true,
+}
+
+var defineWhitelist = map[string]bool{
+	"t.id": true, "t.name": true, "t.display_name": true, "t.type": true, "t.state": true,
+	"t.version": true, "t.create_time": true, "t.update_time": true,
+}
+
+// buildWhere m_ 条件 WHERE 构建（白名单 + 参数化）
+func buildWhere(conditions []spi.Condition, whitelist map[string]bool) (string, []interface{}) {
+	var b strings.Builder
+	var params []interface{}
+	for _, c := range conditions {
+		if !whitelist[c.Column] {
+			continue // 不在白名单，丢弃
+		}
+		val := c.Value
+		if val == nil {
+			continue
+		}
+		if sv, ok := val.(string); ok && sv == "" {
+			continue
+		}
+		switch strings.ToUpper(c.Operator) {
+		case "EQ":
+			b.WriteString(" AND " + c.Column + " = ?")
+			params = append(params, val)
+		case "NE":
+			b.WriteString(" AND " + c.Column + " <> ?")
+			params = append(params, val)
+		case "LIKE":
+			b.WriteString(" AND " + c.Column + " LIKE ?")
+			params = append(params, "%"+fmt.Sprint(val)+"%")
+		case "LLIKE":
+			b.WriteString(" AND " + c.Column + " LIKE ?")
+			params = append(params, "%"+fmt.Sprint(val))
+		case "RLIKE":
+			b.WriteString(" AND " + c.Column + " LIKE ?")
+			params = append(params, fmt.Sprint(val)+"%")
+		case "GT":
+			b.WriteString(" AND " + c.Column + " > ?")
+			params = append(params, val)
+		case "GE":
+			b.WriteString(" AND " + c.Column + " >= ?")
+			params = append(params, val)
+		case "LT":
+			b.WriteString(" AND " + c.Column + " < ?")
+			params = append(params, val)
+		case "LE":
+			b.WriteString(" AND " + c.Column + " <= ?")
+			params = append(params, val)
+		case "IN", "NIN":
+			if list, ok := val.([]interface{}); ok && len(list) > 0 {
+				marks := strings.TrimSuffix(strings.Repeat("?,", len(list)), ",")
+				op := "IN"
+				if strings.ToUpper(c.Operator) == "NIN" {
+					op = "NOT IN"
+				}
+				b.WriteString(" AND " + c.Column + " " + op + " (" + marks + ")")
+				params = append(params, list...)
+			}
+		}
+	}
+	return b.String(), params
+}
+
 func filterWhere(done bool, filter string) string {
 	if done {
 		return " AND t.task_state <> 10 AND t.operator = ?"

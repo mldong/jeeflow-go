@@ -1,6 +1,7 @@
 package facade_test
 
 import (
+	"reflect"
 	"context"
 	"os"
 	"testing"
@@ -471,5 +472,90 @@ func TestDetailJsonObject(t *testing.T) {
 	}
 	if _, ok := r["data"].(map[string]interface{})["jsonObject"]; !ok {
 		t.Fatalf("taskDetail 缺 jsonObject: %v", r["data"])
+	}
+}
+
+func TestMQueryParams(t *testing.T) {
+	// issues/05-5：m_ 前缀查询参数（m_LIKE_name / m_pd_LIKE_displayName / m_t_LIKE_displayName）
+	f, _, _ := setupFacade()
+	c1 := string(flowContent(t, "01-simple.json"))
+	c2 := string(flowContent(t, "02-multi-task.json"))
+	if r := f.Flow("processDefine/deploy", map[string]interface{}{"content": c1}); r["code"].(int) != 0 {
+		t.Fatalf("deploy1: %v", r)
+	}
+	if r := f.Flow("processDefine/deploy", map[string]interface{}{"content": c2}); r["code"].(int) != 0 {
+		t.Fatalf("deploy2: %v", r)
+	}
+
+	// 无别名 → 默认主表别名 t（t.name / t.display_name）
+	r := f.Flow("processDefine/page", map[string]interface{}{"m_LIKE_name": "simple"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("definePage: %v", r)
+	}
+	rows := r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	if len(rows) != 1 {
+		t.Fatalf("m_LIKE_name 应过滤到 1 行: %v", r)
+	}
+
+	r = f.Flow("processDefine/page", map[string]interface{}{"m_LIKE_displayName": "简单"})
+	rows = r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	if len(rows) != 1 {
+		t.Fatalf("m_LIKE_displayName 应过滤到 1 行: %v", r)
+	}
+
+	r = f.Flow("processDefine/page", map[string]interface{}{"m_LIKE_displayName": "流程"})
+	rows = r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	if len(rows) != 2 {
+		t.Fatalf("m_LIKE_displayName 应匹配全部: %v", r)
+	}
+
+	// 实例列表：m_pd_LIKE_displayName（别名 pd → pd.display_name）
+	r = f.Flow("processDefine/getLastByName", map[string]interface{}{"processDefineName": "simple"})
+	defineID := r["data"].(map[string]interface{})["id"].(int64)
+	if r := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": defineID, "operator": "zhangsan",
+	}); r["code"].(int) != 0 {
+		t.Fatalf("start: %v", r)
+	}
+	r = f.Flow("processInstance/page", map[string]interface{}{
+		"operator": "zhangsan", "m_pd_LIKE_displayName": "简单",
+	})
+	rows = r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	if len(rows) != 1 {
+		t.Fatalf("m_pd_LIKE_displayName 应命中: %v", r)
+	}
+	r = f.Flow("processInstance/page", map[string]interface{}{
+		"operator": "zhangsan", "m_pd_LIKE_displayName": "zzz",
+	})
+	rows = r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	if len(rows) != 0 {
+		t.Fatalf("m_pd_LIKE_displayName 不应命中: %v", r)
+	}
+
+	// 任务列表：m_t_LIKE_displayName（别名 t → t.display_name）
+	r = f.Flow("processTask/todoList", map[string]interface{}{
+		"operator": "leader", "m_t_LIKE_displayName": "审批",
+	})
+	rows = r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	if len(rows) != 1 {
+		t.Fatalf("m_t_LIKE_displayName 应命中待办: %v", r)
+	}
+	r = f.Flow("processTask/todoList", map[string]interface{}{
+		"operator": "leader", "m_t_LIKE_displayName": "zzz",
+	})
+	rows = r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	if len(rows) != 0 {
+		t.Fatalf("m_t_LIKE_displayName 不应命中: %v", r)
+	}
+
+	// 设计列表：无别名 m_LIKE_name（process-design 页）
+	if r := f.Flow("processDesign/save", map[string]interface{}{
+		"name": "leave", "displayName": "请假流程", "content": c1, "operator": "zhangsan",
+	}); r["code"].(int) != 0 {
+		t.Fatalf("design save: %v", r)
+	}
+	r = f.Flow("processDesign/page", map[string]interface{}{"m_LIKE_name": "leave"})
+	if got := reflect.ValueOf(r["data"].(map[string]interface{})["rows"]).Len(); got != 1 {
+		t.Fatalf("design m_LIKE_name 应命中 1 行, got %d: %v", got, r)
 	}
 }
