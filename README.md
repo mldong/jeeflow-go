@@ -5,6 +5,9 @@
 
 [jeeflow](https://jeeflow-doc.mldong.com) 引擎规范的 **Go 语言实现**，零外部依赖，纯 stdlib。
 
+> **v1.1.0**：新增管理扩展（流程设计/历史/委托 + `ProcessExtRepository`）与统一门面
+> `facade.Flow(action, map)`；assignee 变量解析与 `flow.auto`/`flow.admin` 系统代执行对齐 boot2/boot3。
+
 ---
 
 ## 快速开始
