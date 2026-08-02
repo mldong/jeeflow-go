@@ -330,3 +330,87 @@ func (ic *testInterceptor) PostHandle(node *model.FlowNode, inst *model.ProcessI
 	ic.post(node, inst)
 }
 func (ic *testInterceptor) Order() int { return ic.order }
+
+// ─── assignee 变量解析（v1.0.1，集成反馈③） ──────────────────────────────────
+
+func Test11AssigneeVariableResolution(t *testing.T) {
+	eng, repo := setup()
+	def := registerFlow(repo, "11-assignee-vars.json")
+
+	// ① deptLeader 变量命中 → 参与者 = 变量值
+	inst := startAndExecute(eng, repo, def.ID, "applicant", map[string]interface{}{"deptLeader": "L001"})
+	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(doing) != 1 || doing[0].TaskName != "task1" {
+		t.Fatalf("want task1, got %+v", doing)
+	}
+	if len(doing[0].ActorIDs) != 1 || doing[0].ActorIDs[0] != "L001" {
+		t.Fatalf("assignee var not resolved: %v", doing[0].ActorIDs)
+	}
+
+	// ② 静态字面量 userA,userB（变量未命中）
+	eng.ExecuteProcessTask(context.Background(), doing[0].ID, "L001", nil)
+	doing, _ = repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(doing) != 1 || doing[0].TaskName != "task2" {
+		t.Fatalf("want task2, got %+v", doing)
+	}
+	if len(doing[0].ActorIDs) != 2 || doing[0].ActorIDs[0] != "userA" || doing[0].ActorIDs[1] != "userB" {
+		t.Fatalf("literal actors wrong: %v", doing[0].ActorIDs)
+	}
+
+	// ③ 变量未传入 → token 字面量回退（对齐 boot3 args.get(token, token)）
+	def = registerFlow(repo, "11-assignee-vars.json")
+	inst = startAndExecute(eng, repo, def.ID, "applicant", nil)
+	doing, _ = repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if doing[0].ActorIDs[0] != "deptLeader" {
+		t.Fatalf("want literal deptLeader, got %v", doing[0].ActorIDs)
+	}
+
+	// ④ tf_nextNodeOperator 优先于 assignee
+	def = registerFlow(repo, "11-assignee-vars.json")
+	inst, _ = eng.StartProcessInstanceByID(context.Background(), def.ID, "applicant", nil)
+	doing, _ = repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if _, err := eng.ExecuteProcessTask(context.Background(), doing[0].ID, "applicant",
+		map[string]interface{}{engine.KeyNextNodeOperator: "BOSS1,BOSS2"}); err != nil {
+		t.Fatalf("execute apply: %v", err)
+	}
+	doing, _ = repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(doing[0].ActorIDs) != 2 || doing[0].ActorIDs[0] != "BOSS1" || doing[0].ActorIDs[1] != "BOSS2" {
+		t.Fatalf("nextNodeOperator not prioritized: %v", doing[0].ActorIDs)
+	}
+}
+
+// ─── 系统代执行 flow.auto / flow.admin（v1.0.1，集成反馈④） ───────────────────
+
+func Test12SystemExecuteFlowAuto(t *testing.T) {
+	eng, repo := setup()
+	def := registerFlow(repo, "11-assignee-vars.json")
+	inst, _ := eng.StartProcessInstanceByID(context.Background(), def.ID, "applicant",
+		map[string]interface{}{"deptLeader": "L001"})
+	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
+
+	// ① flow.auto 非参与者身份放行（startAndExecute 契约）
+	inst, err := eng.ExecuteProcessTask(context.Background(), doing[0].ID, engine.KeyAutoExecute, nil)
+	if err != nil {
+		t.Fatalf("flow.auto should pass: %v", err)
+	}
+	doing, _ = repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if doing[0].TaskName != "task1" {
+		t.Fatalf("want task1, got %v", doing[0].TaskName)
+	}
+
+	// ② 跳过 UserProvider 注入：u_userId 保持发起人
+	reloaded, _ := repo.FindInstanceByID(context.Background(), inst.ID)
+	if uid, _ := reloaded.Variables[engine.KeyUserID].(string); uid != "applicant" {
+		t.Fatalf("user info should not be injected for flow.auto: %v", reloaded.Variables[engine.KeyUserID])
+	}
+
+	// ③ flow.admin 放行
+	inst, err = eng.ExecuteProcessTask(context.Background(), doing[0].ID, engine.KeyAdminID, nil)
+	if err != nil {
+		t.Fatalf("flow.admin should pass: %v", err)
+	}
+	doing, _ = repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if doing[0].TaskName != "task2" {
+		t.Fatalf("want task2, got %v", doing[0].TaskName)
+	}
+}

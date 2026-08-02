@@ -25,4 +25,9 @@ const (
 	KeyPostID       = "u_postId"
 	KeyPostName     = "u_postName"
 	KeyAutoGenTitle = "autoGenTitle"
+	// v1.0.1：下一节点处理人（对齐 boot3 tf_nextNodeOperator）
+	KeyNextNodeOperator = "tf_nextNodeOperator"
+	// v1.0.1：系统代执行 / 超级管理员（对齐 boot3 FlowConst）
+	KeyAutoExecute = "flow.auto"
+	KeyAdminID     = "flow.admin"
 )

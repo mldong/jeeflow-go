@@ -349,7 +349,7 @@ func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel
 }
 
 func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}) error {
-	actors := e.resolveActors(node, inst)
+	actors := e.resolveActors(node, inst, vars)
 	if len(actors) == 0 {
 		return nil
 	}
@@ -379,7 +379,12 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 		}
 		return nil
 	}
-	return e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now))
+	// 普通任务：一个任务，全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
+	nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now)
+	if len(actors) > 1 {
+		nt.ActorIDs = actors
+	}
+	return e.repo.SaveTask(ctx, nt)
 }
 
 func formKeyOf(node *model.FlowNode) string {
@@ -387,7 +392,7 @@ func formKeyOf(node *model.FlowNode) string {
 	return form
 }
 
-func (e *EngineImpl) resolveActors(node *model.FlowNode, inst *model.ProcessInstance) []string {
+func (e *EngineImpl) resolveActors(node *model.FlowNode, inst *model.ProcessInstance, vars map[string]interface{}) []string {
 	// 1a. Registry 按名称解析（推荐，对标 Spring IoC）
 	if e.registry != nil {
 		handlerName, _ := node.Properties["assignmentHandler"].(string)
@@ -404,15 +409,25 @@ func (e *EngineImpl) resolveActors(node *model.FlowNode, inst *model.ProcessInst
 			return actors
 		}
 	}
-	// 2. 固定指派 assignee（spec §5：特殊值 "applicant" → 流程发起人）
+	// 2. 动态指定下一节点处理人优先（v1.0.1：对齐 boot3 tf_nextNodeOperator）
+	if v, ok := vars[KeyNextNodeOperator]; ok {
+		return valueToActors(v, true)
+	}
+	// 3. 固定指派 assignee——token 即变量 key，能替换就换，换不了就是字面量（v1.0.1 对齐 boot3 args.get(token, token)）
 	if v, ok := node.Properties["assignee"].(string); ok && v != "" {
 		var actors []string
 		for _, p := range strings.Split(v, ",") {
 			p = strings.TrimSpace(p)
-			if p != "" {
-				if p == "applicant" {
-					p = inst.Operator
-				}
+			if p == "" {
+				continue
+			}
+			// mldong 契约特殊值：applicant → 流程发起人
+			if p == "applicant" {
+				p = inst.Operator
+			}
+			if val, ok := vars[p]; ok {
+				actors = append(actors, valueToActors(val, false)...)
+			} else {
 				actors = append(actors, p)
 			}
 		}
@@ -421,7 +436,43 @@ func (e *EngineImpl) resolveActors(node *model.FlowNode, inst *model.ProcessInst
 	return nil
 }
 
+// valueToActors 把变量值转参与者列表：
+// split=true 时 String 按逗号分割（tf_nextNodeOperator 语义）；否则 String 原样单个（assignee 命中语义）
+func valueToActors(v interface{}, split bool) []string {
+	var out []string
+	switch t := v.(type) {
+	case string:
+		if split {
+			for _, s := range strings.Split(t, ",") {
+				s = strings.TrimSpace(s)
+				if s != "" {
+					out = append(out, s)
+				}
+			}
+		} else if t = strings.TrimSpace(t); t != "" {
+			out = append(out, t)
+		}
+	case []string:
+		out = append(out, t...)
+	case []interface{}:
+		for _, s := range t {
+			if str, ok := s.(string); ok {
+				out = append(out, str)
+			} else {
+				out = append(out, fmt.Sprintf("%v", s))
+			}
+		}
+	default:
+		out = append(out, fmt.Sprintf("%v", v))
+	}
+	return out
+}
+
 func (e *EngineImpl) isAllowed(task *model.ProcessTask, operator string) bool {
+	// v1.0.1：系统代执行（flow.auto）/超级管理员（flow.admin）放行（对齐 boot3 isAllowed）
+	if strings.EqualFold(operator, KeyAutoExecute) || strings.EqualFold(operator, KeyAdminID) {
+		return true
+	}
 	// 子实体：actorIds 权限判断
 	if task.IsAllowed(operator) {
 		return true
@@ -438,6 +489,10 @@ func (e *EngineImpl) isAllowed(task *model.ProcessTask, operator string) bool {
 
 func (e *EngineImpl) addUserInfo(operator string, vars map[string]interface{}) {
 	if e.userProv == nil {
+		return
+	}
+	// v1.0.1：系统代执行（flow.auto）/超级管理员（flow.admin）非真实用户，跳过注入（对齐 boot3）
+	if strings.EqualFold(operator, KeyAutoExecute) || strings.EqualFold(operator, KeyAdminID) {
 		return
 	}
 	u, err := e.userProv.GetUser(operator)
