@@ -289,6 +289,107 @@ func TestPermissionDenied(t *testing.T) {
 	}
 }
 
+// ─── 定义写操作 SPI（v1.0.1，集成反馈①） ────────────────────────────────────
+
+func TestDefineCrud(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	cleanup(t, db)
+	defer cleanup(t, db)
+
+	ctx := context.Background()
+	repo := jdbc.New(db)
+
+	// save：ID 由仓储生成
+	def := &model.ProcessDefine{Name: "go-crud", DisplayName: "CRUD 流程", Type: "test", State: 1, Version: 1, Content: []byte("{}"), UpdateUser: "tester"}
+	if err := repo.SaveDefine(ctx, def); err != nil {
+		t.Fatalf("save define: %v", err)
+	}
+	if def.ID == 0 {
+		t.Fatalf("save define should assign id")
+	}
+	loaded, err := repo.FindDefineByID(ctx, def.ID)
+	if err != nil || loaded == nil || loaded.Name != "go-crud" {
+		t.Fatalf("find define: %+v err=%v", loaded, err)
+	}
+
+	// update
+	loaded.DisplayName = "CRUD 流程 v2"
+	loaded.Content = []byte(`{"v":2}`)
+	if err := repo.UpdateDefine(ctx, loaded); err != nil {
+		t.Fatalf("update define: %v", err)
+	}
+	updated, _ := repo.FindDefineByID(ctx, def.ID)
+	if updated.DisplayName != "CRUD 流程 v2" {
+		t.Fatalf("update define not persisted: %+v", updated)
+	}
+
+	// state（启用/禁用）
+	if err := repo.UpdateDefineState(ctx, def.ID, 0); err != nil {
+		t.Fatalf("update define state: %v", err)
+	}
+	if got, _ := repo.FindDefineByID(ctx, def.ID); got.State != 0 {
+		t.Fatalf("state not updated: %d", got.State)
+	}
+
+	// remove
+	if err := repo.RemoveDefine(ctx, def.ID); err != nil {
+		t.Fatalf("remove define: %v", err)
+	}
+	if got, _ := repo.FindDefineByID(ctx, def.ID); got != nil {
+		t.Fatalf("define should be removed")
+	}
+}
+
+// ─── updateInstance 级联持久化任务状态（v1.0.1，集成反馈②） ─────────────────
+
+func TestUpdateInstanceCascadesTasks(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	cleanup(t, db)
+	defer cleanup(t, db)
+
+	content := loadFlow(t, "01-simple.json")
+	insertDefine(t, db, "go-simple", content)
+
+	ctx := context.Background()
+	repo := jdbc.New(db)
+	eng := newEngine(t, repo)
+
+	inst, err := eng.StartProcessInstanceByID(ctx, defineID, "zhangsan", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// 加载实例（含任务），修改任务状态后 updateInstance
+	reloaded, err := repo.FindInstanceByID(ctx, inst.ID)
+	if err != nil || reloaded == nil {
+		t.Fatalf("reload instance: %v", err)
+	}
+	tasks, err := repo.FindHistoryTasks(ctx, inst.ID)
+	if err != nil || len(tasks) == 0 {
+		t.Fatalf("no tasks in instance")
+	}
+	reloaded.Tasks = tasks
+	for _, task := range tasks {
+		task.TaskState = model.TaskStateAbandoned
+	}
+	if err := repo.UpdateInstance(ctx, reloaded); err != nil {
+		t.Fatalf("update instance: %v", err)
+	}
+
+	// 重新加载验证任务状态已落库
+	after, err := repo.FindHistoryTasks(ctx, inst.ID)
+	if err != nil {
+		t.Fatalf("reload after: %v", err)
+	}
+	for _, task := range after {
+		if task.TaskState != model.TaskStateAbandoned {
+			t.Fatalf("task state not cascaded: %+v", task)
+		}
+	}
+}
+
 // ─── 事务（spec §7.4）：绑定连接 + 回滚 ───────────────────────────────────────
 
 func TestWithTx(t *testing.T) {

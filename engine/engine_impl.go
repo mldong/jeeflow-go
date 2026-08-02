@@ -72,6 +72,9 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 	// 聚合根：完成任务（子实体状态转换 + 实例变量合并）
 	inst.CompleteTask(task, operator, vars, now)
 	e.repo.UpdateTask(ctx, task)
+	// v1.0.1：updateInstance 级联持久化依赖聚合内任务副本为最新状态，
+	// CompleteTask 改的是外部任务对象，需同步回聚合根
+	syncTaskToAggregate(inst, task)
 	e.fireEvent(ProcessEvent{Type: EventTaskComplete, InstanceID: inst.ID, TaskID: task.ID, NodeID: task.TaskName, Operator: operator})
 
 	var flow model.FlowModel
@@ -129,6 +132,17 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 	return inst, nil
 }
 
+// syncTaskToAggregate 把外部任务对象的最新状态同步回聚合根任务副本
+// （v1.0.1：updateInstance 级联持久化依赖聚合内任务副本为最新状态）
+func syncTaskToAggregate(inst *model.ProcessInstance, task *model.ProcessTask) {
+	for i, t := range inst.Tasks {
+		if t.ID == task.ID {
+			inst.Tasks[i] = task
+			return
+		}
+	}
+}
+
 // ─── Reject ────────────────────────────────────────────────────────────────────
 
 func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
@@ -144,6 +158,8 @@ func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, oper
 	// 子实体：完成任务
 	task.Finish(operator, task.Variables, now)
 	e.repo.UpdateTask(ctx, task)
+	// v1.0.1：同步回聚合根，避免 updateInstance 级联把任务写回旧状态
+	syncTaskToAggregate(inst, task)
 	// 聚合根：驳回
 	inst.Reject(now)
 	e.repo.UpdateInstance(ctx, inst)
@@ -235,7 +251,9 @@ func (e *EngineImpl) loadAndCheck(ctx context.Context, taskID int64, operator st
 }
 
 func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}) error {
-	if !e.firePreInterceptors(node, inst) { return nil }
+	if !e.firePreInterceptors(node, inst) {
+		return nil
+	}
 	defer e.firePostInterceptors(node, inst)
 
 	switch node.Type {
@@ -427,11 +445,21 @@ func (e *EngineImpl) addUserInfo(operator string, vars map[string]interface{}) {
 		return
 	}
 	vars[KeyUserID] = u.UserID
-	if u.RealName != "" { vars[KeyRealName] = u.RealName }
-	if u.DeptID != "" { vars[KeyDeptID] = u.DeptID }
-	if u.DeptName != "" { vars[KeyDeptName] = u.DeptName }
-	if u.PostID != "" { vars[KeyPostID] = u.PostID }
-	if u.PostName != "" { vars[KeyPostName] = u.PostName }
+	if u.RealName != "" {
+		vars[KeyRealName] = u.RealName
+	}
+	if u.DeptID != "" {
+		vars[KeyDeptID] = u.DeptID
+	}
+	if u.DeptName != "" {
+		vars[KeyDeptName] = u.DeptName
+	}
+	if u.PostID != "" {
+		vars[KeyPostID] = u.PostID
+	}
+	if u.PostName != "" {
+		vars[KeyPostName] = u.PostName
+	}
 }
 
 func (e *EngineImpl) nextID() int64 {
@@ -475,8 +503,12 @@ func followEdges(flow *model.FlowModel, sourceID string) []*model.FlowNode {
 
 func mergeVars(args map[string]interface{}, base map[string]interface{}) map[string]interface{} {
 	out := make(map[string]interface{})
-	for k, v := range base { out[k] = v }
-	for k, v := range args { out[k] = v }
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range args {
+		out[k] = v
+	}
 	return out
 }
 
@@ -484,16 +516,21 @@ func getCsState(vars map[string]interface{}, nodeID string) ([]string, int) {
 	var actors []string
 	if v, ok := vars[prefixKey("operatorList", nodeID)]; ok {
 		switch a := v.(type) {
-		case []string: actors = a
+		case []string:
+			actors = a
 		case []interface{}:
-			for _, x := range a { actors = append(actors, fmt.Sprint(x)) }
+			for _, x := range a {
+				actors = append(actors, fmt.Sprint(x))
+			}
 		}
 	}
 	lc := 0
 	if v, ok := vars[prefixKey("loopCounter", nodeID)]; ok {
 		switch x := v.(type) {
-		case float64: lc = int(x)
-		case int: lc = x
+		case float64:
+			lc = int(x)
+		case int:
+			lc = x
 		}
 	}
 	return actors, lc
@@ -501,11 +538,16 @@ func getCsState(vars map[string]interface{}, nodeID string) ([]string, int) {
 
 func isTruthy(v interface{}) bool {
 	switch val := v.(type) {
-	case bool: return val
-	case string: return val != "" && val != "false"
-	case float64: return val != 0
-	case nil: return false
-	default: return true
+	case bool:
+		return val
+	case string:
+		return val != "" && val != "false"
+	case float64:
+		return val != 0
+	case nil:
+		return false
+	default:
+		return true
 	}
 }
 
@@ -514,11 +556,15 @@ func prefixKey(key, nodeID string) string { return key + "_" + nodeID }
 func intFromProps(props map[string]interface{}, key string) (int, bool) {
 	if v, ok := props[key]; ok {
 		switch val := v.(type) {
-		case float64: return int(val), true
-		case int: return val, true
+		case float64:
+			return int(val), true
+		case int:
+			return val, true
 		case string:
 			var n int
-			if _, err := fmt.Sscanf(val, "%d", &n); err == nil { return n, true }
+			if _, err := fmt.Sscanf(val, "%d", &n); err == nil {
+				return n, true
+			}
 		case json.Number:
 			n, _ := val.Int64()
 			return int(n), true
@@ -530,9 +576,12 @@ func intFromProps(props map[string]interface{}, key string) (int, bool) {
 func stringFromProps(props map[string]interface{}, key string) (string, bool) {
 	if v, ok := props[key]; ok {
 		switch val := v.(type) {
-		case string: return val, true
-		case float64: return fmt.Sprint(val), true
-		default: return fmt.Sprint(val), true
+		case string:
+			return val, true
+		case float64:
+			return fmt.Sprint(val), true
+		default:
+			return fmt.Sprint(val), true
 		}
 	}
 	return "", false

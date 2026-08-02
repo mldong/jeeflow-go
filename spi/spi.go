@@ -9,6 +9,11 @@ import (
 // ProcessRepository 流程仓储接口（方法名对齐 Java/Node camelCase）
 type ProcessRepository interface {
 	FindDefineByID(ctx context.Context, id int64) (*model.ProcessDefine, error)
+	// 定义写操作（v1.0.1，集成反馈①）：保存/更新/启停/删除流程定义
+	SaveDefine(ctx context.Context, def *model.ProcessDefine) error
+	UpdateDefine(ctx context.Context, def *model.ProcessDefine) error
+	UpdateDefineState(ctx context.Context, defineID int64, state int) error
+	RemoveDefine(ctx context.Context, defineID int64) error
 
 	FindInstanceByID(ctx context.Context, id int64) (*model.ProcessInstance, error)
 	SaveInstance(ctx context.Context, inst *model.ProcessInstance) error

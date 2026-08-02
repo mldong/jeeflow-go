@@ -178,6 +178,66 @@ func (r *Repository) FindDefineByID(ctx context.Context, id int64) (*model.Proce
 	return def, nil
 }
 
+// 定义写操作（v1.0.1，集成反馈①）。SQL 与 jeeflow-java JdbcProcessRepository 对齐；
+// State/Version 零值按 Java null 语义默认 1。
+
+func (r *Repository) SaveDefine(ctx context.Context, def *model.ProcessDefine) error {
+	if def.ID == 0 {
+		def.ID = r.idGen.NextID()
+	}
+	if def.State == 0 {
+		def.State = 1
+	}
+	if def.Version == 0 {
+		def.Version = 1
+	}
+	c := r.conn(ctx)
+	now := time.Now()
+	if def.CreateTime.IsZero() {
+		def.CreateTime = now
+	}
+	if def.UpdateTime.IsZero() {
+		def.UpdateTime = now
+	}
+	if def.CreateUser == "" {
+		def.CreateUser = def.UpdateUser
+	}
+	_, err := c.ExecContext(ctx,
+		"INSERT INTO wf_process_define (id, name, display_name, type, state, content, version, create_time, create_user, update_time, update_user) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+		def.ID, def.Name, def.DisplayName, def.Type, def.State, def.Content, def.Version,
+		def.CreateTime, def.CreateUser, def.UpdateTime, def.UpdateUser)
+	return err
+}
+
+func (r *Repository) UpdateDefine(ctx context.Context, def *model.ProcessDefine) error {
+	if def.State == 0 {
+		def.State = 1
+	}
+	if def.Version == 0 {
+		def.Version = 1
+	}
+	c := r.conn(ctx)
+	_, err := c.ExecContext(ctx,
+		"UPDATE wf_process_define SET name=?, display_name=?, type=?, state=?, content=?, version=?, update_time=?, update_user=? WHERE id=?",
+		def.Name, def.DisplayName, def.Type, def.State, def.Content, def.Version,
+		time.Now(), def.UpdateUser, def.ID)
+	return err
+}
+
+func (r *Repository) UpdateDefineState(ctx context.Context, defineID int64, state int) error {
+	c := r.conn(ctx)
+	_, err := c.ExecContext(ctx,
+		"UPDATE wf_process_define SET state=?, update_time=? WHERE id=?",
+		state, time.Now(), defineID)
+	return err
+}
+
+func (r *Repository) RemoveDefine(ctx context.Context, defineID int64) error {
+	c := r.conn(ctx)
+	_, err := c.ExecContext(ctx, "DELETE FROM wf_process_define WHERE id=?", defineID)
+	return err
+}
+
 // ─── ProcessInstance ───────────────────────────────────────────────────────────
 
 const instanceCols = "id, parent_id, process_define_id, state, parent_node_name, business_no, operator, expire_time, variable, create_time, create_user, update_time, update_user"
@@ -230,7 +290,18 @@ func (r *Repository) UpdateInstance(ctx context.Context, inst *model.ProcessInst
 		"UPDATE wf_process_instance SET state=?, parent_node_name=?, business_no=?, operator=?, expire_time=?, variable=?, update_time=?, update_user=? WHERE id=?",
 		inst.State, inst.ParentNodeName, inst.BusinessNo, inst.Operator, inst.ExpireTime, variable,
 		inst.UpdateTime, inst.UpdateUser, inst.ID)
-	return err
+	if err != nil {
+		return err
+	}
+	// v1.0.1：级联持久化聚合根内任务状态变更（同连接，spec §7.4）
+	for _, task := range inst.Tasks {
+		if task.ID != 0 {
+			if err := r.updateTaskWithConn(ctx, c, task); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // ─── ProcessTask ───────────────────────────────────────────────────────────────
@@ -304,7 +375,11 @@ func (r *Repository) SaveTask(ctx context.Context, task *model.ProcessTask) erro
 }
 
 func (r *Repository) UpdateTask(ctx context.Context, task *model.ProcessTask) error {
-	c := r.conn(ctx)
+	return r.updateTaskWithConn(ctx, r.conn(ctx), task)
+}
+
+// updateTaskWithConn 用指定连接更新任务（实例级联时与实例更新同连接）
+func (r *Repository) updateTaskWithConn(ctx context.Context, c phConn, task *model.ProcessTask) error {
 	variable, _ := json.Marshal(task.Variables)
 	_, err := c.ExecContext(ctx,
 		"UPDATE wf_process_task SET task_state=?, operator=?, finish_time=?, expire_time=?, variable=?, update_time=?, update_user=? WHERE id=?",
