@@ -58,6 +58,10 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 	var err error
 	var data interface{}
 	switch action {
+	case "processDefine/page":
+		data, err = f.definePage(args)
+	case "processDefine/detail":
+		data, err = f.defineDetail(args)
 	case "processDefine/startAndExecute":
 		data, err = f.startAndExecute(args)
 	case "processDefine/deploy":
@@ -68,12 +72,20 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 		err = f.removeDefine(args)
 	case "processDefine/upAndDown":
 		err = f.upAndDown(args)
+	case "processInstance/page":
+		data, err = f.instancePage(args)
+	case "processInstance/detail":
+		data, err = f.instanceDetail(args)
 	case "processInstance/startAndExecute":
 		data, err = f.startAndExecute(args)
 	case "processInstance/withdraw":
 		err = f.withdraw(args)
 	case "processTask/execute":
 		err = f.execute(args)
+	case "processTask/todoList":
+		data, err = f.todoList(args)
+	case "processTask/doneList":
+		data, err = f.doneList(args)
 	case "processDesign/page":
 		data, err = f.designPage(args)
 	case "processDesign/detail":
@@ -963,4 +975,101 @@ func toIntDef(v interface{}, def int) int {
 		return n
 	}
 	return def
+}
+
+// ═══ 基础分页/详情（v1.5.0 补齐，对齐 Java 门面）═══
+
+// definePage 流程定义分页
+func (f *Facade) definePage(args map[string]interface{}) (interface{}, error) {
+	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10)}
+	rows, total, err := f.repo.PageDefines(context.Background(), query)
+	if err != nil {
+		return nil, err
+	}
+	return pageData(query.PageNum, query.PageSize, total, rows), nil
+}
+
+// defineDetail 流程定义详情
+func (f *Facade) defineDetail(args map[string]interface{}) (interface{}, error) {
+	id, err := toInt64(args["id"])
+	if err != nil {
+		return nil, errors.New("id 缺失或非法")
+	}
+	def, err := f.repo.FindDefineByID(context.Background(), id)
+	if err != nil || def == nil {
+		return nil, errors.New("流程定义不存在")
+	}
+	return map[string]interface{}{
+		"id": def.ID, "name": def.Name, "displayName": def.DisplayName,
+		"type": def.Type, "state": def.State, "version": def.Version,
+	}, nil
+}
+
+// instancePage 我发起的流程实例分页（operator 过滤）
+func (f *Facade) instancePage(args map[string]interface{}) (interface{}, error) {
+	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10)}
+	operator := toStr(args["operator"], "user1")
+	rows, total, err := f.repo.PageInstances(context.Background(), query, operator)
+	if err != nil {
+		return nil, err
+	}
+	return pageData(query.PageNum, query.PageSize, total, rows), nil
+}
+
+// instanceDetail 流程实例详情（含任务列表）
+func (f *Facade) instanceDetail(args map[string]interface{}) (interface{}, error) {
+	id, err := toInt64(args["id"])
+	if err != nil {
+		return nil, errors.New("id 缺失或非法")
+	}
+	inst, err := f.repo.FindInstanceByID(context.Background(), id)
+	if err != nil || inst == nil {
+		return nil, errors.New("流程实例不存在")
+	}
+	data := map[string]interface{}{
+		"id": inst.ID, "parentId": inst.ParentID, "processDefineId": inst.DefineID,
+		"state": inst.State, "parentNodeName": inst.ParentNodeName,
+		"businessNo": inst.BusinessNo, "operator": inst.Operator,
+		"variables": inst.Variables, "createTime": inst.CreateTime, "createUser": inst.CreateUser,
+	}
+	tasks := make([]map[string]interface{}, 0, len(inst.Tasks))
+	for _, t := range inst.Tasks {
+		tasks = append(tasks, f.taskVo(t))
+	}
+	data["tasks"] = tasks
+	return data, nil
+}
+
+// todoList 我的待办分页（operator 作为抄送…待办人过滤，对齐 Java pta.actor_id EQ）
+func (f *Facade) todoList(args map[string]interface{}) (interface{}, error) {
+	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10)}
+	actorID := toStr(args["operator"], "user1")
+	rows, total, err := f.repo.PageTodoTasks(context.Background(), query, actorID)
+	if err != nil {
+		return nil, err
+	}
+	return pageData(query.PageNum, query.PageSize, total, rows), nil
+}
+
+// doneList 我的已办分页（operator 过滤，非进行中任务）
+func (f *Facade) doneList(args map[string]interface{}) (interface{}, error) {
+	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10)}
+	operator := toStr(args["operator"], "user1")
+	rows, total, err := f.repo.PageDoneTasks(context.Background(), query, operator)
+	if err != nil {
+		return nil, err
+	}
+	return pageData(query.PageNum, query.PageSize, total, rows), nil
+}
+
+// taskVo 任务行 VO（instanceDetail 任务列表用，对齐 Java taskVo）
+func (f *Facade) taskVo(t *model.ProcessTask) map[string]interface{} {
+	return map[string]interface{}{
+		"id": t.ID, "processInstanceId": t.ProcessInstanceID, "taskName": t.TaskName,
+		"displayName": t.DisplayName, "taskType": t.TaskType, "performType": t.PerformType,
+		"taskState": t.TaskState, "operator": t.ActorID, "finishTime": t.FinishTime,
+		"expireTime": t.ExpireTime, "formKey": t.FormKey, "taskParentId": t.ParentTaskID,
+		"variable": t.Variables, "createTime": t.CreateTime, "createUser": t.CreateUser,
+		"updateTime": t.UpdateTime, "updateUser": t.UpdateUser, "taskActorIdList": t.ActorIDs,
+	}
 }

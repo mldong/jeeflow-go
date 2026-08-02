@@ -122,7 +122,7 @@ const (
 type PerformType int
 
 const (
-	PerformTypeNormal     PerformType = 0
+	PerformTypeNormal      PerformType = 0
 	PerformTypeCountersign PerformType = 1
 )
 
@@ -199,4 +199,65 @@ type CcInstanceRow struct {
 	DefineName        string
 	DefineDisplayName string
 	DefineVersion     int
+}
+
+// ─── 核心表分页行数据（v1.5.0，对齐 Java DefineRow/InstanceRow/TaskRow） ─────
+
+// DefineRow 流程定义行数据（pageDefines 分页）
+type DefineRow struct {
+	ID          int64     `json:"id"`
+	Name        string    `json:"name"`
+	DisplayName string    `json:"displayName"`
+	Type        string    `json:"type"`
+	State       int       `json:"state"`
+	Version     int       `json:"version"`
+	CreateTime  time.Time `json:"createTime"`
+	CreateUser  string    `json:"createUser"`
+	UpdateTime  time.Time `json:"updateTime"`
+	UpdateUser  string    `json:"updateUser"`
+}
+
+// InstanceRow 流程实例行数据（pageInstances 分页）
+type InstanceRow struct {
+	ID                int64                  `json:"id"`
+	ParentID          *int64                 `json:"parentId"`
+	DefineID          int64                  `json:"processDefineId"`
+	State             InstanceState          `json:"state"`
+	ParentNodeName    string                 `json:"parentNodeName"`
+	BusinessNo        string                 `json:"businessNo"`
+	Operator          string                 `json:"operator"`
+	ExpireTime        *time.Time             `json:"expireTime"`
+	Variables         map[string]interface{} `json:"variables"`
+	CreateTime        time.Time              `json:"createTime"`
+	CreateUser        string                 `json:"createUser"`
+	UpdateTime        time.Time              `json:"updateTime"`
+	UpdateUser        string                 `json:"updateUser"`
+	DefineName        string                 `json:"defineName"`
+	DefineDisplayName string                 `json:"defineDisplayName"`
+	DefineVersion     int                    `json:"defineVersion"`
+}
+
+// TaskRow 任务行数据（pageTodoTasks / pageDoneTasks 分页）
+type TaskRow struct {
+	ID                       int64                  `json:"id"`
+	ProcessInstanceID        int64                  `json:"processInstanceId"`
+	TaskName                 string                 `json:"taskName"`
+	DisplayName              string                 `json:"displayName"`
+	TaskType                 int                    `json:"taskType"`
+	PerformType              int                    `json:"performType"`
+	TaskState                TaskState              `json:"taskState"`
+	Operator                 string                 `json:"operator"`
+	FinishTime               *time.Time             `json:"finishTime"`
+	ExpireTime               *time.Time             `json:"expireTime"`
+	FormKey                  string                 `json:"formKey"`
+	TaskParentID             *int64                 `json:"taskParentId"`
+	Variables                map[string]interface{} `json:"variables"`
+	CreateTime               time.Time              `json:"createTime"`
+	CreateUser               string                 `json:"createUser"`
+	UpdateTime               time.Time              `json:"updateTime"`
+	UpdateUser               string                 `json:"updateUser"`
+	ProcessDefineName        string                 `json:"processDefineName"`
+	ProcessDefineDisplayName string                 `json:"processDefineDisplayName"`
+	InstanceVariable         string                 `json:"instanceVariable"`
+	InstanceCreateTime       time.Time              `json:"instanceCreateTime"`
 }

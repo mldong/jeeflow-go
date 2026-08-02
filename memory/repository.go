@@ -400,3 +400,131 @@ func (r *Repository) AllTasks() []*model.ProcessTask {
 	}
 	return result
 }
+
+// ─── 核心表分页（v1.5.0） ──────────────────────────────────────────────────────
+
+// PageDefines 流程定义分页
+func (r *Repository) PageDefines(ctx context.Context, query spi.PageQuery) ([]*model.DefineRow, int, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var rows []*model.DefineRow
+	for _, d := range r.defines {
+		rows = append(rows, &model.DefineRow{
+			ID: d.ID, Name: d.Name, DisplayName: d.DisplayName, Type: d.Type,
+			State: d.State, Version: d.Version,
+			CreateTime: d.CreateTime, CreateUser: d.CreateUser,
+			UpdateTime: d.UpdateTime, UpdateUser: d.UpdateUser,
+		})
+	}
+	return slicePage(rows, query), len(rows), nil
+}
+
+// PageInstances 我发起的流程实例分页（operator 过滤，join 定义名）
+func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, operator string) ([]*model.InstanceRow, int, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var rows []*model.InstanceRow
+	for _, inst := range r.instances {
+		if operator != "" && inst.Operator != operator {
+			continue
+		}
+		row := &model.InstanceRow{
+			ID: inst.ID, ParentID: inst.ParentID, DefineID: inst.DefineID, State: inst.State,
+			ParentNodeName: inst.ParentNodeName, BusinessNo: inst.BusinessNo, Operator: inst.Operator,
+			ExpireTime: inst.ExpireTime, Variables: inst.Variables,
+			CreateTime: inst.CreateTime, CreateUser: inst.CreateUser,
+			UpdateTime: inst.UpdateTime, UpdateUser: inst.UpdateUser,
+		}
+		if def, ok := r.defines[inst.DefineID]; ok {
+			row.DefineName = def.Name
+			row.DefineDisplayName = def.DisplayName
+			row.DefineVersion = def.Version
+		}
+		rows = append(rows, row)
+	}
+	return slicePage(rows, query), len(rows), nil
+}
+
+// PageTodoTasks 我的待办分页（actorID 过滤，仅进行中任务）
+func (r *Repository) PageTodoTasks(ctx context.Context, query spi.PageQuery, actorID string) ([]*model.TaskRow, int, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var rows []*model.TaskRow
+	for _, t := range r.tasks {
+		if t.TaskState != model.TaskStateDoing {
+			continue
+		}
+		if actorID != "" {
+			hit := false
+			for _, a := range r.actors[t.ID] {
+				if a == actorID {
+					hit = true
+					break
+				}
+			}
+			if !hit {
+				continue
+			}
+		}
+		rows = append(rows, r.taskRow(t))
+	}
+	return slicePage(rows, query), len(rows), nil
+}
+
+// PageDoneTasks 我的已办分页（operator 过滤，非进行中任务）
+func (r *Repository) PageDoneTasks(ctx context.Context, query spi.PageQuery, operator string) ([]*model.TaskRow, int, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var rows []*model.TaskRow
+	for _, t := range r.tasks {
+		if t.TaskState == model.TaskStateDoing {
+			continue
+		}
+		if operator != "" && t.ActorID != operator {
+			continue
+		}
+		rows = append(rows, r.taskRow(t))
+	}
+	return slicePage(rows, query), len(rows), nil
+}
+
+// taskRow 构造任务行（join 实例 + 定义）
+func (r *Repository) taskRow(t *model.ProcessTask) *model.TaskRow {
+	row := &model.TaskRow{
+		ID: t.ID, ProcessInstanceID: t.ProcessInstanceID, TaskName: t.TaskName,
+		DisplayName: t.DisplayName, TaskType: t.TaskType, PerformType: t.PerformType,
+		TaskState: t.TaskState, Operator: t.ActorID,
+		FinishTime: t.FinishTime, ExpireTime: t.ExpireTime, FormKey: t.FormKey,
+		TaskParentID: t.ParentTaskID, Variables: t.Variables,
+		CreateTime: t.CreateTime, CreateUser: t.CreateUser,
+		UpdateTime: t.UpdateTime, UpdateUser: t.UpdateUser,
+	}
+	if inst, ok := r.instances[t.ProcessInstanceID]; ok {
+		row.InstanceCreateTime = inst.CreateTime
+		if def, ok := r.defines[inst.DefineID]; ok {
+			row.ProcessDefineName = def.Name
+			row.ProcessDefineDisplayName = def.DisplayName
+		}
+	}
+	return row
+}
+
+// slicePage 简单分页切片
+func slicePage[T any](rows []*T, query spi.PageQuery) []*T {
+	pageNum, pageSize := query.PageNum, query.PageSize
+	if pageNum <= 0 {
+		pageNum = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 10
+	}
+	start := (pageNum - 1) * pageSize
+	if start >= len(rows) {
+		return []*T{}
+	}
+	end := start + pageSize
+	if end > len(rows) {
+		end = len(rows)
+	}
+	return rows[start:end]
+}

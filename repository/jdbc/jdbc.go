@@ -633,3 +633,174 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 
 // 编译期断言：实现 spi.ProcessRepository
 var _ spi.ProcessRepository = (*Repository)(nil)
+
+// ─── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──
+
+// PageDefines 流程定义分页
+func (r *Repository) PageDefines(ctx context.Context, query spi.PageQuery) ([]*model.DefineRow, int, error) {
+	pageNum, pageSize := normPage(query)
+	var total int
+	if err := r.conn(ctx).QueryRowContext(ctx, "SELECT COUNT(*) FROM wf_process_define t").Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	rows, err := r.conn(ctx).QueryContext(ctx,
+		"SELECT id, name, display_name, type, state, version, create_time, create_user, update_time, update_user"+
+			" FROM wf_process_define t ORDER BY t.id DESC LIMIT ? OFFSET ?",
+		pageSize, (pageNum-1)*pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var result []*model.DefineRow
+	for rows.Next() {
+		row := &model.DefineRow{}
+		if err := rows.Scan(&row.ID, &row.Name, &row.DisplayName, &row.Type, &row.State, &row.Version,
+			&row.CreateTime, &row.CreateUser, &row.UpdateTime, &row.UpdateUser); err != nil {
+			return nil, 0, err
+		}
+		result = append(result, row)
+	}
+	return result, total, rows.Err()
+}
+
+// PageInstances 我发起的流程实例分页（operator 过滤，join 定义）
+func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, operator string) ([]*model.InstanceRow, int, error) {
+	pageNum, pageSize := normPage(query)
+	where := " FROM wf_process_instance t LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id WHERE t.operator = ?"
+	var total int
+	if err := r.conn(ctx).QueryRowContext(ctx, "SELECT COUNT(*) "+where, operator).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	cols := "t.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no," +
+		" t.operator, t.expire_time, t.variable, t.create_time, t.create_user, t.update_time, t.update_user," +
+		" pd.name, pd.display_name, pd.version"
+	rows, err := r.conn(ctx).QueryContext(ctx,
+		"SELECT "+cols+where+" ORDER BY t.id DESC LIMIT ? OFFSET ?", operator, pageSize, (pageNum-1)*pageSize)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var result []*model.InstanceRow
+	for rows.Next() {
+		row := &model.InstanceRow{}
+		var parentID sql.NullInt64
+		var expire sql.NullTime
+		var variable []byte
+		var defVersion sql.NullInt64
+		if err := rows.Scan(&row.ID, &parentID, &row.DefineID, &row.State, &row.ParentNodeName,
+			&row.BusinessNo, &row.Operator, &expire, &variable, &row.CreateTime, &row.CreateUser,
+			&row.UpdateTime, &row.UpdateUser, &row.DefineName, &row.DefineDisplayName, &defVersion); err != nil {
+			return nil, 0, err
+		}
+		if parentID.Valid {
+			v := parentID.Int64
+			row.ParentID = &v
+		}
+		if expire.Valid {
+			v := expire.Time
+			row.ExpireTime = &v
+		}
+		if len(variable) > 0 {
+			_ = json.Unmarshal(variable, &row.Variables)
+		}
+		if defVersion.Valid {
+			row.DefineVersion = int(defVersion.Int64)
+		}
+		result = append(result, row)
+	}
+	return result, total, rows.Err()
+}
+
+// PageTodoTasks 我的待办分页（actorID 过滤，仅进行中任务）
+func (r *Repository) PageTodoTasks(ctx context.Context, query spi.PageQuery, actorID string) ([]*model.TaskRow, int, error) {
+	return r.pageTasks(ctx, query, false, actorID)
+}
+
+// PageDoneTasks 我的已办分页（operator 过滤，非进行中任务）
+func (r *Repository) PageDoneTasks(ctx context.Context, query spi.PageQuery, operator string) ([]*model.TaskRow, int, error) {
+	return r.pageTasks(ctx, query, true, operator)
+}
+
+// pageTasks 待办/已办分页（对齐 Java pageTasks：todo 按 actor 过滤、done 按操作人过滤）
+func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bool, filter string) ([]*model.TaskRow, int, error) {
+	pageNum, pageSize := normPage(query)
+	where := " FROM wf_process_task t" +
+		" LEFT JOIN wf_process_instance pi ON t.process_instance_id = pi.id" +
+		" LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id" +
+		" LEFT JOIN wf_process_task_actor pta ON t.id = pta.process_task_id" +
+		" WHERE 1=1" + filterWhere(done, filter)
+	args := []interface{}{filter}
+	var total int
+	if err := r.conn(ctx).QueryRowContext(ctx, "SELECT COUNT(DISTINCT t.id) "+where, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	cols := "DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, t.task_type, t.perform_type," +
+		" t.task_state, t.operator, t.finish_time, t.expire_time, t.form_key, t.task_parent_id, t.variable," +
+		" t.create_time, t.create_user, t.update_time, t.update_user," +
+		" pd.name, pd.display_name, pi.variable, pi.create_time"
+	sqlStr := "SELECT " + cols + where + " ORDER BY t.id DESC LIMIT ? OFFSET ?"
+	args = append(args, pageSize, (pageNum-1)*pageSize)
+	rows, err := r.conn(ctx).QueryContext(ctx, sqlStr, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var result []*model.TaskRow
+	for rows.Next() {
+		row := &model.TaskRow{}
+		var finish, expire sql.NullTime
+		var parentTaskID sql.NullInt64
+		var variable, instVariable []byte
+		var instCreateTime sql.NullTime
+		if err := rows.Scan(&row.ID, &row.ProcessInstanceID, &row.TaskName, &row.DisplayName,
+			&row.TaskType, &row.PerformType, &row.TaskState, &row.Operator, &finish, &expire,
+			&row.FormKey, &parentTaskID, &variable, &row.CreateTime, &row.CreateUser,
+			&row.UpdateTime, &row.UpdateUser, &row.ProcessDefineName, &row.ProcessDefineDisplayName,
+			&instVariable, &instCreateTime); err != nil {
+			return nil, 0, err
+		}
+		if finish.Valid {
+			v := finish.Time
+			row.FinishTime = &v
+		}
+		if expire.Valid {
+			v := expire.Time
+			row.ExpireTime = &v
+		}
+		if parentTaskID.Valid {
+			v := parentTaskID.Int64
+			row.TaskParentID = &v
+		}
+		if len(variable) > 0 {
+			_ = json.Unmarshal(variable, &row.Variables)
+		}
+		if len(instVariable) > 0 {
+			row.InstanceVariable = string(instVariable)
+		}
+		if instCreateTime.Valid {
+			row.InstanceCreateTime = instCreateTime.Time
+		}
+		result = append(result, row)
+	}
+	return result, total, rows.Err()
+}
+
+// filterWhere 待办（task_state=10 + pta.actor_id 过滤）/ 已办（非进行中 + t.operator 过滤）
+func filterWhere(done bool, filter string) string {
+	if done {
+		return " AND t.task_state <> 10 AND t.operator = ?"
+	}
+	return " AND t.task_state = 10 AND pta.actor_id = ?"
+}
+
+// normPage 归一化分页参数
+func normPage(query spi.PageQuery) (int, int) {
+	pageNum, pageSize := query.PageNum, query.PageSize
+	if pageNum <= 0 {
+		pageNum = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 10
+	}
+	return pageNum, pageSize
+}

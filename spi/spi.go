@@ -38,6 +38,17 @@ type ProcessRepository interface {
 	// PageCcInstances 我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：
 	// 按抄送人 actorID 过滤实例列表，返回行数据（含关联定义名/版本）+ 总数
 	PageCcInstances(ctx context.Context, query PageQuery, actorID string) ([]*model.CcInstanceRow, int, error)
+
+	// ── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──
+
+	// PageDefines 流程定义分页
+	PageDefines(ctx context.Context, query PageQuery) ([]*model.DefineRow, int, error)
+	// PageInstances 我发起的流程实例分页（operator 过滤）
+	PageInstances(ctx context.Context, query PageQuery, operator string) ([]*model.InstanceRow, int, error)
+	// PageTodoTasks 我的待办分页（actorID 过滤，仅进行中任务）
+	PageTodoTasks(ctx context.Context, query PageQuery, actorID string) ([]*model.TaskRow, int, error)
+	// PageDoneTasks 我的已办分页（operator 过滤，非进行中任务）
+	PageDoneTasks(ctx context.Context, query PageQuery, operator string) ([]*model.TaskRow, int, error)
 }
 
 // UserProvider 用户信息提供者
