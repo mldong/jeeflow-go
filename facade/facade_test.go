@@ -432,3 +432,41 @@ func TestHighLightFiltersDecisionBranch(t *testing.T) {
 		t.Fatalf("应包含走过节点 task3: %v", histNodes)
 	}
 }
+
+// ═══ 三个 detail 返回 jsonObject（issues/05-1）═══
+
+func TestDetailJsonObject(t *testing.T) {
+	f, repo, _ := setupFacade()
+	content := string(flowContent(t, "01-simple.json"))
+	r := f.Flow("processDefine/deploy", map[string]interface{}{"content": content})
+	defineID := r["data"].(map[string]interface{})["processDefineId"].(int64)
+
+	r = f.Flow("processDefine/detail", map[string]interface{}{"id": defineID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("defineDetail failed: %v", r)
+	}
+	if _, ok := r["data"].(map[string]interface{})["jsonObject"]; !ok {
+		t.Fatalf("defineDetail 缺 jsonObject: %v", r["data"])
+	}
+
+	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": defineID, "operator": "zhangsan",
+	})
+	instanceID := r["data"].(map[string]interface{})["processInstanceId"].(int64)
+	r = f.Flow("processInstance/detail", map[string]interface{}{"id": instanceID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("instanceDetail failed: %v", r)
+	}
+	if _, ok := r["data"].(map[string]interface{})["jsonObject"]; !ok {
+		t.Fatalf("instanceDetail 缺 jsonObject: %v", r["data"])
+	}
+
+	doing, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
+	r = f.Flow("processTask/detail", map[string]interface{}{"id": doing[0].ID, "operator": "zhangsan"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("taskDetail failed: %v", r)
+	}
+	if _, ok := r["data"].(map[string]interface{})["jsonObject"]; !ok {
+		t.Fatalf("taskDetail 缺 jsonObject: %v", r["data"])
+	}
+}

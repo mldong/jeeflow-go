@@ -526,6 +526,15 @@ func (f *Facade) getLastByName(args map[string]interface{}) (interface{}, error)
 	if err != nil || def == nil {
 		return nil, fmt.Errorf("流程定义不存在: %s", name)
 	}
+	graph := map[string]interface{}{}
+	if json.Unmarshal(def.Content, &graph) == nil && len(graph) > 0 {
+		// 前端表单渲染/流程图依赖（issues/05）
+		return map[string]interface{}{
+			"id": def.ID, "name": def.Name, "displayName": def.DisplayName,
+			"type": def.Type, "state": def.State, "version": def.Version,
+			"jsonObject": graph,
+		}, nil
+	}
 	return map[string]interface{}{
 		"id": def.ID, "name": def.Name, "displayName": def.DisplayName,
 		"type": def.Type, "state": def.State, "version": def.Version,
@@ -761,6 +770,10 @@ func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 	if inst != nil {
 		def, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID)
 		if def != nil {
+			graph := map[string]interface{}{}
+			if json.Unmarshal(def.Content, &graph) == nil && len(graph) > 0 {
+				vo["jsonObject"] = graph // issues/05
+			}
 			var flow model.FlowModel
 			if json.Unmarshal(def.Content, &flow) == nil {
 				for _, n := range flow.Nodes {
@@ -1039,6 +1052,15 @@ func (f *Facade) defineDetail(args map[string]interface{}) (interface{}, error) 
 	if err != nil || def == nil {
 		return nil, errors.New("流程定义不存在")
 	}
+	graph := map[string]interface{}{}
+	if json.Unmarshal(def.Content, &graph) == nil && len(graph) > 0 {
+		// 前端表单渲染/流程图依赖（issues/05）
+		return map[string]interface{}{
+			"id": def.ID, "name": def.Name, "displayName": def.DisplayName,
+			"type": def.Type, "state": def.State, "version": def.Version,
+			"jsonObject": graph,
+		}, nil
+	}
 	return map[string]interface{}{
 		"id": def.ID, "name": def.Name, "displayName": def.DisplayName,
 		"type": def.Type, "state": def.State, "version": def.Version,
@@ -1072,12 +1094,47 @@ func (f *Facade) instanceDetail(args map[string]interface{}) (interface{}, error
 		"businessNo": inst.BusinessNo, "operator": inst.Operator,
 		"variables": inst.Variables, "createTime": inst.CreateTime, "createUser": inst.CreateUser,
 	}
+	var graph map[string]interface{}
+	if def0, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID); def0 != nil {
+		graph = map[string]interface{}{}
+		if json.Unmarshal(def0.Content, &graph) == nil && len(graph) > 0 {
+			data["jsonObject"] = graph // issues/05
+		}
+	}
+	// 任务列表（issues/05-4）：全量 tasks + activeTaskList（仅 DOING）+ 任务行 ext/isFirstTaskNode
+	firstTaskNodeID := firstTaskNodeIDOf(graph)
 	tasks := make([]map[string]interface{}, 0, len(inst.Tasks))
+	activeTaskList := make([]map[string]interface{}, 0)
 	for _, t := range inst.Tasks {
-		tasks = append(tasks, f.taskVo(t))
+		vo := f.taskVo(t)
+		ext := map[string]interface{}{}
+		for k, v := range t.Variables {
+			ext[k] = v
+		}
+		doing := t.TaskState == model.TaskStateDoing
+		ext["isFirstTaskNode"] = doing && t.TaskName == firstTaskNodeID
+		vo["ext"] = ext
+		tasks = append(tasks, vo)
+		if doing {
+			activeTaskList = append(activeTaskList, vo)
+		}
 	}
 	data["tasks"] = tasks
+	data["activeTaskList"] = activeTaskList
 	return data, nil
+}
+
+// firstTaskNodeIDOf 流程 JSON 中第一个任务节点 id（issues/05-4 isFirstTaskNode 用）
+func firstTaskNodeIDOf(graph map[string]interface{}) string {
+	nodes, _ := graph["nodes"].([]interface{})
+	for _, n := range nodes {
+		node, _ := n.(map[string]interface{})
+		if node != nil && node["type"] == "snaker:task" {
+			id, _ := node["id"].(string)
+			return id
+		}
+	}
+	return ""
 }
 
 // todoList 我的待办分页（operator 作为抄送…待办人过滤，对齐 Java pta.actor_id EQ）
