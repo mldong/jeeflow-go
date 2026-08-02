@@ -21,11 +21,22 @@ import (
 	"github.com/mldong/jeeflow-go/spi"
 )
 
+// UserSearch 用户搜索钩子（v1.2.0，可选）——candidatePage 无模型候选时的用户分页搜索。
+// 返回 (rows, total, err)；query 透传 pageNum/pageSize/搜索条件。
+type UserSearch func(query map[string]interface{}) ([]map[string]interface{}, int, error)
+
 // Facade 统一门面
 type Facade struct {
-	engine  *engine.EngineImpl
-	repo    spi.ProcessRepository
-	extRepo spi.ProcessExtRepository // 可空：未接入时设计/委托 action 报错
+	engine     *engine.EngineImpl
+	repo       spi.ProcessRepository
+	extRepo    spi.ProcessExtRepository // 可空：未接入时设计/委托 action 报错
+	userSearch UserSearch               // 可空：candidatePage 用户搜索依赖
+}
+
+// SetUserSearch 注入用户搜索钩子
+func (f *Facade) SetUserSearch(fn UserSearch) *Facade {
+	f.userSearch = fn
+	return f
 }
 
 // New 构造门面
@@ -79,6 +90,32 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 		data, err = f.surrogateSave(args)
 	case "processSurrogate/remove":
 		err = f.surrogateRemove(args)
+	case "processDefine/getLastByName":
+		data, err = f.getLastByName(args)
+	case "processInstance/highLight":
+		data, err = f.highLight(args)
+	case "processInstance/approvalRecord":
+		data, err = f.approvalRecord(args)
+	case "processInstance/getAssigneeTextData":
+		data, err = f.getAssigneeTextData(args)
+	case "processInstance/createCCInstance":
+		err = f.createCCInstance(args)
+	case "processInstance/updateCCStatus":
+		err = f.updateCCStatus(args)
+	case "processInstance/ccList":
+		err = errors.New("ccList 需要核心分页 SPI（pageCcInstances），当前语言 1.3.0 补齐")
+	case "processTask/detail":
+		data, err = f.taskDetail(args)
+	case "processTask/jumpAbleTaskNameList":
+		data, err = f.jumpAbleTaskNameList(args)
+	case "processTask/candidatePage":
+		data, err = f.candidatePage(args)
+	case "processTask/surrogate":
+		err = f.taskAddActor(args)
+	case "processTask/addCandidate":
+		err = f.taskAddActor(args)
+	case "processTask/latest":
+		data, err = f.taskLatest(args)
 	default:
 		return errorResult("未知 action: " + action)
 	}
@@ -467,6 +504,369 @@ func (f *Facade) surrogateRemove(args map[string]interface{}) error {
 		return errors.New("id 缺失或非法")
 	}
 	return f.ext().RemoveSurrogate(context.Background(), id)
+}
+
+// ═══ 视图端点（v1.2.0） ═══
+
+func (f *Facade) getLastByName(args map[string]interface{}) (interface{}, error) {
+	name := toStr(args["processDefineName"], "")
+	def, err := f.repo.FindDefineByName(context.Background(), name)
+	if err != nil || def == nil {
+		return nil, fmt.Errorf("流程定义不存在: %s", name)
+	}
+	return map[string]interface{}{
+		"id": def.ID, "name": def.Name, "displayName": def.DisplayName,
+		"type": def.Type, "state": def.State, "version": def.Version,
+	}, nil
+}
+
+func (f *Facade) highLight(args map[string]interface{}) (interface{}, error) {
+	instanceID, err := toInt64(args["id"])
+	if err != nil {
+		return nil, errors.New("id 缺失或非法")
+	}
+	inst, err := f.repo.FindInstanceByID(context.Background(), instanceID)
+	if err != nil || inst == nil {
+		return nil, errors.New("流程实例不存在")
+	}
+	active := []string{}
+	history := []string{}
+	edges := []string{}
+	// 活跃节点 = 进行中任务
+	doing, _ := f.repo.FindDoingTasks(context.Background(), instanceID, nil)
+	for _, t := range doing {
+		if !containsStr(active, t.TaskName) {
+			active = append(active, t.TaskName)
+		}
+	}
+	// 历史节点 = 全部任务（排除活跃）+ 模型路径补全
+	his, _ := f.repo.FindHistoryTasks(context.Background(), instanceID)
+	for _, t := range his {
+		if !containsStr(active, t.TaskName) && !containsStr(history, t.TaskName) {
+			history = append(history, t.TaskName)
+		}
+	}
+	// 路径补全：start 沿 edges 递归，遇活跃节点停止
+	def, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID)
+	if def != nil {
+		var flow model.FlowModel
+		if json.Unmarshal(def.Content, &flow) == nil {
+			collectPath(&flow, "start", "", active, &history, &edges, map[string]bool{})
+		}
+	}
+	return map[string]interface{}{
+		"activeNodeNames":  active,
+		"historyNodeNames": history,
+		"historyEdgeNames": edges,
+	}, nil
+}
+
+// collectPath 从节点沿输出边递归（遇活跃节点停止），补全历史节点与边
+func collectPath(flow *model.FlowModel, nodeID, edgeName string, active []string,
+	history *[]string, edges *[]string, visited map[string]bool) {
+	if visited[nodeID] {
+		return
+	}
+	visited[nodeID] = true
+	if edgeName != "" && !containsStr(*edges, edgeName) {
+		*edges = append(*edges, edgeName)
+	}
+	for _, e := range flow.Edges {
+		if e.SourceNodeID != nodeID {
+			continue
+		}
+		target := findNodeIn(flow, e.TargetNodeID)
+		if target == nil {
+			continue
+		}
+		if !containsStr(active, target.ID) && !containsStr(*history, target.ID) {
+			*history = append(*history, target.ID)
+		}
+		if containsStr(active, target.ID) {
+			continue // 遇活跃节点停止深入
+		}
+		collectPath(flow, target.ID, e.ID, active, history, edges, visited)
+	}
+}
+
+func findNodeIn(flow *model.FlowModel, id string) *model.FlowNode {
+	for i := range flow.Nodes {
+		if flow.Nodes[i].ID == id {
+			return &flow.Nodes[i]
+		}
+	}
+	return nil
+}
+
+func containsStr(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *Facade) approvalRecord(args map[string]interface{}) (interface{}, error) {
+	instanceID, err := toInt64(args["id"])
+	if err != nil {
+		return nil, errors.New("id 缺失或非法")
+	}
+	his, err := f.repo.FindHistoryTasks(context.Background(), instanceID)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]map[string]interface{}, 0, len(his))
+	for _, t := range his {
+		rows = append(rows, map[string]interface{}{
+			"taskName": t.TaskName, "displayName": t.DisplayName,
+			"taskType": t.TaskType, "performType": t.PerformType,
+			"taskState": t.TaskState, "operator": t.ActorID,
+			"finishTime": t.FinishTime, "variable": t.Variables,
+		})
+	}
+	return rows, nil
+}
+
+func (f *Facade) getAssigneeTextData(args map[string]interface{}) (interface{}, error) {
+	instanceID, err := toInt64(args["id"])
+	if err != nil {
+		return nil, errors.New("id 缺失或非法")
+	}
+	includeNodeName := true
+	if v, ok := args["includeNodeName"].(bool); ok {
+		includeNodeName = v
+	}
+	rows := []map[string]interface{}{}
+	doing, _ := f.repo.FindDoingTasks(context.Background(), instanceID, nil)
+	for _, t := range doing {
+		actors, _ := f.repo.FindTaskActors(context.Background(), t.ID)
+		for _, actor := range actors {
+			label := actor
+			if includeNodeName {
+				label = t.DisplayName + ":" + actor
+			}
+			rows = append(rows, map[string]interface{}{"label": label, "value": actor})
+		}
+	}
+	return rows, nil
+}
+
+func (f *Facade) createCCInstance(args map[string]interface{}) error {
+	instanceID, err := toInt64(args["processInstanceId"])
+	if err != nil {
+		return errors.New("processInstanceId 缺失或非法")
+	}
+	operator := toStr(args["operator"], "user1")
+	actors := toStringSlice2(args["actorIds"])
+	if len(actors) == 0 {
+		return errors.New("actorIds 缺失")
+	}
+	return f.repo.CreateCcInstance(context.Background(), instanceID, operator, actors...)
+}
+
+func (f *Facade) updateCCStatus(args map[string]interface{}) error {
+	instanceID, err := toInt64(args["processInstanceId"])
+	if err != nil {
+		return errors.New("processInstanceId 缺失或非法")
+	}
+	operator := toStr(args["operator"], "user1")
+	return f.repo.UpdateCcStatus(context.Background(), instanceID, operator)
+}
+
+func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
+	taskID, err := toInt64(args["id"])
+	if err != nil {
+		return nil, errors.New("id 缺失或非法")
+	}
+	operator := toStr(args["operator"], "user1")
+	task, err := f.repo.FindTaskByID(context.Background(), taskID)
+	if err != nil || task == nil {
+		return nil, errors.New("任务不存在")
+	}
+	actors, _ := f.repo.FindTaskActors(context.Background(), taskID)
+	vo := map[string]interface{}{
+		"id": task.ID, "processInstanceId": task.ProcessInstanceID,
+		"taskName": task.TaskName, "displayName": task.DisplayName,
+		"taskType": task.TaskType, "performType": task.PerformType,
+		"taskState": task.TaskState, "operator": task.ActorID,
+		"formKey": task.FormKey, "taskActorIdList": actors,
+		"executable": task.IsAllowed(operator),
+	}
+	// taskModel：流程定义中对应节点
+	inst, _ := f.repo.FindInstanceByID(context.Background(), task.ProcessInstanceID)
+	if inst != nil {
+		def, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID)
+		if def != nil {
+			var flow model.FlowModel
+			if json.Unmarshal(def.Content, &flow) == nil {
+				for _, n := range flow.Nodes {
+					if n.ID == task.TaskName {
+						vo["taskModel"] = map[string]interface{}{
+							"name": n.ID, "displayName": n.Text.Value, "type": n.Type,
+						}
+						break
+					}
+				}
+			}
+		}
+	}
+	return vo, nil
+}
+
+func (f *Facade) jumpAbleTaskNameList(args map[string]interface{}) (interface{}, error) {
+	instanceID, err := toInt64(args["processInstanceId"])
+	if err != nil {
+		return nil, errors.New("processInstanceId 缺失或非法")
+	}
+	done, _ := f.repo.FindDoneTasks(context.Background(), instanceID, nil)
+	rows := []map[string]interface{}{}
+	seen := map[string]bool{}
+	for _, t := range done {
+		if t.PerformType == 1 { // COUNTERSIGN
+			continue
+		}
+		if !seen[t.TaskName] {
+			seen[t.TaskName] = true
+			rows = append(rows, map[string]interface{}{"label": t.DisplayName, "value": t.TaskName})
+		}
+	}
+	return rows, nil
+}
+
+func (f *Facade) candidatePage(args map[string]interface{}) (interface{}, error) {
+	taskID, err := toInt64(args["processTaskId"])
+	if err != nil {
+		taskID, err = toInt64(args["id"])
+	}
+	if err != nil {
+		return nil, errors.New("processTaskId 缺失")
+	}
+	task, err := f.repo.FindTaskByID(context.Background(), taskID)
+	if err != nil || task == nil {
+		return nil, errors.New("任务不存在")
+	}
+	inst, _ := f.repo.FindInstanceByID(context.Background(), task.ProcessInstanceID)
+	if inst == nil {
+		return nil, errors.New("流程实例不存在")
+	}
+	// 模型候选解析：当前任务的后继任务节点的 candidateUsers 配置
+	var candidates []string
+	def, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID)
+	if def != nil {
+		var flow model.FlowModel
+		if json.Unmarshal(def.Content, &flow) == nil {
+			candidates = nextTaskCandidates(&flow, task.TaskName)
+		}
+	}
+	if len(candidates) > 0 {
+		// 候选命中 → 用户信息映射（UserProvider 兜底）
+		rows := []map[string]interface{}{}
+		for _, c := range candidates {
+			rows = append(rows, map[string]interface{}{"userId": c, "realName": c})
+		}
+		return pageData(1, 10, len(rows), rows), nil
+	}
+	// 无模型候选 → 用户分页搜索（依赖 UserSearch 钩子）
+	if f.userSearch == nil {
+		return nil, errors.New("未配置 UserSearch（用户搜索钩子）")
+	}
+	rows, total, err := f.userSearch(args)
+	if err != nil {
+		return nil, err
+	}
+	return pageData(toIntDef(args["pageNum"], 1), toIntDef(args["pageSize"], 10), total, rows), nil
+}
+
+// nextTaskCandidates 找当前任务节点的后继任务节点，收集 candidateUsers（逗号分割）
+func nextTaskCandidates(flow *model.FlowModel, taskName string) []string {
+	var result []string
+	collect := func(node *model.FlowNode) {
+		if v, ok := node.Properties["candidateUsers"].(string); ok && v != "" {
+			for _, s := range strings.Split(v, ",") {
+				s = strings.TrimSpace(s)
+				if s != "" && !containsStr(result, s) {
+					result = append(result, s)
+				}
+			}
+		}
+	}
+	visited := map[string]bool{}
+	var walk func(id string)
+	walk = func(id string) {
+		if visited[id] {
+			return
+		}
+		visited[id] = true
+		for _, e := range flow.Edges {
+			if e.SourceNodeID != id {
+				continue
+			}
+			target := findNodeIn(flow, e.TargetNodeID)
+			if target == nil {
+				continue
+			}
+			if target.Type == model.TypeTask || target.Type == model.TypeCustom {
+				collect(target)
+				continue
+			}
+			if target.Type == model.TypeFork || target.Type == model.TypeJoin ||
+				target.Type == model.TypeDecision {
+				walk(target.ID)
+			}
+		}
+	}
+	walk(taskName)
+	return result
+}
+
+func (f *Facade) taskAddActor(args map[string]interface{}) error {
+	taskID, err := toInt64(args["processTaskId"])
+	if err != nil {
+		return errors.New("processTaskId 缺失或非法")
+	}
+	actors := toStringSlice2(args["actorIds"])
+	if len(actors) == 0 {
+		return errors.New("actorIds 缺失")
+	}
+	return f.repo.AddTaskActor(context.Background(), taskID, actors)
+}
+
+func (f *Facade) taskLatest(args map[string]interface{}) (interface{}, error) {
+	instanceID, err := toInt64(args["processInstanceId"])
+	if err != nil {
+		return nil, errors.New("processInstanceId 缺失或非法")
+	}
+	doing, _ := f.repo.FindDoingTasks(context.Background(), instanceID, nil)
+	if len(doing) == 0 {
+		return nil, nil
+	}
+	t := doing[0]
+	return map[string]interface{}{
+		"id": t.ID, "taskName": t.TaskName, "displayName": t.DisplayName,
+		"taskState": t.TaskState, "operator": t.ActorID,
+	}, nil
+}
+
+// toStringSlice2 把 actorIds（数组或逗号串）转列表
+func toStringSlice2(v interface{}) []string {
+	var list []string
+	switch t := v.(type) {
+	case []string:
+		list = append(list, t...)
+	case []interface{}:
+		for _, s := range t {
+			list = append(list, fmt.Sprintf("%v", s))
+		}
+	case string:
+		for _, s := range strings.Split(t, ",") {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				list = append(list, s)
+			}
+		}
+	}
+	return list
 }
 
 // ═══ 工具 ═══

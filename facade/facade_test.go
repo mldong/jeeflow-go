@@ -232,6 +232,119 @@ func TestFacadeDesignAndSurrogate(t *testing.T) {
 	}
 }
 
+func TestFacadeViewEndpoints(t *testing.T) {
+	f, repo, _ := setupFacade()
+	content := string(flowContent(t, "01-simple.json"))
+	r := f.Flow("processDefine/deploy", map[string]interface{}{"content": content})
+	defineID := r["data"].(map[string]interface{})["processDefineId"].(int64)
+
+	// getLastByName
+	r = f.Flow("processDefine/getLastByName", map[string]interface{}{"processDefineName": "simple"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("getLastByName failed: %v", r)
+	}
+	if name, _ := r["data"].(map[string]interface{})["name"].(string); name != "simple" {
+		t.Fatalf("getLastByName name = %v", name)
+	}
+
+	// startAndExecute → 视图端点
+	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": defineID, "operator": "zhangsan",
+	})
+	instanceID := r["data"].(map[string]interface{})["processInstanceId"].(int64)
+
+	r = f.Flow("processInstance/approvalRecord", map[string]interface{}{"id": instanceID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("approvalRecord failed: %v", r)
+	}
+	if len(r["data"].([]map[string]interface{})) != 2 { // apply + task1
+		t.Fatalf("approvalRecord rows = %d, want 2", len(r["data"].([]map[string]interface{})))
+	}
+
+	r = f.Flow("processInstance/highLight", map[string]interface{}{"id": instanceID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("highLight failed: %v", r)
+	}
+	hl := r["data"].(map[string]interface{})
+	if !containsStr2(hl["activeNodeNames"].([]string), "task1") {
+		t.Fatalf("highLight active should contain task1: %v", hl)
+	}
+
+	r = f.Flow("processInstance/getAssigneeTextData", map[string]interface{}{"id": instanceID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("getAssigneeTextData failed: %v", r)
+	}
+
+	doing, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
+	r = f.Flow("processTask/detail", map[string]interface{}{"id": doing[0].ID, "operator": "leader"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("taskDetail failed: %v", r)
+	}
+	if exec, _ := r["data"].(map[string]interface{})["executable"].(bool); !exec {
+		t.Fatalf("taskDetail executable should be true")
+	}
+
+	r = f.Flow("processTask/latest", map[string]interface{}{"processInstanceId": instanceID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("taskLatest failed: %v", r)
+	}
+	if name, _ := r["data"].(map[string]interface{})["taskName"].(string); name != "task1" {
+		t.Fatalf("taskLatest = %v, want task1", name)
+	}
+
+	// 抄送：创建 + 已读（ccList 未实现，当前语言）
+	if err := f.Flow("processInstance/createCCInstance", map[string]interface{}{
+		"processInstanceId": instanceID, "operator": "zhangsan", "actorIds": []string{"lisi"},
+	})["code"].(int); err != 0 {
+		t.Fatalf("createCCInstance failed")
+	}
+	r = f.Flow("processInstance/updateCCStatus", map[string]interface{}{
+		"processInstanceId": instanceID, "operator": "lisi",
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("updateCCStatus failed: %v", r)
+	}
+	r = f.Flow("processInstance/ccList", map[string]interface{}{"operator": "lisi"})
+	if code, _ := r["code"].(int); code != 99999999 {
+		t.Fatalf("ccList should be unimplemented, got %v", r)
+	}
+
+	// 加签/转交
+	r = f.Flow("processTask/addCandidate", map[string]interface{}{
+		"processTaskId": doing[0].ID, "actorIds": []string{"zhaoliu"},
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("addCandidate failed: %v", r)
+	}
+	actors, _ := repo.FindTaskActors(context.Background(), doing[0].ID)
+	if !containsStr2(actors, "zhaoliu") {
+		t.Fatalf("addCandidate actors = %v", actors)
+	}
+
+	// candidatePage：无模型候选 → 未配置钩子报错
+	r = f.Flow("processTask/candidatePage", map[string]interface{}{"processTaskId": doing[0].ID})
+	if code, _ := r["code"].(int); code != 99999999 {
+		t.Fatalf("candidatePage without hook should fail, got %v", r)
+	}
+	// 注入钩子后可用
+	f.SetUserSearch(func(q map[string]interface{}) ([]map[string]interface{}, int, error) {
+		return []map[string]interface{}{{"userId": "u1", "realName": "用户1"}}, 1, nil
+	})
+	r = f.Flow("processTask/candidatePage", map[string]interface{}{"processTaskId": doing[0].ID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("candidatePage with hook failed: %v", r)
+	}
+}
+
+func containsStr2(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 func TestFacadeErrors(t *testing.T) {
 	f, _, _ := setupFacade()
 	r := f.Flow("foo/bar", nil)

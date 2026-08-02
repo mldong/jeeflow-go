@@ -2,7 +2,6 @@ package memory
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -10,20 +9,22 @@ import (
 )
 
 type Repository struct {
-	mu        sync.RWMutex
-	defines   map[int64]*model.ProcessDefine
-	instances map[int64]*model.ProcessInstance
-	tasks     map[int64]*model.ProcessTask
-	actors    map[int64][]string
-	nextID    atomic.Int64
+	mu          sync.RWMutex
+	defines     map[int64]*model.ProcessDefine
+	instances   map[int64]*model.ProcessInstance
+	tasks       map[int64]*model.ProcessTask
+	actors      map[int64][]string
+	ccInstances map[int64][]string
+	nextID      atomic.Int64
 }
 
 func New() *Repository {
 	r := &Repository{
-		defines:   make(map[int64]*model.ProcessDefine),
-		instances: make(map[int64]*model.ProcessInstance),
-		tasks:     make(map[int64]*model.ProcessTask),
-		actors:    make(map[int64][]string),
+		defines:     make(map[int64]*model.ProcessDefine),
+		instances:   make(map[int64]*model.ProcessInstance),
+		tasks:       make(map[int64]*model.ProcessTask),
+		actors:      make(map[int64][]string),
+		ccInstances: make(map[int64][]string),
 	}
 	r.nextID.Store(1)
 	return r
@@ -289,11 +290,14 @@ func (r *Repository) RemoveTaskActor(ctx context.Context, taskID int64, actors [
 }
 
 func (r *Repository) CreateCcInstance(ctx context.Context, instanceID int64, creator string, actorIDs ...string) error {
-	return fmt.Errorf("not implemented")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ccInstances[instanceID] = append(r.ccInstances[instanceID], actorIDs...)
+	return nil
 }
 
 func (r *Repository) UpdateCcStatus(ctx context.Context, instanceID int64, actorID string) error {
-	return fmt.Errorf("not implemented")
+	return nil // 内存实现无已读状态
 }
 
 // ─── Demo helpers ──────────────────────────────────────────────────────────────
