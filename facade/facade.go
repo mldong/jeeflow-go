@@ -8,6 +8,7 @@
 package facade
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -92,10 +93,16 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 		data, err = f.designDetail(args)
 	case "processDesign/save":
 		data, err = f.designSave(args)
+	case "processDesign/update":
+		err = f.designUpdate(args)
+	case "processDesign/updateDefine":
+		err = f.designUpdateDefine(args)
 	case "processDesign/remove":
 		err = f.designRemove(args)
 	case "processDesign/deploy":
 		data, err = f.designDeploy(args)
+	case "processDesign/redeploy":
+		data, err = f.designRedeploy(args)
 	case "processSurrogate/page":
 		data, err = f.surrogatePage(args)
 	case "processSurrogate/save":
@@ -407,6 +414,10 @@ func (f *Facade) designSave(args map[string]interface{}) (interface{}, error) {
 			design.Remark = toStr(v, "")
 		}
 		design.UpdateUser = operator
+		// 内容快照变更 → 置为未部署（对齐 boot3 updateDefine 语义，issues/08）
+		if content, cerr := contentBytes(args); cerr == nil && content != nil {
+			design.IsDeployed = 0
+		}
 		err = ext.UpdateDesign(context.Background(), design)
 	}
 	if err != nil {
@@ -464,6 +475,144 @@ func (f *Facade) designDeploy(args map[string]interface{}) (interface{}, error) 
 		return nil, err
 	}
 	return defineID, nil
+}
+
+// designUpdate 修改流程设计基本信息（对齐 boot3 ProcessDesignController.update，不写设计稿快照）
+func (f *Facade) designUpdate(args map[string]interface{}) error {
+	ext := f.ext()
+	id, err := toInt64(args["id"])
+	if err != nil {
+		return errors.New("id 缺失或非法")
+	}
+	design, err := ext.FindDesignByID(context.Background(), id)
+	if err != nil || design == nil {
+		return errors.New("流程设计不存在")
+	}
+	if v, ok := args["name"]; ok {
+		design.Name = toStr(v, "")
+	}
+	if v, ok := args["displayName"]; ok {
+		design.DisplayName = toStr(v, "")
+	}
+	if v, ok := args["type"]; ok {
+		design.Type = toStr(v, "")
+	}
+	if v, ok := args["icon"]; ok {
+		design.Icon = toStr(v, "")
+	}
+	if v, ok := args["remark"]; ok {
+		design.Remark = toStr(v, "")
+	}
+	design.UpdateUser = toStr(args["operator"], "system")
+	return ext.UpdateDesign(context.Background(), design)
+}
+
+// designUpdateDefine 更新流程设计定义（设计稿保存，issues/08）：content 快照入库 + 同步基本信息 + 置未部署
+func (f *Facade) designUpdateDefine(args map[string]interface{}) error {
+	ext := f.ext()
+	designID, err := toInt64(args["processDesignId"])
+	if err != nil {
+		return errors.New("processDesignId 缺失或非法")
+	}
+	design, err := ext.FindDesignByID(context.Background(), designID)
+	if err != nil || design == nil {
+		return errors.New("流程设计不存在")
+	}
+	content, cerr := contentBytes(args)
+	if cerr != nil || content == nil {
+		return errors.New("content 缺失")
+	}
+	// 与最新一条相同则不重复入库（对齐 boot3 updateDefine）
+	hisList, err := ext.ListDesignHis(context.Background(), designID)
+	if err != nil {
+		return err
+	}
+	if len(hisList) == 0 || !bytes.Equal(hisList[0].Content, content) {
+		if err := ext.SaveDesignHis(context.Background(), &model.ProcessDesignHis{
+			ProcessDesignID: designID,
+			Content:         content,
+			CreateUser:      toStr(args["operator"], "system"),
+		}); err != nil {
+			return err
+		}
+	}
+	// 同步设计基本信息（jsonObject 里的 name/displayName/type）+ 内容变更 → 未部署
+	var flow model.FlowModel
+	if json.Unmarshal(content, &flow) == nil {
+		if flow.Name != "" {
+			design.Name = flow.Name
+		}
+		if flow.DisplayName != "" {
+			design.DisplayName = flow.DisplayName
+		}
+		if flow.Type != "" {
+			design.Type = flow.Type
+		}
+	}
+	design.IsDeployed = 0
+	design.UpdateUser = toStr(args["operator"], "system")
+	return ext.UpdateDesign(context.Background(), design)
+}
+
+// designRedeploy 重新部署流程定义（issues/08）：替换最新定义内容 + 置已部署（对齐 boot3 redeploy）
+func (f *Facade) designRedeploy(args map[string]interface{}) (interface{}, error) {
+	ext := f.ext()
+	designID, err := toInt64(args["id"])
+	if err != nil {
+		return nil, errors.New("id 缺失或非法")
+	}
+	design, err := ext.FindDesignByID(context.Background(), designID)
+	if err != nil || design == nil {
+		return nil, errors.New("流程设计不存在")
+	}
+	hisList, err := ext.ListDesignHis(context.Background(), designID)
+	if err != nil {
+		return nil, err
+	}
+	if len(hisList) == 0 {
+		return nil, errors.New("流程设计没有内容，无法发布")
+	}
+	content := hisList[0].Content
+	var flow model.FlowModel
+	if err := json.Unmarshal(content, &flow); err != nil {
+		return nil, fmt.Errorf("流程定义 JSON 解析失败: %w", err)
+	}
+	if flow.Name == "" {
+		return nil, errors.New("流程定义缺少 name")
+	}
+	// 按 name 取最新定义：有则替换内容（version 不变），无则新建（对齐 boot3 redeploy）
+	last, lerr := f.repo.FindDefineByName(context.Background(), flow.Name)
+	var defineID int64
+	if lerr != nil || last == nil {
+		def, derr := f.deploy(map[string]interface{}{
+			"content":  content,
+			"operator": toStr(args["operator"], "system"),
+		})
+		if derr != nil {
+			return nil, derr
+		}
+		if m, ok := def.(map[string]interface{}); ok {
+			defineID, _ = m["processDefineId"].(int64)
+		}
+	} else {
+		if err := f.repo.UpdateDefine(context.Background(), &model.ProcessDefine{
+			ID:          last.ID,
+			Name:        flow.Name,
+			DisplayName: flow.DisplayName,
+			Type:        flow.Type,
+			Content:     content,
+			UpdateUser:  toStr(args["operator"], "system"),
+		}); err != nil {
+			return nil, err
+		}
+		defineID = last.ID
+	}
+	design.IsDeployed = 1
+	design.UpdateUser = toStr(args["operator"], "system")
+	if err := ext.UpdateDesign(context.Background(), design); err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{"processDefineId": defineID}, nil
 }
 
 // ═══ 委托代理（需扩展仓储） ═══

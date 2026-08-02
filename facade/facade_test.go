@@ -559,3 +559,82 @@ func TestMQueryParams(t *testing.T) {
 		t.Fatalf("design m_LIKE_name 应命中 1 行, got %d: %v", got, r)
 	}
 }
+
+func TestDesignDeployRedeployIsDeployed(t *testing.T) {
+	// issues/08：部署/重新部署/设计稿变更的 is_deployed 状态同步
+	f, _, extRepo := setupFacade()
+	content := string(flowContent(t, "01-simple.json"))
+
+	// 保存（含内容快照）→ 未部署
+	r := f.Flow("processDesign/save", map[string]interface{}{
+		"name": "leave08", "displayName": "请假流程08", "content": content, "operator": "zhangsan",
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("save: %v", r)
+	}
+	designID := r["data"].(map[string]interface{})["id"].(int64)
+	design, _ := extRepo.FindDesignByID(nil, designID)
+	if design.IsDeployed != 0 {
+		t.Fatalf("保存后应为未部署: %v", design.IsDeployed)
+	}
+
+	// 部署 → is_deployed=1
+	r = f.Flow("processDesign/deploy", map[string]interface{}{"id": designID, "operator": "zhangsan"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("deploy: %v", r)
+	}
+	defineID := r["data"].(map[string]interface{})["processDefineId"].(int64)
+	design, _ = extRepo.FindDesignByID(nil, designID)
+	if design.IsDeployed != 1 {
+		t.Fatalf("部署后应为已部署: %v", design.IsDeployed)
+	}
+
+	// 重新部署 → 同一 defineId（内容替换，version 不变）+ is_deployed=1
+	r = f.Flow("processDesign/redeploy", map[string]interface{}{"id": designID, "operator": "zhangsan"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("redeploy: %v", r)
+	}
+	if got := r["data"].(map[string]interface{})["processDefineId"].(int64); got != defineID {
+		t.Fatalf("redeploy 应复用同一 defineId: %d != %d", got, defineID)
+	}
+	design, _ = extRepo.FindDesignByID(nil, designID)
+	if design.IsDeployed != 1 {
+		t.Fatalf("重新部署后应为已部署: %v", design.IsDeployed)
+	}
+
+	// 设计稿内容变更（updateDefine，不同 content）→ 新快照 + is_deployed=0 + name 同步
+	content2 := string(flowContent(t, "02-multi-task.json"))
+	r = f.Flow("processDesign/updateDefine", map[string]interface{}{
+		"processDesignId": designID, "content": content2, "operator": "zhangsan",
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("updateDefine: %v", r)
+	}
+	design, _ = extRepo.FindDesignByID(nil, designID)
+	if design.IsDeployed != 0 {
+		t.Fatalf("内容变更后应为未部署: %v", design.IsDeployed)
+	}
+	if design.Name != "multi-task" {
+		t.Fatalf("updateDefine 应同步 name: %v", design.Name)
+	}
+
+	// 基本信息修改（update）→ is_deployed 不变
+	r = f.Flow("processDesign/update", map[string]interface{}{"id": designID, "displayName": "改名08", "operator": "zhangsan"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("update: %v", r)
+	}
+	design, _ = extRepo.FindDesignByID(nil, designID)
+	if design.DisplayName != "改名08" || design.IsDeployed != 0 {
+		t.Fatalf("update 应只改基本信息: %+v", design)
+	}
+
+	// 部署 → 再置 1
+	r = f.Flow("processDesign/deploy", map[string]interface{}{"id": designID, "operator": "zhangsan"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("redeploy: %v", r)
+	}
+	design, _ = extRepo.FindDesignByID(nil, designID)
+	if design.IsDeployed != 1 {
+		t.Fatalf("再部署后应为已部署: %v", design.IsDeployed)
+	}
+}
