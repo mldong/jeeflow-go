@@ -65,9 +65,13 @@ type ProcessDefine struct {
 type InstanceState int
 
 const (
-	InstanceStateDoing  InstanceState = 10
-	InstanceStateDone   InstanceState = 20
-	InstanceStateReject InstanceState = 45
+	InstanceStateDoing     InstanceState = 10
+	InstanceStateDone      InstanceState = 20
+	InstanceStateWithdraw  InstanceState = 30
+	InstanceStateInterrupt InstanceState = 40
+	InstanceStateReject    InstanceState = 45
+	InstanceStatePending   InstanceState = 50
+	InstanceStateAbandon   InstanceState = 99
 )
 
 type TaskState int
@@ -75,7 +79,59 @@ type TaskState int
 const (
 	TaskStateDoing     TaskState = 10
 	TaskStateDone      TaskState = 20
+	TaskStateWithdraw  TaskState = 30
+	TaskStateInterrupt TaskState = 40
+	TaskStatePending   TaskState = 50
 	TaskStateAbandoned TaskState = 99
+)
+
+// ─── 字典枚举（v1.4.0，对齐 Java enums，值与 boot3 字典一致） ────────────────
+
+// DefineState 流程定义状态（wf_process_define_state）
+type DefineState int
+
+const (
+	DefineStateDisable DefineState = 0
+	DefineStateEnable  DefineState = 1
+)
+
+// SubmitType 流程提交类型（wf_process_submit_type）
+type SubmitType int
+
+const (
+	SubmitTypeApply               SubmitType = 0
+	SubmitTypeAgree               SubmitType = 1
+	SubmitTypeReject              SubmitType = 2
+	SubmitTypeRollback            SubmitType = 3
+	SubmitTypeJump                SubmitType = 4
+	SubmitTypeReApply             SubmitType = 5
+	SubmitTypeRollbackToOperator  SubmitType = 6
+	SubmitTypeCountersignDisagree SubmitType = 20
+)
+
+// TaskType 任务类型（wf_process_task_type）
+type TaskType int
+
+const (
+	TaskTypeMajor     TaskType = 0
+	TaskTypeSecondary TaskType = 1
+	TaskTypeRecord    TaskType = 2
+)
+
+// PerformType 任务参与方式（wf_process_task_perform_type）
+type PerformType int
+
+const (
+	PerformTypeNormal     PerformType = 0
+	PerformTypeCountersign PerformType = 1
+)
+
+// CountersignType 会签类型（wf_countersign_type）
+type CountersignType int
+
+const (
+	CountersignTypeParallel   CountersignType = 0
+	CountersignTypeSequential CountersignType = 1
 )
 
 type ProcessInstance struct {
