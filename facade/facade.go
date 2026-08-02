@@ -743,7 +743,11 @@ func (f *Facade) ccList(args map[string]interface{}) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pageData(query.PageNum, query.PageSize, total, rows), nil
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, ccRowToMap(r))
+	}
+	return pageData(query.PageNum, query.PageSize, total, out), nil
 }
 
 func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
@@ -1039,7 +1043,11 @@ func (f *Facade) definePage(args map[string]interface{}) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pageData(query.PageNum, query.PageSize, total, rows), nil
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, defineRowToMap(r))
+	}
+	return pageData(query.PageNum, query.PageSize, total, out), nil
 }
 
 // defineDetail 流程定义详情
@@ -1075,7 +1083,11 @@ func (f *Facade) instancePage(args map[string]interface{}) (interface{}, error) 
 	if err != nil {
 		return nil, err
 	}
-	return pageData(query.PageNum, query.PageSize, total, rows), nil
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, instanceRowToMap(r))
+	}
+	return pageData(query.PageNum, query.PageSize, total, out), nil
 }
 
 // instanceDetail 流程实例详情（含任务列表）
@@ -1145,7 +1157,11 @@ func (f *Facade) todoList(args map[string]interface{}) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pageData(query.PageNum, query.PageSize, total, rows), nil
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, taskRowToMap(r))
+	}
+	return pageData(query.PageNum, query.PageSize, total, out), nil
 }
 
 // doneList 我的已办分页（operator 过滤，非进行中任务）
@@ -1156,7 +1172,11 @@ func (f *Facade) doneList(args map[string]interface{}) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pageData(query.PageNum, query.PageSize, total, rows), nil
+	out := make([]map[string]interface{}, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, taskRowToMap(r))
+	}
+	return pageData(query.PageNum, query.PageSize, total, out), nil
 }
 
 // taskVo 任务行 VO（instanceDetail 任务列表用，对齐 Java taskVo）
@@ -1169,4 +1189,87 @@ func (f *Facade) taskVo(t *model.ProcessTask) map[string]interface{} {
 		"variable": t.Variables, "createTime": t.CreateTime, "createUser": t.CreateUser,
 		"updateTime": t.UpdateTime, "updateUser": t.UpdateUser, "taskActorIdList": t.ActorIDs,
 	}
+}
+
+// ═══ 行输出转换（issues/05-2 字段契约 + 05-3 时间格式）═══
+
+const timeFmt = "2006-01-02 15:04:05"
+
+func fmtTime(t *time.Time) interface{} {
+	if t == nil {
+		return nil
+	}
+	return t.Format(timeFmt)
+}
+
+func fmtTimeV(t time.Time) string {
+	return t.Format(timeFmt)
+}
+
+// defineRowToMap 定义行：时间格式化
+func defineRowToMap(r *model.DefineRow) map[string]interface{} {
+	return map[string]interface{}{
+		"id": r.ID, "name": r.Name, "displayName": r.DisplayName, "type": r.Type,
+		"state": r.State, "version": r.Version,
+		"createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
+		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
+	}
+}
+
+// instanceRowToMap 实例行：ext（实例变量对象）+ displayName/version（定义）
+func instanceRowToMap(r *model.InstanceRow) map[string]interface{} {
+	return map[string]interface{}{
+		"id": r.ID, "parentId": r.ParentID, "processDefineId": r.DefineID,
+		"state": r.State, "parentNodeName": r.ParentNodeName, "businessNo": r.BusinessNo,
+		"operator": r.Operator, "expireTime": fmtTime(r.ExpireTime),
+		"variable": r.Variables, "createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
+		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
+		"processDefineName": r.DefineName, "processDefineDisplayName": r.DefineDisplayName,
+		"processDefineVersion": r.DefineVersion,
+		"ext":                  r.Variables, "displayName": r.DefineDisplayName, "version": r.DefineVersion,
+	}
+}
+
+// taskRowToMap 任务行：ext（任务变量，空回退实例变量）+ instanceExt + version
+func taskRowToMap(r *model.TaskRow) map[string]interface{} {
+	instanceExt := parseVarMap(r.InstanceVariable)
+	ext := r.Variables
+	if len(ext) == 0 {
+		ext = instanceExt
+	}
+	return map[string]interface{}{
+		"id": r.ID, "processInstanceId": r.ProcessInstanceID, "taskName": r.TaskName,
+		"displayName": r.DisplayName, "taskType": r.TaskType, "performType": r.PerformType,
+		"taskState": r.TaskState, "operator": r.Operator, "finishTime": fmtTime(r.FinishTime),
+		"expireTime": fmtTime(r.ExpireTime), "formKey": r.FormKey, "taskParentId": r.TaskParentID,
+		"variable": r.Variables, "createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
+		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
+		"processDefineName": r.ProcessDefineName, "processDefineDisplayName": r.ProcessDefineDisplayName,
+		"instanceVariable": r.InstanceVariable, "instanceCreateTime": fmtTimeV(r.InstanceCreateTime),
+		"ext": ext, "instanceExt": instanceExt, "version": r.DefineVersion,
+	}
+}
+
+// ccRowToMap 抄送行：ext（实例变量对象）+ displayName/version（定义）
+func ccRowToMap(r *model.CcInstanceRow) map[string]interface{} {
+	return map[string]interface{}{
+		"id": r.ID, "parentId": r.ParentID, "processDefineId": r.DefineID,
+		"state": r.State, "parentNodeName": r.ParentNodeName, "businessNo": r.BusinessNo,
+		"operator": r.Operator, "expireTime": fmtTime(r.ExpireTime),
+		"variable": r.Variables, "createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
+		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
+		"processDefineName": r.DefineName, "processDefineDisplayName": r.DefineDisplayName,
+		"processDefineVersion": r.DefineVersion,
+		"ext":                  r.Variables, "displayName": r.DefineDisplayName, "version": r.DefineVersion,
+	}
+}
+
+// parseVarMap JSON 字符串 → map（坏 JSON 返回空 map）
+func parseVarMap(s string) map[string]interface{} {
+	m := map[string]interface{}{}
+	if s == "" {
+		return m
+	}
+	_ = json.Unmarshal([]byte(s), &m)
+	return m
 }

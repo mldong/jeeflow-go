@@ -258,6 +258,7 @@ type TaskRow struct {
 	UpdateUser               string                 `json:"updateUser"`
 	ProcessDefineName        string                 `json:"processDefineName"`
 	ProcessDefineDisplayName string                 `json:"processDefineDisplayName"`
+	DefineVersion            int                    `json:"defineVersion"`
 	InstanceVariable         string                 `json:"instanceVariable"`
 	InstanceCreateTime       time.Time              `json:"instanceCreateTime"`
 }

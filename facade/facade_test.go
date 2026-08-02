@@ -309,9 +309,12 @@ func TestFacadeViewEndpoints(t *testing.T) {
 		t.Fatalf("ccList failed: %v", r)
 	}
 	ccData := r["data"].(map[string]interface{})
-	ccRows := ccData["rows"].([]*model.CcInstanceRow)
+	ccRows := ccData["rows"].([]map[string]interface{})
 	if len(ccRows) != 1 {
 		t.Fatalf("ccList rows = %d, want 1", len(ccRows))
+	}
+	if _, ok := ccRows[0]["ext"]; !ok {
+		t.Fatalf("ccList 行缺 ext: %v", ccRows[0])
 	}
 
 	// 加签/转交

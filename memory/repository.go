@@ -504,6 +504,7 @@ func (r *Repository) taskRow(t *model.ProcessTask) *model.TaskRow {
 		if def, ok := r.defines[inst.DefineID]; ok {
 			row.ProcessDefineName = def.Name
 			row.ProcessDefineDisplayName = def.DisplayName
+			row.DefineVersion = def.Version
 		}
 	}
 	return row

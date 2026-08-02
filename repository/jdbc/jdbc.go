@@ -737,7 +737,7 @@ func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bo
 	cols := "DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, t.task_type, t.perform_type," +
 		" t.task_state, t.operator, t.finish_time, t.expire_time, t.form_key, t.task_parent_id, t.variable," +
 		" t.create_time, t.create_user, t.update_time, t.update_user," +
-		" pd.name, pd.display_name, pi.variable, pi.create_time"
+		" pd.name, pd.display_name, pd.version, pi.variable, pi.create_time"
 	sqlStr := "SELECT " + cols + where + " ORDER BY t.id DESC LIMIT ? OFFSET ?"
 	args = append(args, pageSize, (pageNum-1)*pageSize)
 	rows, err := r.conn(ctx).QueryContext(ctx, sqlStr, args...)
@@ -756,7 +756,7 @@ func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bo
 			&row.TaskType, &row.PerformType, &row.TaskState, &row.Operator, &finish, &expire,
 			&row.FormKey, &parentTaskID, &variable, &row.CreateTime, &row.CreateUser,
 			&row.UpdateTime, &row.UpdateUser, &row.ProcessDefineName, &row.ProcessDefineDisplayName,
-			&instVariable, &instCreateTime); err != nil {
+			&row.DefineVersion, &instVariable, &instCreateTime); err != nil {
 			return nil, 0, err
 		}
 		if finish.Valid {
