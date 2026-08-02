@@ -24,6 +24,14 @@ func New(repo spi.ProcessRepository, userProv spi.UserProvider, idGen spi.IDGene
 	return &EngineImpl{repo: repo, userProv: userProv, idGen: idGen, exprEval: exprEval}
 }
 
+// EvalExpr 表达式求值（v1.5.0，门面 highLight 决策分支过滤用）
+func (e *EngineImpl) EvalExpr(expr string, vars map[string]interface{}) (interface{}, error) {
+	if e.exprEval == nil {
+		return nil, fmt.Errorf("ExpressionEvaluator 未配置")
+	}
+	return e.exprEval.Eval(expr, vars)
+}
+
 // ─── Start ─────────────────────────────────────────────────────────────────────
 
 func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {

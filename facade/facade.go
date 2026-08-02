@@ -558,12 +558,12 @@ func (f *Facade) highLight(args map[string]interface{}) (interface{}, error) {
 			history = append(history, t.TaskName)
 		}
 	}
-	// 路径补全：start 沿 edges 递归，遇活跃节点停止
+	// 路径补全：start 沿 edges 递归，遇活跃节点停止；决策分支按表达式求值过滤（issues/06）
 	def, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID)
 	if def != nil {
 		var flow model.FlowModel
 		if json.Unmarshal(def.Content, &flow) == nil {
-			collectPath(&flow, "start", "", active, &history, &edges, map[string]bool{})
+			f.collectPath(&flow, "start", "", active, &history, &edges, map[string]bool{}, inst.Variables, his)
 		}
 	}
 	return map[string]interface{}{
@@ -573,9 +573,11 @@ func (f *Facade) highLight(args map[string]interface{}) (interface{}, error) {
 	}, nil
 }
 
-// collectPath 从节点沿输出边递归（遇活跃节点停止），补全历史节点与边
-func collectPath(flow *model.FlowModel, nodeID, edgeName string, active []string,
-	history *[]string, edges *[]string, visited map[string]bool) {
+// collectPath 从节点沿输出边递归（遇活跃节点停止），补全历史节点与边；
+// 决策节点输出边带 expr 时用表达式求值过滤（对齐 boot3 recursionModel，issues/06）
+func (f *Facade) collectPath(flow *model.FlowModel, nodeID, edgeName string, active []string,
+	history *[]string, edges *[]string, visited map[string]bool,
+	vars map[string]interface{}, historyTasks []*model.ProcessTask) {
 	if visited[nodeID] {
 		return
 	}
@@ -583,9 +585,18 @@ func collectPath(flow *model.FlowModel, nodeID, edgeName string, active []string
 	if edgeName != "" && !containsStr(*edges, edgeName) {
 		*edges = append(*edges, edgeName)
 	}
+	src := findNodeIn(flow, nodeID)
 	for _, e := range flow.Edges {
 		if e.SourceNodeID != nodeID {
 			continue
+		}
+		// 决策节点：输出边表达式求值过滤——false 的分支未实际执行，不收集
+		if src != nil && src.Type == "snaker:decision" {
+			if expr, ok := e.Properties["expr"].(string); ok && expr != "" {
+				if ok2, _ := f.evalDecisionExpr(flow, src, expr, vars, historyTasks); !ok2 {
+					continue
+				}
+			}
 		}
 		target := findNodeIn(flow, e.TargetNodeID)
 		if target == nil {
@@ -597,8 +608,37 @@ func collectPath(flow *model.FlowModel, nodeID, edgeName string, active []string
 		if containsStr(active, target.ID) {
 			continue // 遇活跃节点停止深入
 		}
-		collectPath(flow, target.ID, e.ID, active, history, edges, visited)
+		f.collectPath(flow, target.ID, e.ID, active, history, edges, visited, vars, historyTasks)
 	}
+}
+
+// evalDecisionExpr 决策输出边表达式求值（args = 实例变量 + 决策节点前置任务变量，与引擎同源）
+func (f *Facade) evalDecisionExpr(flow *model.FlowModel, decision *model.FlowNode, expr string,
+	vars map[string]interface{}, historyTasks []*model.ProcessTask) (bool, error) {
+	args := map[string]interface{}{}
+	for k, v := range vars {
+		args[k] = v
+	}
+	// 前置任务变量：决策节点输入的第一个源节点对应的历史任务
+	for _, e := range flow.Edges {
+		if e.TargetNodeID == decision.ID {
+			for _, t := range historyTasks {
+				if t.TaskName == e.SourceNodeID {
+					for k, v := range t.Variables {
+						args[k] = v
+					}
+					break
+				}
+			}
+			break
+		}
+	}
+	result, err := f.engine.EvalExpr(expr, args)
+	if err != nil {
+		return false, nil
+	}
+	b, _ := result.(bool)
+	return b, nil
 }
 
 func findNodeIn(flow *model.FlowModel, id string) *model.FlowNode {

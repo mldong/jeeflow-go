@@ -366,3 +366,69 @@ func TestFacadeErrors(t *testing.T) {
 		t.Fatalf("design action without ext should fail, got %v", r)
 	}
 }
+
+// ═══ highLight 决策分支表达式过滤（issues/06）═══
+
+func TestHighLightFiltersDecisionBranch(t *testing.T) {
+	f, repo, _ := setupFacade()
+	content := string(flowContent(t, "03-decision-expr.json"))
+	r := f.Flow("processDefine/deploy", map[string]interface{}{"content": content})
+	defineID := r["data"].(map[string]interface{})["processDefineId"].(int64)
+
+	// amount=500 → 走「amount <= 1000」分支（task3），task2 分支未执行
+	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": defineID, "operator": "zhangsan", "amount": 500,
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("startAndExecute failed: %v", r)
+	}
+	instanceID := r["data"].(map[string]interface{})["processInstanceId"].(int64)
+
+	// 推进：task1(leader) → decision → task3(director) → end
+	doing, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
+	for _, tk := range doing {
+		if tk.TaskName == "task1" {
+			_ = repo.AddTaskActor(context.Background(), tk.ID, []string{"leader"})
+			r = f.Flow("processTask/execute", map[string]interface{}{
+				"processTaskId": tk.ID, "operator": "leader", "submitType": 1,
+			})
+			if code, _ := r["code"].(int); code != 0 {
+				t.Fatalf("execute task1 failed: %v", r)
+			}
+		}
+	}
+	doing, _ = repo.FindDoingTasks(context.Background(), instanceID, nil)
+	for _, tk := range doing {
+		if tk.TaskName == "task3" {
+			_ = repo.AddTaskActor(context.Background(), tk.ID, []string{"director"})
+			r = f.Flow("processTask/execute", map[string]interface{}{
+				"processTaskId": tk.ID, "operator": "director", "submitType": 1,
+			})
+			if code, _ := r["code"].(int); code != 0 {
+				t.Fatalf("execute task3 failed: %v", r)
+			}
+		}
+	}
+
+	r = f.Flow("processInstance/highLight", map[string]interface{}{"id": instanceID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("highLight failed: %v", r)
+	}
+	hl := r["data"].(map[string]interface{})
+	histEdges := hl["historyEdgeNames"].([]string)
+	histNodes := hl["historyNodeNames"].([]string)
+	// 走过的分支：e4（amount<=1000 → task3）+ e6（task3→end）
+	if !containsStr2(histEdges, "e4") || !containsStr2(histEdges, "e6") {
+		t.Fatalf("应包含走过的边 e4/e6: %v", histEdges)
+	}
+	// 未走分支：e3/e5/task2 不得出现
+	if containsStr2(histEdges, "e3") || containsStr2(histEdges, "e5") {
+		t.Fatalf("未走分支边不应高亮: %v", histEdges)
+	}
+	if containsStr2(histNodes, "task2") {
+		t.Fatalf("未走节点 task2 不应高亮: %v", histNodes)
+	}
+	if !containsStr2(histNodes, "task3") {
+		t.Fatalf("应包含走过节点 task3: %v", histNodes)
+	}
+}
