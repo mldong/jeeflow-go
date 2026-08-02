@@ -20,5 +20,6 @@
 
 ## 相关
 
-- 引擎规范（唯一事实来源）：[SPEC](../../spec/)
+- 引擎规范（唯一事实来源）：[规范总览](../../spec/)
+  - [01 数据模型](../../spec/01-data-model) · [02 流程定义格式](../../spec/02-flow-definition) · [03 状态机](../../spec/03-state-machine) · [04 引擎核心操作](../../spec/04-engine-ops) · [05 SPI 接口](../../spec/05-spi) · [06 统一门面](../../spec/06-facade) · [07 元数据能力](../../spec/07-metadata) · [08 合规测试](../../spec/08-compliance)
 - 设计原理 / 通用指南：[jeeflow-doc](../../)
