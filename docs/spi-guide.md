@@ -99,6 +99,44 @@ func (p *MyUserProvider) GetUser(userID string) (*model.UserInfo, error) {
 }
 ```
 
+### OrgUserProvider（v1.6.0）
+
+组织维度取人——内置组织 handler（部门领导/分管领导/角色）的数据源。
+**业务方只实现数据接口，不写 handler**：
+
+```go
+type OrgUserProvider interface {
+    FindDeptLeaders(deptID string) ([]string, error)
+    FindDeptMainLeaders(deptID string) ([]string, error)
+    FindByRole(roleCode string) ([]string, error)
+}
+```
+
+```go
+type MyOrgUserProvider struct {
+    orgSvc *OrgService
+}
+
+func (p *MyOrgUserProvider) FindDeptLeaders(deptID string) ([]string, error) {
+    return p.orgSvc.LeaderIDs(deptID)
+}
+
+func (p *MyOrgUserProvider) FindByRole(roleCode string) ([]string, error) {
+    return p.orgSvc.UserIDsByRole(roleCode)
+}
+```
+
+注册内置 handler（`engine.RegisterBuiltinAssignments`，注册名与 Java 类全限定名一致，
+流程 JSON 四语言通用）：
+
+```go
+reg := engine.NewHandlerRegistry()
+engine.RegisterBuiltinAssignments(reg, userProv, orgProv)   // 组织维度依赖注入
+eng.SetRegistry(reg)
+```
+
+> 内置 handler 的**场景/配置/注意事项**见 [用户指南 07 · 参与者解析](../../guides/07-assignment-handlers.md)。
+
 ### IDGenerator
 
 ```go
