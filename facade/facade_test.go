@@ -59,6 +59,19 @@ var _ spi.ExpressionEvaluator = (*testExprEval)(nil)
 
 // ─── 门面路由测试（v1.1.0，spec §12 #15） ─────────────────────────────────────
 
+type testOrgUserProv struct{}
+
+func (p *testOrgUserProv) FindDeptLeaders(deptID string) ([]string, error)    { return nil, nil }
+func (p *testOrgUserProv) FindDeptMainLeaders(deptID string) ([]string, error) { return nil, nil }
+func (p *testOrgUserProv) FindByRole(roleCode string) ([]string, error) {
+	if roleCode == "finance" {
+		return []string{"finA", "finB"}, nil
+	}
+	return nil, nil
+}
+
+var _ spi.OrgUserProvider = (*testOrgUserProv)(nil)
+
 func setupFacade() (*facade.Facade, *memory.Repository, *memory.ExtRepository) {
 	repo := memory.New()
 	extRepo := memory.NewExt()
@@ -352,6 +365,50 @@ func containsStr2(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+func TestCandidatePageDualSource(t *testing.T) {
+	repo := memory.New()
+	extRepo := memory.NewExt()
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	f := facade.New(eng, repo, extRepo)
+	f.SetOrgUserProvider(&testOrgUserProv{})
+
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "12-candidate-page.json"))})
+	if code, _ := r0["code"].(int); code != 0 {
+		t.Fatalf("deploy failed: %v", r0)
+	}
+	def, err := repo.FindDefineByName(context.Background(), "candidate-flow")
+	if err != nil || def == nil {
+		t.Fatalf("define not found: %v", err)
+	}
+	// 直接启动（不自动完成 apply）→ apply 任务 → candidatePage 查 review 候选
+	inst, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "user1", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(doing) != 1 || doing[0].TaskName != "apply" {
+		t.Fatalf("want apply task, got %+v", doing)
+	}
+	r := f.Flow("processTask/candidatePage", map[string]interface{}{"processTaskId": doing[0].ID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("candidatePage failed: %v", r)
+	}
+	data := r["data"].(map[string]interface{})
+	rows := data["rows"].([]map[string]interface{})
+	if len(rows) != 4 {
+		t.Fatalf("candidates = %d, want 4 (userA/userB + finA/finB)", len(rows))
+	}
+	got := map[string]bool{}
+	for _, row := range rows {
+		got[row["userId"].(string)] = true
+	}
+	for _, want := range []string{"userA", "userB", "finA", "finB"} {
+		if !got[want] {
+			t.Fatalf("candidate missing %s: %v", want, rows)
+		}
+	}
 }
 
 func TestFacadeErrors(t *testing.T) {

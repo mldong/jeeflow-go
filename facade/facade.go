@@ -32,11 +32,18 @@ type Facade struct {
 	repo       spi.ProcessRepository
 	extRepo    spi.ProcessExtRepository // 可空：未接入时设计/委托 action 报错
 	userSearch UserSearch               // 可空：candidatePage 用户搜索依赖
+	orgProv    spi.OrgUserProvider      // 可空：candidatePage candidateGroups 角色取人（v1.6.0）
 }
 
 // SetUserSearch 注入用户搜索钩子
 func (f *Facade) SetUserSearch(fn UserSearch) *Facade {
 	f.userSearch = fn
+	return f
+}
+
+// SetOrgUserProvider 注入组织用户提供者（candidatePage candidateGroups 角色取人）
+func (f *Facade) SetOrgUserProvider(orgProv spi.OrgUserProvider) *Facade {
+	f.orgProv = orgProv
 	return f
 }
 
@@ -998,13 +1005,13 @@ func (f *Facade) candidatePage(args map[string]interface{}) (interface{}, error)
 	if inst == nil {
 		return nil, errors.New("流程实例不存在")
 	}
-	// 模型候选解析：当前任务的后继任务节点的 candidateUsers 配置
+	// 模型候选解析：当前任务的后继任务节点的 candidateUsers / candidateGroups 配置
 	var candidates []string
 	def, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID)
 	if def != nil {
 		var flow model.FlowModel
 		if json.Unmarshal(def.Content, &flow) == nil {
-			candidates = nextTaskCandidates(&flow, task.TaskName)
+			candidates = f.nextTaskCandidates(&flow, task.TaskName)
 		}
 	}
 	if len(candidates) > 0 {
@@ -1026,8 +1033,9 @@ func (f *Facade) candidatePage(args map[string]interface{}) (interface{}, error)
 	return pageData(toIntDef(args["pageNum"], 1), toIntDef(args["pageSize"], 10), total, rows), nil
 }
 
-// nextTaskCandidates 找当前任务节点的后继任务节点，收集 candidateUsers（逗号分割）
-func nextTaskCandidates(flow *model.FlowModel, taskName string) []string {
+// nextTaskCandidates 找当前任务节点的后继任务节点，收集 candidateUsers / candidateGroups（逗号分割）。
+// candidateGroups 按角色取人（OrgUserProvider.findByRole，v1.6.0 对齐 boot4 GlobalCandidateHandler）。
+func (f *Facade) nextTaskCandidates(flow *model.FlowModel, taskName string) []string {
 	var result []string
 	collect := func(node *model.FlowNode) {
 		if v, ok := node.Properties["candidateUsers"].(string); ok && v != "" {
@@ -1035,6 +1043,23 @@ func nextTaskCandidates(flow *model.FlowModel, taskName string) []string {
 				s = strings.TrimSpace(s)
 				if s != "" && !containsStr(result, s) {
 					result = append(result, s)
+				}
+			}
+		}
+		if f.orgProv != nil {
+			if v, ok := node.Properties["candidateGroups"].(string); ok && v != "" {
+				for _, roleCode := range strings.Split(v, ",") {
+					roleCode = strings.TrimSpace(roleCode)
+					if roleCode == "" {
+						continue
+					}
+					if ids, err := f.orgProv.FindByRole(roleCode); err == nil {
+						for _, id := range ids {
+							if id != "" && !containsStr(result, id) {
+								result = append(result, id)
+							}
+						}
+					}
 				}
 			}
 		}
