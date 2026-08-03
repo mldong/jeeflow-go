@@ -1,0 +1,54 @@
+name: sync-cn
+
+# 发布同步：打 v* tag（发布锚点，与各平台版本对齐）时，
+# 把 master 分支 + 全部 tag 同步到 Gitee / GitCode 国内镜像仓。
+#
+# 前置配置（一次性）：
+#   1. 在 gitee.com / gitcode.com 创建同名空仓库（mldong/<本仓库名>）
+#   2. 生成私人令牌（Gitee：设置→私人令牌；GitCode：设置→访问令牌）
+#   3. 仓库 Settings → Secrets and variables → Actions 配置：
+#        GITEE_OWNER / GITEE_USERNAME / GITEE_TOKEN
+#        GITCODE_OWNER / GITCODE_TOKEN
+#   详细步骤见 mldong-hub/docs/github-sync-cn.md
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {} # 手动触发（首次配置后验证用）
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout（含全部 tag）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Sync to Gitee
+        env:
+          GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+          GITEE_USERNAME: ${{ secrets.GITEE_USERNAME }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          if [ -z "$GITEE_OWNER" ] || [ -z "$GITEE_TOKEN" ]; then
+            echo "⚠️ 未配置 GITEE_OWNER/GITEE_TOKEN，跳过 Gitee 同步"
+            exit 0
+          fi
+          git push --force --tags \
+            "https://${GITEE_USERNAME}:${GITEE_TOKEN}@gitee.com/${GITEE_OWNER}/${{ github.event.repository.name }}.git" \
+            master
+
+      - name: Sync to GitCode
+        env:
+          GITCODE_OWNER: ${{ secrets.GITCODE_OWNER }}
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+        run: |
+          if [ -z "$GITCODE_OWNER" ] || [ -z "$GITCODE_TOKEN" ]; then
+            echo "⚠️ 未配置 GITCODE_OWNER/GITCODE_TOKEN，跳过 GitCode 同步"
+            exit 0
+          fi
+          git push --force --tags \
+            "https://oauth2:${GITCODE_TOKEN}@gitcode.com/${GITCODE_OWNER}/${{ github.event.repository.name }}.git" \
+            master
