@@ -56,6 +56,17 @@ type UserProvider interface {
 	GetUser(userID string) (*model.UserInfo, error)
 }
 
+// OrgUserProvider 组织维度用户提供者（issues/16）——部门领导 / 部门分管领导 / 角色成员。
+// 通用业务语义，业务方只实现数据接口，不写 AssignmentHandler。
+type OrgUserProvider interface {
+	// FindDeptLeaders 部门领导（deptId → 领导 userId 列表）
+	FindDeptLeaders(deptID string) ([]string, error)
+	// FindDeptMainLeaders 部门分管领导（deptId → 分管领导 userId 列表）
+	FindDeptMainLeaders(deptID string) ([]string, error)
+	// FindByRole 按角色取人（roleCode → userId 列表）
+	FindByRole(roleCode string) ([]string, error)
+}
+
 // IDGenerator ID 生成器
 type IDGenerator interface {
 	NextID() int64

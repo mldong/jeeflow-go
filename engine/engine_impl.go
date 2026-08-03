@@ -357,7 +357,7 @@ func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel
 }
 
 func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}) error {
-	actors := e.resolveActors(node, inst, vars)
+	actors := e.resolveActors(node, inst, operator, vars)
 	if len(actors) == 0 {
 		return nil
 	}
@@ -400,20 +400,20 @@ func formKeyOf(node *model.FlowNode) string {
 	return form
 }
 
-func (e *EngineImpl) resolveActors(node *model.FlowNode, inst *model.ProcessInstance, vars map[string]interface{}) []string {
+func (e *EngineImpl) resolveActors(node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}) []string {
 	// 1a. Registry 按名称解析（推荐，对标 Spring IoC）
 	if e.registry != nil {
 		handlerName, _ := node.Properties["assignmentHandler"].(string)
 		if handlerName != "" {
 			if h := e.registry.ResolveAssignment(handlerName); h != nil {
-				return h.Assign(node, nil)
+				return h.Assign(node, inst, operator)
 			}
 		}
 	}
 	// 1b. Extensions 兼容模式（旧 API）
 	if e.ext != nil && e.ext.AssignmentHandler != nil {
 		handlerName, _ := node.Properties["assignmentHandler"].(string)
-		if actors := e.ext.AssignmentHandler(handlerName, node, nil); len(actors) > 0 {
+		if actors := e.ext.AssignmentHandler(handlerName, node, inst); len(actors) > 0 {
 			return actors
 		}
 	}

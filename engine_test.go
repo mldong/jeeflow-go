@@ -414,3 +414,93 @@ func Test12SystemExecuteFlowAuto(t *testing.T) {
 		t.Fatalf("want task2, got %v", doing[0].TaskName)
 	}
 }
+
+// ─── issues/16 内置通用 handler（11-assignment-handler.json 全链路）────────────
+
+type testOrgUserProv struct{}
+
+func (p *testOrgUserProv) FindDeptLeaders(deptID string) ([]string, error) {
+	if deptID == "D01" {
+		return []string{"leader1", "leader2"}, nil
+	}
+	return nil, nil
+}
+
+func (p *testOrgUserProv) FindDeptMainLeaders(deptID string) ([]string, error) {
+	if deptID == "D01" {
+		return []string{"boss1"}, nil
+	}
+	return nil, nil
+}
+
+func (p *testOrgUserProv) FindByRole(roleCode string) ([]string, error) {
+	if roleCode == "task4" {
+		return []string{"roleA", "roleB"}, nil
+	}
+	return nil, nil
+}
+
+func Test12BuiltinAssignmentHandlers(t *testing.T) {
+	repo := memory.New()
+	reg := engine.NewHandlerRegistry()
+	engine.RegisterBuiltinAssignments(reg, &testUserProv{}, &testOrgUserProv{})
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	eng.SetRegistry(reg)
+
+	def := registerFlow(repo, "11-assignment-handler.json")
+
+	// ① FormFieldAssigneeHandler：节点 task1 → args.task1 = userA,userB
+	inst, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "user1",
+		map[string]interface{}{"task1": "userA,userB"})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(doing) != 1 || doing[0].TaskName != "task1" {
+		t.Fatalf("want task1, got %+v", doing)
+	}
+	if len(doing[0].ActorIDs) != 2 || doing[0].ActorIDs[0] != "userA" || doing[0].ActorIDs[1] != "userB" {
+		t.Fatalf("formField actors wrong: %v", doing[0].ActorIDs)
+	}
+	repo.AddTaskActor(context.Background(), doing[0].ID, doing[0].ActorIDs)
+	eng.ExecuteProcessTask(context.Background(), doing[0].ID, "userA", nil)
+
+	// ② OperatorAssignmentHandler：task2 → 发起人 user1
+	doing, _ = repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(doing) != 1 || doing[0].TaskName != "task2" {
+		t.Fatalf("want task2, got %+v", doing)
+	}
+	if len(doing[0].ActorIDs) != 1 || doing[0].ActorIDs[0] != "user1" {
+		t.Fatalf("operator actors wrong: %v", doing[0].ActorIDs)
+	}
+	repo.AddTaskActor(context.Background(), doing[0].ID, doing[0].ActorIDs)
+	eng.ExecuteProcessTask(context.Background(), doing[0].ID, "user1", nil)
+
+	// ③ DeptLeaderAssignmentHandler：task3 → user1 部门 D01 领导 = leader1,leader2
+	doing, _ = repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(doing) != 1 || doing[0].TaskName != "task3" {
+		t.Fatalf("want task3, got %+v", doing)
+	}
+	if len(doing[0].ActorIDs) != 2 || doing[0].ActorIDs[0] != "leader1" || doing[0].ActorIDs[1] != "leader2" {
+		t.Fatalf("deptLeader actors wrong: %v", doing[0].ActorIDs)
+	}
+	repo.AddTaskActor(context.Background(), doing[0].ID, doing[0].ActorIDs)
+	eng.ExecuteProcessTask(context.Background(), doing[0].ID, "leader1", nil)
+
+	// ④ TaskRoleAssigneeHandler：task4 → roleCode=task4 → roleA,roleB
+	doing, _ = repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(doing) != 1 || doing[0].TaskName != "task4" {
+		t.Fatalf("want task4, got %+v", doing)
+	}
+	if len(doing[0].ActorIDs) != 2 || doing[0].ActorIDs[0] != "roleA" || doing[0].ActorIDs[1] != "roleB" {
+		t.Fatalf("taskRole actors wrong: %v", doing[0].ActorIDs)
+	}
+	repo.AddTaskActor(context.Background(), doing[0].ID, doing[0].ActorIDs)
+	eng.ExecuteProcessTask(context.Background(), doing[0].ID, "roleA", nil)
+
+	// 结束
+	reloaded, _ := repo.FindInstanceByID(context.Background(), inst.ID)
+	if reloaded.State != model.InstanceStateDone {
+		t.Fatalf("want finished, got %v", reloaded.State)
+	}
+}

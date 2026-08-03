@@ -6,8 +6,8 @@ import "github.com/mldong/jeeflow-go/model"
 
 // IAssignmentHandler 参与者指派处理器接口
 type IAssignmentHandler interface {
-	// Assign 返回参与者列表
-	Assign(node *model.FlowNode, inst *model.ProcessInstance) []string
+	// Assign 返回参与者列表（operator: 当前任务操作人，issues/16 对齐 Java Execution.getOperator）
+	Assign(node *model.FlowNode, inst *model.ProcessInstance, operator string) []string
 }
 
 // IDecisionHandler 决策处理器接口
