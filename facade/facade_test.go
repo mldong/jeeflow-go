@@ -411,6 +411,52 @@ func TestCandidatePageDualSource(t *testing.T) {
 	}
 }
 
+func TestStartAndExecutePreAssign(t *testing.T) {
+	f, repo, _ := setupFacade()
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
+	if code, _ := r0["code"].(int); code != 0 {
+		t.Fatalf("deploy failed: %v", r0)
+	}
+	def, err := repo.FindDefineByName(context.Background(), "simple")
+	if err != nil || def == nil {
+		t.Fatalf("define not found: %v", err)
+	}
+
+	// 预指派人：f_nextNodeOperator=userA → 自动完成 apply → task1 参与者 = userA
+	r := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": def.ID, "operator": "user1", "f_nextNodeOperator": "userA",
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("startAndExecute failed: %v", r)
+	}
+	inst1 := int64(toFloat(r["data"].(map[string]interface{})["processInstanceId"]))
+	doing, _ := repo.FindDoingTasks(context.Background(), inst1, nil)
+	if len(doing) != 1 || doing[0].TaskName != "task1" {
+		t.Fatalf("want task1, got %+v", doing)
+	}
+	actors1, _ := repo.FindTaskActors(context.Background(), doing[0].ID)
+	if len(actors1) != 1 || actors1[0] != "userA" {
+		t.Fatalf("预指派后 task1 参与者应为 userA, got %v", actors1)
+	}
+
+	// 未指定 → task1 参与者 = leader
+	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": def.ID, "operator": "user1",
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("startAndExecute failed: %v", r)
+	}
+	inst2 := int64(toFloat(r["data"].(map[string]interface{})["processInstanceId"]))
+	doing2, _ := repo.FindDoingTasks(context.Background(), inst2, nil)
+	if len(doing2) != 1 || doing2[0].TaskName != "task1" {
+		t.Fatalf("want task1, got %+v", doing2)
+	}
+	actors2, _ := repo.FindTaskActors(context.Background(), doing2[0].ID)
+	if len(actors2) != 1 || actors2[0] != "leader" {
+		t.Fatalf("未指定时 task1 参与者应为 leader, got %v", actors2)
+	}
+}
+
 func TestFacadeErrors(t *testing.T) {
 	f, _, _ := setupFacade()
 	r := f.Flow("foo/bar", nil)

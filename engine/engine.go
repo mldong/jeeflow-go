@@ -27,6 +27,8 @@ const (
 	KeyAutoGenTitle = "autoGenTitle"
 	// v1.0.1：下一节点处理人（对齐 boot3 tf_nextNodeOperator）
 	KeyNextNodeOperator = "tf_nextNodeOperator"
+	// v1.6.0：流程启动时预指派人（对齐 boot3 f_nextNodeOperator）——startAndExecute 时转换为 tf_
+	KeyProcessStartNextNodeOperator = "f_nextNodeOperator"
 	// v1.0.1：系统代执行 / 超级管理员（对齐 boot3 FlowConst）
 	KeyAutoExecute = "flow.auto"
 	KeyAdminID     = "flow.admin"
