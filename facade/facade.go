@@ -850,7 +850,8 @@ func (f *Facade) approvalRecord(args map[string]interface{}) (interface{}, error
 			"taskName": t.TaskName, "displayName": t.DisplayName,
 			"taskType": t.TaskType, "performType": t.PerformType,
 			"taskState": t.TaskState, "operator": t.ActorID,
-			"finishTime": t.FinishTime, "variable": t.Variables,
+			"finishTime": fmtTime(t.FinishTime), "variable": t.Variables,
+			"ext": t.Variables, // issues/15：前端读 ext.tf_approvalComment
 		})
 	}
 	return rows, nil
@@ -1271,10 +1272,14 @@ func (f *Facade) instanceDetail(args map[string]interface{}) (interface{}, error
 		"id": inst.ID, "parentId": inst.ParentID, "processDefineId": inst.DefineID,
 		"state": inst.State, "parentNodeName": inst.ParentNodeName,
 		"businessNo": inst.BusinessNo, "operator": inst.Operator,
-		"variables": inst.Variables, "createTime": inst.CreateTime, "createUser": inst.CreateUser,
+		"variables": inst.Variables, "formData": formDataOf(inst.Variables, "f_"), // issues/15
+		"createTime": inst.CreateTime, "createUser": inst.CreateUser,
 	}
 	var graph map[string]interface{}
 	if def0, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID); def0 != nil {
+		data["displayName"] = def0.DisplayName // issues/15
+		data["name"] = def0.Name
+		data["version"] = def0.Version
 		graph = map[string]interface{}{}
 		if json.Unmarshal(def0.Content, &graph) == nil && len(graph) > 0 {
 			data["jsonObject"] = graph // issues/05
@@ -1355,6 +1360,7 @@ func (f *Facade) taskVo(t *model.ProcessTask) map[string]interface{} {
 		"expireTime": t.ExpireTime, "formKey": t.FormKey, "taskParentId": t.ParentTaskID,
 		"variable": t.Variables, "createTime": t.CreateTime, "createUser": t.CreateUser,
 		"updateTime": t.UpdateTime, "updateUser": t.UpdateUser, "taskActorIdList": t.ActorIDs,
+		"taskFormData": formDataOf(t.Variables, "tf_"), // issues/15
 	}
 }
 
@@ -1401,6 +1407,18 @@ func toUnderscore(camel string) string {
 		}
 	}
 	return b.String()
+}
+
+// formDataOf issues/15：取 vars 中 prefix 前缀字段，输出「带前缀 + 去前缀副本」（对齐 boot3 getFormData/getTaskFormData）
+func formDataOf(vars map[string]interface{}, prefix string) map[string]interface{} {
+	out := map[string]interface{}{}
+	for k, v := range vars {
+		if strings.HasPrefix(k, prefix) {
+			out[k] = v
+			out[strings.TrimPrefix(k, prefix)] = v
+		}
+	}
+	return out
 }
 
 // ═══ 行输出转换（issues/05-2 字段契约 + 05-3 时间格式）═══
@@ -1459,6 +1477,7 @@ func taskRowToMap(r *model.TaskRow) map[string]interface{} {
 		"processDefineName": r.ProcessDefineName, "processDefineDisplayName": r.ProcessDefineDisplayName,
 		"instanceVariable": r.InstanceVariable, "instanceCreateTime": fmtTimeV(r.InstanceCreateTime),
 		"ext": ext, "instanceExt": instanceExt, "version": r.DefineVersion,
+		"taskFormData": formDataOf(r.Variables, "tf_"), // issues/15
 	}
 }
 
