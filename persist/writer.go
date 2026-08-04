@@ -166,9 +166,11 @@ func (w *JdbcDynamicTableWriter) probeSQLite(ctx context.Context, tableName stri
 }
 
 func (w *JdbcDynamicTableWriter) probeMySQL(ctx context.Context, tableName string) ([]columnMeta, error) {
+	// issues/22：限定当前 schema（DATABASE()），防多库同名表列重复
 	rows, err := w.db.QueryContext(ctx,
 		"SELECT column_name, extra, column_key FROM information_schema.columns "+
-			"WHERE UPPER(table_name) = UPPER(?) ORDER BY ordinal_position", tableName)
+			"WHERE UPPER(table_name) = UPPER(?) AND table_schema = DATABASE() "+
+			"ORDER BY ordinal_position", tableName)
 	if err != nil {
 		return nil, fmt.Errorf("persist: probe columns of %s failed: %w", tableName, err)
 	}
@@ -190,15 +192,19 @@ func (w *JdbcDynamicTableWriter) probeMySQL(ctx context.Context, tableName strin
 
 func (w *JdbcDynamicTableWriter) probeStd(ctx context.Context, tableName string) ([]columnMeta, error) {
 	// PG/H2 标准 SQL：IS_IDENTITY（identity）+ column_default nextval（PG serial）+ 主键约束 JOIN
+	// issues/22：限定当前 schema（CURRENT_SCHEMA()，H2/PG 均支持），防多库同名表列重复
 	rows, err := w.db.QueryContext(ctx,
 		"SELECT c.column_name, c.is_identity, c.column_default, "+
 			"CASE WHEN kcu.column_name IS NOT NULL THEN 'PRI' ELSE '' END AS column_key "+
 			"FROM information_schema.columns c "+
 			"LEFT JOIN information_schema.table_constraints tc "+
 			"  ON tc.table_name = c.table_name AND tc.constraint_type = 'PRIMARY KEY' "+
+			"  AND tc.table_schema = c.table_schema "+
 			"LEFT JOIN information_schema.key_column_usage kcu "+
 			"  ON kcu.constraint_name = tc.constraint_name AND kcu.column_name = c.column_name "+
-			"WHERE UPPER(c.table_name) = UPPER(?) ORDER BY c.ordinal_position", tableName)
+			"  AND kcu.table_schema = c.table_schema "+
+			"WHERE UPPER(c.table_name) = UPPER(?) AND c.table_schema = CURRENT_SCHEMA() "+
+			"ORDER BY c.ordinal_position", tableName)
 	if err != nil {
 		return nil, fmt.Errorf("persist: probe columns of %s failed: %w", tableName, err)
 	}
