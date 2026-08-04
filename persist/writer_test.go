@@ -60,7 +60,7 @@ func TestInsertFull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
-	if title != "年假申请" || pi != 1 || createUser != "system" || deleted != 0 {
+	if title != "年假申请" || pi != 1 || createUser != "user1" || deleted != 0 {
 		t.Fatalf("row mismatch: title=%s pi=%d createUser=%s deleted=%d", title, pi, createUser, deleted)
 	}
 }
@@ -152,7 +152,8 @@ func TestExistsIdempotent(t *testing.T) {
 	}
 }
 
-// ⑧ 系统字段填充：insert=true 填 create/update/is_deleted；false 只填 update
+// ⑧ 系统字段填充：insert=true 填 create/update/is_deleted；false 只填 update；
+// 用户列默认值优先 apply_user_id（issues/19）
 func TestFillSystemFields(t *testing.T) {
 	db, w := setupDB(t)
 	defer db.Close()
@@ -173,5 +174,18 @@ func TestFillSystemFields(t *testing.T) {
 	w.FillSystemFields(w2data, true)
 	if _, ok := w2data["create_time"]; ok {
 		t.Fatal("disabled column should not be filled")
+	}
+	// issues/19：data 已注入 apply_user_id（拦截器场景）→ 用户列取 operator
+	w3data := map[string]interface{}{"title": "t", "apply_user_id": "123"}
+	w.FillSystemFields(w3data, true)
+	if w3data["create_user"] != "123" || w3data["update_user"] != "123" {
+		t.Fatalf("user column should use operator: %v", w3data)
+	}
+	// 可配置默认值回落
+	w.DefaultUserValue = 0
+	w4data := map[string]interface{}{"title": "t"}
+	w.FillSystemFields(w4data, true)
+	if w4data["create_user"] != 0 {
+		t.Fatalf("configured default user expected: %v", w4data)
 	}
 }

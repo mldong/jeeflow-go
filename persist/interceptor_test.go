@@ -140,7 +140,7 @@ func TestFlowFinishPersist(t *testing.T) {
 		t.Fatalf("query biz_leave failed: %v", err)
 	}
 	if title != "年假申请" || amount != 800.0 || pi != inst.ID || applyUser != "user1" ||
-		applyDept != "D01" || createUser != "system" || deleted != 0 {
+		applyDept != "D01" || createUser != "user1" || deleted != 0 {
 		t.Fatalf("row mismatch: title=%s amount=%v pi=%d applyUser=%s applyDept=%s createUser=%s deleted=%d",
 			title, amount, pi, applyUser, applyDept, createUser, deleted)
 	}
@@ -216,10 +216,75 @@ func TestIdempotentFlow(t *testing.T) {
 	def := registerPersistFlow(repo, true)
 	inst := runFlow(t, eng, repo, def.ID, true)
 
-	// 模拟重复触发：直接对结束节点再调一次拦截器
+	// 模拟同链重复触发：结束节点再调一次拦截器（共享 inst.Variables）
 	ic.PostHandle(&model.FlowNode{Type: model.TypeEnd}, inst)
 	if n := countRows(t, db); n != 1 {
 		t.Fatalf("idempotent failed, rows=%d", n)
+	}
+}
+
+// ⑥ BIGINT 用户列（issues/19）：create_user 为 BIGINT 存 userId，operator 数字时插入不报类型错误
+func TestBigintUserColumn(t *testing.T) {
+	repo := memory.New()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite failed: %v", err)
+	}
+	defer db.Close()
+	_, err = db.Exec(`CREATE TABLE biz_settle (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		title TEXT,
+		process_instance_id INTEGER,
+		apply_user_id INTEGER,
+		create_user INTEGER,
+		update_user INTEGER,
+		is_deleted INTEGER
+	)`)
+	if err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+	w := persist.NewJdbcDynamicTableWriter(db)
+	ic := persist.NewPersistPostInterceptor(w, repo.FindDefineByID)
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}})
+
+	// 流程 content 注入 relTableName=biz_settle
+	data, err := os.ReadFile("../../jeeflow-java/jeeflow-core/src/test/resources/flows/01-simple.json")
+	if err != nil {
+		t.Fatalf("read flow failed: %v", err)
+	}
+	content := replaceFirst(string(data), `"type": "approval"`, `"type": "approval", "relTableName": "biz_settle"`)
+	def := &model.ProcessDefine{ID: 1, Name: "simple", Type: "approval", State: 1, Version: 1, Content: []byte(content)}
+	repo.AddDefine(def)
+
+	// operator 用数字 userId（BIGINT 列场景）
+	inst, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "123",
+		map[string]interface{}{"f_title": "结算单", "u_deptId": "D01"})
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	repo.AddTaskActor(context.Background(), doing[0].ID, []string{"123"})
+	doing[0].ActorIDs = append(doing[0].ActorIDs, "123")
+	if _, err = eng.ExecuteProcessTask(context.Background(), doing[0].ID, "123",
+		map[string]interface{}{engine.KeySubmitType: int(model.SubmitTypeApply)}); err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	doing, _ = repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	repo.AddTaskActor(context.Background(), doing[0].ID, []string{"leader"})
+	doing[0].ActorIDs = append(doing[0].ActorIDs, "leader")
+	if _, err = eng.ExecuteProcessTask(context.Background(), doing[0].ID, "leader",
+		map[string]interface{}{engine.KeySubmitType: int(model.SubmitTypeAgree)}); err != nil {
+		t.Fatalf("task1 failed: %v", err)
+	}
+
+	var createUser, applyUser int64
+	err = db.QueryRow("SELECT create_user, apply_user_id FROM biz_settle").Scan(&createUser, &applyUser)
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if createUser != 123 || applyUser != 123 {
+		t.Fatalf("BIGINT user column mismatch: create_user=%d apply_user_id=%d", createUser, applyUser)
 	}
 }
 

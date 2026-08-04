@@ -70,6 +70,16 @@ func (p *PersistPostInterceptor) PostHandle(node *model.FlowNode, inst *model.Pr
 		return
 	}
 
+	// 同链重复触发防护（issues/19）：最后任务节点与结束节点都会触发后置拦截器，
+	// 同一执行链（共享 inst.Variables）只插一次。标记写入时实例已完成持久化
+	// （引擎 TypeEnd 分支先 UpdateInstance 后触发拦截器），不会落库；
+	// exists 保留作为跨请求/重启的幂等兜底（先查后插语义不变）。
+	chainKey := "__persist_executed_" + strconv.FormatInt(inst.ID, 10)
+	if v, ok := inst.Variables[chainKey]; ok && v == true {
+		return
+	}
+	inst.Variables[chainKey] = true
+
 	// 表名：流程定义顶层 relTableName，缺省回落流程 name
 	tableName, err := p.resolveTableName(inst)
 	if err != nil || tableName == "" {

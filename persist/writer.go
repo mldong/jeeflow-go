@@ -53,10 +53,13 @@ type JdbcDynamicTableWriter struct {
 	UpdateTimeColumn string
 	UpdateUserColumn string
 	IsDeletedColumn  string
+	// 用户列默认值（issues/19）：优先取 data 中已注入的 apply_user_id=流程 operator，
+	// 否则用此配置值，缺省 "system"——多数框架业务表 create_user/update_user 为 BIGINT 存 userId
+	DefaultUserValue interface{}
 
-	mu       sync.RWMutex
-	cache    map[string][]string // 表名 -> 实际列（大写）
-	sqlite   bool               // 方言：SQLite 走 PRAGMA table_info
+	mu     sync.RWMutex
+	cache  map[string][]string // 表名 -> 实际列（大写）
+	sqlite bool                // 方言：SQLite 走 PRAGMA table_info
 }
 
 // NewJdbcDynamicTableWriter 创建 JDBC 写入器（方言自动探测：
@@ -69,6 +72,7 @@ func NewJdbcDynamicTableWriter(db *sql.DB) *JdbcDynamicTableWriter {
 		UpdateTimeColumn: "update_time",
 		UpdateUserColumn: "update_user",
 		IsDeletedColumn:  "is_deleted",
+		DefaultUserValue: "system",
 		cache:            make(map[string][]string),
 	}
 	w.sqlite = strings.Contains(fmt.Sprintf("%T", db.Driver()), "sqlite")
@@ -246,13 +250,13 @@ func (w *JdbcDynamicTableWriter) FillSystemFields(data map[string]interface{}, i
 			data[w.CreateTimeColumn] = now
 		}
 		if w.CreateUserColumn != "" {
-			data[w.CreateUserColumn] = "system"
+			data[w.CreateUserColumn] = w.resolveDefaultUser(data)
 		}
 		if w.UpdateTimeColumn != "" {
 			data[w.UpdateTimeColumn] = now
 		}
 		if w.UpdateUserColumn != "" {
-			data[w.UpdateUserColumn] = "system"
+			data[w.UpdateUserColumn] = w.resolveDefaultUser(data)
 		}
 		if w.IsDeletedColumn != "" {
 			data[w.IsDeletedColumn] = 0
@@ -262,7 +266,16 @@ func (w *JdbcDynamicTableWriter) FillSystemFields(data map[string]interface{}, i
 			data[w.UpdateTimeColumn] = now
 		}
 		if w.UpdateUserColumn != "" {
-			data[w.UpdateUserColumn] = "system"
+			data[w.UpdateUserColumn] = w.resolveDefaultUser(data)
 		}
 	}
+}
+
+// resolveDefaultUser 默认用户值（issues/19）：优先取 data 中已注入的 apply_user_id
+// （拦截器场景 = 流程 operator，BIGINT 用户列表开箱即用），否则回落配置默认值。
+func (w *JdbcDynamicTableWriter) resolveDefaultUser(data map[string]interface{}) interface{} {
+	if operator, ok := data["apply_user_id"]; ok && operator != nil {
+		return operator
+	}
+	return w.DefaultUserValue
 }
