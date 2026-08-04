@@ -24,6 +24,21 @@
 
 storageType 支持名称（"EXPAND"）或数字（2，mldong dev_schema_field 1-5 语义）。
 
+
+**JSON 配置字段语义**（顶层 + `fields[]`，storageType 名称/数字双解析）：
+
+| 字段 | 类型 | 缺省 | 语义 |
+|------|------|------|------|
+| `tableName` | string | 必填 | 业务表名（应与 JSON 文件名一致） |
+| `primaryKey` | string | `id` | 主键列名（子表外键缺省回落它） |
+| `fields[].name` | string | 必填 | **表单字段名**（`f_` 去前缀后的名字，如 `f_title` → `title`） |
+| `fields[].columnName` | string | name 转下划线 | 主表列名 |
+| `fields[].storageType` | string \| number | `NORMAL` | `NORMAL`(1) 直写 / `EXPAND`(2) 展开 / `JSON`(3) 序列化 / `ONE2ONE`(4) 子表单条 / `ONE2MANY`(5) 子表多条（对齐 mldong dev_schema_field） |
+| `fields[].expandFields` | object | 无 | **EXPAND 专用**：子字段名 → 表列名映射 |
+| `fields[].targetTable` | string | 无 | **ONE2ONE/ONE2MANY 专用**：子表表名 |
+| `fields[].foreignKey` | string | 主表主键列名 | **ONE2ONE/ONE2MANY 专用**：子表外键列 |
+
+
 ## 装配（写侧 + 读侧）
 
 ```go
