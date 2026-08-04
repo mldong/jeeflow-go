@@ -45,6 +45,15 @@ eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}}
   不同意/退回不入库
 - 引擎对齐（1.6.2）：任务完成后结束节点统一走 `executeNode`，拦截器在流程结束时完整触发
 
+
+**流程定义配置字段语义**（顶层，与 `name`/`nodes` 同层）：
+
+| 字段 | 取值 | 语义 |
+|------|------|------|
+| `relTableName` | 表名 | 业务表名——数据写入哪张表；**缺省回落流程 `name`**；表不存在 = 配置错误显性报错 |
+| `persistMode` | `ARCHIVE` / `SYNC`（缺省 `ARCHIVE`） | 持久化模式——`ARCHIVE`：流程结束且同意落库一次；`SYNC`：发起即入库 → 节点推进 → 结束定稿，全程留痕。非 `SYNC` 值回落 `ARCHIVE` |
+
+
 ## 同步演进模式（SYNC，1.8.0）
 
 流程定义顶层加 `"persistMode": "SYNC"`（缺省 `ARCHIVE`——保持"结束同意归档"不变），
