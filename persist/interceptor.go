@@ -3,6 +3,7 @@ package persist
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -16,7 +17,6 @@ import (
 // Go 拦截器签名（PostHandle）不含流程模型，表名信息需由集成方注入加载函数，
 // 通常直接透传仓库的 FindDefineByID。
 type DefineLoader func(ctx context.Context, defineID int64) (*model.ProcessDefine, error)
-
 // ─── PersistPostInterceptor ────────────────────────────────────────────────────
 
 // PersistPostInterceptor 工作流业务数据入库适配拦截器（issues/18）——
@@ -76,9 +76,13 @@ func (p *PersistPostInterceptor) PostHandle(node *model.FlowNode, inst *model.Pr
 		return // 解析失败/未配置：静默跳过
 	}
 
-	// 幂等：以 process_instance_id 为键，先查后插
+	// 幂等：以 process_instance_id 为键，先查后插。
+	// 表不存在等探测失败是配置错误，必须显性暴露（与 Java/Python 抛异常一致）
 	exists, err := p.Writer.Exists(tableName, "process_instance_id", inst.ID)
-	if err != nil || exists {
+	if err != nil {
+		panic(fmt.Errorf("persist: %w", err))
+	}
+	if exists {
 		return
 	}
 

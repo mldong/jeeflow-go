@@ -183,20 +183,24 @@ func TestNoWriterSkip(t *testing.T) {
 	}
 }
 
-// ④ 未配置 relTableName → 缺省回落流程 name（simple），表不存在 → 静默跳过
+// ④ 未配置 relTableName → 缺省回落流程 name（simple）→ 表不存在 → 显性报错（panic，配置错误快速失败）
 func TestNoTableNameSkip(t *testing.T) {
 	repo := memory.New()
-	db, _ := newWriter(t)
+	db, w := newWriter(t)
 	defer db.Close()
-	ic := persist.NewPersistPostInterceptor(nil, repo.FindDefineByID)
+	ic := persist.NewPersistPostInterceptor(w, repo.FindDefineByID)
 	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
 	eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}})
 
 	def := registerPersistFlow(repo, false)
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("table not found should panic (config error)")
+		}
+	}()
 	runFlow(t, eng, repo, def.ID, true)
-
 	if n := countRows(t, db); n != 0 {
-		t.Fatalf("no table name should skip, rows=%d", n)
+		t.Fatalf("no table name should not persist, rows=%d", n)
 	}
 }
 
