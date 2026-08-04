@@ -1,6 +1,6 @@
 # 元数据驱动入库（persist-meta）
 
-> issues/23 · 1.7.0 起随 module 提供（go get 同 module）
+> issues/23 起 · 1.8.0（1.7.0 引入）随 module 提供（go get 同 module）
 
 **字段元数据（storageType）驱动的动态写入/读取**——复杂表单（对象/JSON/子表）落库与
 流程回显成为通用能力。规范见文档站《10 · 元数据驱动的动态写入/读取》；本页是 Go 语言视角。
@@ -45,6 +45,16 @@ form, _ := reader.ReadByProcessInstance("biz_leave", processInstanceID)
 ```
 
 边界（不做）：通用分页/条件/权限/排序。
+
+
+## 1.8.0 增强（SYNC 同步演进协同）
+
+- **中途更新（`update`）**：按元数据 storageType 组装 SET 列——NORMAL/JSON/EXPAND 参与更新；
+  **ONE2ONE/ONE2MANY 子表不参与中途更新**（SYNC 任务推进只更新主表行状态，子表数据变动走重新提交）
+- **子表系统用户字段（issues/24）**：子表递归插入继承主表 `apply_user_id`（= 流程 operator，
+  子表单显式同名字段优先）——BIGINT `create_user`/`update_user` 列不再回落 "system" 严格模式报错
+- **回显去冗余（issues/24）**：EXPAND 展开列（如 `province`/`city`）已消费为对象（`address`），
+  不再作为顶层平铺键重复带出
 
 ## 测试
 
