@@ -20,9 +20,10 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout（含全部 tag）
+      - name: Checkout（master + 全部 tag）
         uses: actions/checkout@v4
         with:
+          ref: master          # 显式检出 master：tag 触发时默认 detached HEAD，无 master 分支可 push
           fetch-depth: 0
           fetch-tags: true
 
