@@ -39,7 +39,7 @@ eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}}
 - 拦截器挂在引擎全局 Extensions；内部按「结束节点 + 实例 Done + submitType=AGREE」过滤，
   仅对流程定义顶层声明了 `relTableName`（缺省回落流程 name）的流程生效
 - 语义：实例 `f_` 字段（去前缀）+ 流程上下文（`process_instance_id`/`apply_user_id`/`apply_dept_id`）
-  + 系统字段写入业务表；`process_instance_id` 幂等（先查后插）；表不存在 panic（配置错误快速失败）；
+  + 系统字段写入业务表；`process_instance_id` 幂等（先查后插）+ 同链内存标记（1.6.3，共享 inst.Variables，不落库）；用户列默认取 operator（1.6.3）；表不存在 panic（配置错误快速失败）；
   不同意/退回不入库
 - 引擎对齐（1.6.2）：任务完成后结束节点统一走 `executeNode`，拦截器在流程结束时完整触发
 
