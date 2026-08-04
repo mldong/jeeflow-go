@@ -125,15 +125,9 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 			}
 		}
 		for _, node := range followEdges(&flow, curNode.ID) {
-			if node.Type == model.TypeEnd {
-				// 聚合根：流程完成
-				inst.Finish(time.Now())
-				inst.Variables = vars
-				e.repo.UpdateInstance(ctx, inst)
-				e.fireEvent(ProcessEvent{Type: EventProcessFinish, InstanceID: inst.ID, Operator: operator})
-			} else {
-				e.executeNode(ctx, &flow, inst, node, operator, vars)
-			}
+			// 统一走 executeNode：结束节点也经节点执行链（拦截器/事件完整触发），
+			// executeNode 内部 TypeEnd 分支完成聚合根 Finish + 事件发布
+			e.executeNode(ctx, &flow, inst, node, operator, vars)
 		}
 	}
 	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
