@@ -21,6 +21,7 @@ func setupDB(t *testing.T) (*sql.DB, *persist.JdbcDynamicTableWriter) {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		title TEXT,
 		amount REAL,
+		start_time TEXT,
 		process_instance_id INTEGER,
 		apply_user_id TEXT,
 		apply_dept_id TEXT,
@@ -187,5 +188,52 @@ func TestFillSystemFields(t *testing.T) {
 	w.FillSystemFields(w4data, true)
 	if w4data["create_user"] != 0 {
 		t.Fatalf("configured default user expected: %v", w4data)
+	}
+}
+
+// ⑨ 宽松列匹配（issues/20）：驼峰表单字段 ↔ 下划线表列，写入保持表列原名
+func TestLooseCamelMatch(t *testing.T) {
+	db, w := setupDB(t)
+	defer db.Close()
+	_, err := w.Insert("biz_leave", map[string]interface{}{
+		"startTime":         "09:00:00", // 驼峰 key（表列 start_time）
+		"processInstanceId": int64(55),  // 驼峰 key（表列 process_instance_id）
+	})
+	if err != nil {
+		t.Fatalf("insert failed: %v", err)
+	}
+	var startTime string
+	var pi int64
+	if err := db.QueryRow("SELECT start_time, process_instance_id FROM biz_leave").Scan(&startTime, &pi); err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if startTime != "09:00:00" || pi != 55 {
+		t.Fatalf("camel key should land on snake column: start_time=%s pi=%d", startTime, pi)
+	}
+	kept, _ := w.FilterColumns("biz_leave", []string{"startTime", "processInstanceId", "no_such"})
+	if len(kept) != 2 {
+		t.Fatalf("loose filter mismatch: %v", kept)
+	}
+}
+
+// ⑩ 严格列匹配（issues/20）：显式开启后驼峰不再匹配
+func TestStrictColumnMatch(t *testing.T) {
+	db, w := setupDB(t)
+	defer db.Close()
+	w.StrictColumnMatch = true
+	_, err := w.Insert("biz_leave", map[string]interface{}{
+		"startTime": "09:00:00", // 严格模式：驼峰不匹配表列 start_time
+		"title":     "strict",
+	})
+	if err != nil {
+		t.Fatalf("insert failed: %v", err)
+	}
+	var title string
+	var startTime interface{}
+	if err := db.QueryRow("SELECT title, start_time FROM biz_leave").Scan(&title, &startTime); err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if title != "strict" || startTime != nil {
+		t.Fatalf("strict mode should filter camel key: title=%s start_time=%v", title, startTime)
 	}
 }

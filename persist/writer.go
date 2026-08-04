@@ -56,6 +56,9 @@ type JdbcDynamicTableWriter struct {
 	// 用户列默认值（issues/19）：优先取 data 中已注入的 apply_user_id=流程 operator，
 	// 否则用此配置值，缺省 "system"——多数框架业务表 create_user/update_user 为 BIGINT 存 userId
 	DefaultUserValue interface{}
+	// 列匹配（issues/20）：默认宽松——驼峰↔下划线归一匹配（表单字段 companyName ↔ 表列 company_name）；
+	// 需要精确控制列名的集成方显式开启严格模式（忽略大小写精确匹配）
+	StrictColumnMatch bool
 
 	mu     sync.RWMutex
 	cache  map[string][]string // 表名 -> 实际列（大写）
@@ -154,7 +157,7 @@ func (w *JdbcDynamicTableWriter) tableColumns(ctx context.Context, tableName str
 	return names, nil
 }
 
-// FilterColumns 按目标表过滤列
+// FilterColumns 按目标表过滤列（宽松模式驼峰↔下划线归一匹配，issues/20）
 func (w *JdbcDynamicTableWriter) FilterColumns(tableName string, columns []string) ([]string, error) {
 	if err := checkTableName(tableName); err != nil {
 		return nil, err
@@ -163,20 +166,16 @@ func (w *JdbcDynamicTableWriter) FilterColumns(tableName string, columns []strin
 	if err != nil {
 		return nil, err
 	}
-	set := make(map[string]struct{}, len(cols))
-	for _, c := range cols {
-		set[c] = struct{}{}
-	}
 	var kept []string
 	for _, c := range columns {
-		if _, ok := set[strings.ToUpper(c)]; ok {
+		if w.findColumn(cols, c) != "" {
 			kept = append(kept, c)
 		}
 	}
 	return kept, nil
 }
 
-// Insert 参数化 INSERT（列过滤 + 值过滤，防注入）
+// Insert 参数化 INSERT（列过滤 + 值过滤，防注入；写入用表列原名，issues/20）
 func (w *JdbcDynamicTableWriter) Insert(tableName string, data map[string]interface{}) (interface{}, error) {
 	if err := checkTableName(tableName); err != nil {
 		return nil, err
@@ -185,28 +184,16 @@ func (w *JdbcDynamicTableWriter) Insert(tableName string, data map[string]interf
 	if err != nil {
 		return nil, err
 	}
-	set := make(map[string]struct{}, len(cols))
-	for _, c := range cols {
-		set[c] = struct{}{}
-	}
 	var names []string
 	var values []interface{}
 	// 保持插入顺序稳定（map 无序，先按表列顺序取）
 	for _, col := range cols {
-		v, ok := data[col] // 精确匹配（含大小写变体）
-		if !ok {
-			for k, vv := range data {
-				if strings.ToUpper(k) == col {
-					v, ok = vv, true
-					break
-				}
-			}
-		}
-		if !ok {
+		key := w.findDataKey(data, col)
+		if key == "" {
 			continue
 		}
 		names = append(names, col)
-		values = append(values, v)
+		values = append(values, data[key])
 	}
 	if len(names) == 0 {
 		return nil, fmt.Errorf("persist: no matching columns for %s", tableName)
@@ -224,6 +211,35 @@ func (w *JdbcDynamicTableWriter) Insert(tableName string, data map[string]interf
 		return nil, nil // 不支持自增键的驱动（如 PG）不返回 ID，不算错误
 	}
 	return id, nil
+}
+
+// findColumn 列匹配（issues/20）：严格=忽略大小写精确；宽松（默认）=驼峰↔下划线归一匹配
+func (w *JdbcDynamicTableWriter) findColumn(cols []string, column string) string {
+	for _, col := range cols {
+		if w.StrictColumnMatch {
+			if strings.EqualFold(col, column) {
+				return col
+			}
+		} else if normalizeColumn(col) == normalizeColumn(column) {
+			return col
+		}
+	}
+	return ""
+}
+
+// findDataKey 在 data 中找匹配指定表列的 key（宽松模式驼峰 key 匹配下划线列）
+func (w *JdbcDynamicTableWriter) findDataKey(data map[string]interface{}, col string) string {
+	for k := range data {
+		if w.findColumn([]string{col}, k) != "" {
+			return k
+		}
+	}
+	return ""
+}
+
+// normalizeColumn 列名归一：转小写 + 去下划线（companyName / company_name / COMPANY_NAME 等价）
+func normalizeColumn(name string) string {
+	return strings.ToLower(strings.ReplaceAll(name, "_", ""))
 }
 
 // Exists 幂等检查

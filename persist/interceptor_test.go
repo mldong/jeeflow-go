@@ -103,6 +103,7 @@ func newWriter(t *testing.T) (*sql.DB, *persist.JdbcDynamicTableWriter) {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		title TEXT,
 		amount REAL,
+		start_time TEXT,
 		process_instance_id INTEGER,
 		apply_user_id TEXT,
 		apply_dept_id TEXT,
