@@ -110,9 +110,24 @@ type HandlerRegistry struct {
 	handlers map[string][]HandlerMeta
 }
 
-// NewHandlerRegistry 构造注册中心
+// NewHandlerRegistry 构造注册中心（构造即内置 7 个通用 AssignmentHandler 元数据，v1.6.0 issues/16）
 func NewHandlerRegistry() *HandlerRegistry {
-	return &HandlerRegistry{handlers: map[string][]HandlerMeta{}}
+	r := &HandlerRegistry{handlers: map[string][]HandlerMeta{}}
+	r.RegisterAll(builtinAssignmentMetas())
+	return r
+}
+
+// builtinAssignmentMetas 内置通用参与者 handler 元数据（注册名与 Java 类全限定名一致，四语言通用）
+func builtinAssignmentMetas() []HandlerMeta {
+	return []HandlerMeta{
+		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler", DisplayName: "流程发起人", Order: -9999},
+		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$ApplicantDeptLeaderAssignmentHandler", DisplayName: "发起人所属部门经理", Order: 10},
+		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$ApplicantDeptMainLeaderAssignmentHandler", DisplayName: "发起人所属部门分管领导", Order: 20},
+		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$DeptLeaderAssignmentHandler", DisplayName: "当前用户所属部门经理", Order: 30},
+		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$DeptMainLeaderAssignmentHandler", DisplayName: "当前用户所属部门分管领导", Order: 40},
+		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.FormFieldAssigneeHandler", DisplayName: "根据表单字段值分配参与者", Order: 50},
+		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskRoleAssigneeHandler", DisplayName: "根据任务节点唯一编码关联角色分配参与者", Order: 60},
+	}
 }
 
 // Register 注册单个处理器元数据

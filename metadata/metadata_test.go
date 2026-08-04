@@ -65,11 +65,16 @@ func TestHandlerRegistry(t *testing.T) {
 	r.Register(HandlerMeta{Type: "FlowInterceptor", ClassName: "com.example.LogInterceptor", DisplayName: "日志记录", Order: 1, Group: "pre"})
 
 	assignments := r.ListHandlers("AssignmentHandler")
-	if len(assignments) != 2 {
-		t.Fatalf("assignments = %d, want 2", len(assignments))
+	// 内置 7 个通用 handler（v1.6.0 issues/16）+ 2 个自定义
+	if len(assignments) != 9 {
+		t.Fatalf("assignments = %d, want 9", len(assignments))
 	}
-	if assignments[0].ClassName != "com.example.BossHandler" || assignments[0].DisplayName != "老板审批" {
-		t.Fatalf("assignments[0] = %v, want order 1 的 BossHandler", assignments[0])
+	if assignments[0].ClassName != "com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler" ||
+		assignments[0].DisplayName != "流程发起人" {
+		t.Fatalf("assignments[0] = %v, want 内置 OperatorAssignmentHandler(order=-9999)", assignments[0])
+	}
+	if assignments[1].ClassName != "com.example.BossHandler" || assignments[1].DisplayName != "老板审批" {
+		t.Fatalf("assignments[1] = %v, want order 1 的 BossHandler", assignments[1])
 	}
 
 	pre := r.ListHandlersGroup("FlowInterceptor", "pre")
@@ -87,10 +92,8 @@ func TestHandlerRegistry(t *testing.T) {
 
 func TestEmptyRegistry(t *testing.T) {
 	r := NewHandlerRegistry()
-	if list := r.ListHandlers("AssignmentHandler"); len(list) != 0 {
-		t.Fatalf("empty registry should return empty, got %v", list)
-	}
-	if types := r.ListHandlerTypes(); len(types) != 0 {
-		t.Fatalf("empty types, got %v", types)
+	// 构造即内置 7 个通用 handler（v1.6.0 issues/16），空注册表不再为空
+	if list := r.ListHandlers("AssignmentHandler"); len(list) != 7 {
+		t.Fatalf("want 7 builtin handlers, got %d: %v", len(list), list)
 	}
 }
