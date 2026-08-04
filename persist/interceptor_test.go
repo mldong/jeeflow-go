@@ -302,7 +302,7 @@ func registerSyncFlow(repo *memory.Repository, tableName string) *model.ProcessD
 	content = strings.ReplaceAll(content, `"type": "approval"`,
 		`"type": "approval", "relTableName": "`+tableName+`", "persistMode": "SYNC"`)
 	content = strings.ReplaceAll(content, `"assignee": "leader"`,
-		`"assignee": "leader", "field": {"PERMISSION_title": 1, "PERMISSION_amount": 2}`)
+		`"assignee": "leader", "field": {"PERMISSION_f_title": 1, "PERMISSION_amount": 2}`)
 	content = strings.ReplaceAll(content, `"id": "end"`, `"id": "finish"`)
 	content = strings.ReplaceAll(content, `"targetNodeId": "end"`, `"targetNodeId": "finish"`)
 	def := &model.ProcessDefine{ID: 2, Name: "simple", DisplayName: "01-simple.json", Type: "approval", State: 1, Version: 1, Content: []byte(content)}

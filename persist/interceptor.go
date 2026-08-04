@@ -238,12 +238,22 @@ func (p *PersistPostInterceptor) resolveFieldPermission(node *model.FlowNode) ma
 	return nil
 }
 
-// isEditable 字段可编辑判定：无声明或 EDIT(2) 可更新；READ_ONLY(1)/HIDDEN(3) 不更新
+// isEditable 字段可编辑判定：无声明或 EDIT(2) 可更新；READ_ONLY(1)/HIDDEN(3) 不更新。
+// 键格式兼容两种（issues/25）：
+//   - PERMISSION_f_{表单字段全名}——前端 vben5-wf 设计器约定（优先）
+//   - PERMISSION_{去前缀名}——后端 1.8.0 首版格式（兼容）
 func (p *PersistPostInterceptor) isEditable(fieldPerm map[string]interface{}, fieldName string) bool {
 	if len(fieldPerm) == 0 {
 		return true
 	}
-	perm, ok := fieldPerm["PERMISSION_"+fieldName]
+	prefix := p.FieldPrefix
+	if prefix == "" {
+		prefix = "f_"
+	}
+	perm, ok := fieldPerm["PERMISSION_"+prefix+fieldName]
+	if !ok {
+		perm, ok = fieldPerm["PERMISSION_"+fieldName]
+	}
 	if !ok {
 		return true
 	}
