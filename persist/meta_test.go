@@ -191,3 +191,100 @@ type mapMetaProvider struct {
 func (p *mapMetaProvider) LoadTableMeta(tableName string) *persist.TableMeta {
 	return p.metas[tableName]
 }
+
+// ⑧ issues/24：ONE2MANY 子表递归继承主表 apply_user_id（BIGINT create_user 不回落 "system"）
+// + EXPAND 列不重复平铺带出 + MetaTableWriter.Update 组装
+func TestSubTableUserPropagationAndUpdate(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite failed: %v", err)
+	}
+	defer db.Close()
+	db.Exec(`CREATE TABLE biz_parent (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		title TEXT, apply_user_id INTEGER, create_user INTEGER, finish INTEGER, process_instance_id INTEGER,
+		province TEXT, city TEXT, is_deleted INTEGER
+	)`)
+	db.Exec(`CREATE TABLE biz_child (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER,
+		item_name TEXT, create_user INTEGER, update_user INTEGER, is_deleted INTEGER
+	)`)
+
+	provider := &mapMetaProvider{metas: map[string]*persist.TableMeta{
+		"biz_parent": {
+			TableName: "biz_parent", PrimaryKey: "id",
+			Fields: []persist.FieldMeta{
+				{Name: "title"},
+				{Name: "address", StorageType: persist.StorageExpand,
+					ExpandFields: map[string]string{"province": "province", "city": "city"}},
+				{Name: "items", StorageType: persist.StorageOne2Many,
+					TargetTable: "biz_child", ForeignKey: "parent_id"},
+			},
+		},
+		"biz_child": {
+			TableName: "biz_child", PrimaryKey: "id",
+			Fields: []persist.FieldMeta{{Name: "itemName"}},
+		},
+	}}
+	base := persist.NewJdbcDynamicTableWriter(db)
+	writer := persist.NewMetaTableWriter(base, provider)
+	reader := persist.NewMetaTableReader(persist.NewJdbcTableReader(db), provider)
+
+	operator := int64(1567738052492341249)
+	pk, err := writer.Insert("biz_parent", map[string]interface{}{
+		"title": "传播测试", "apply_user_id": operator,
+		"address": map[string]interface{}{"province": "广东省", "city": "深圳市"},
+		"items":   []interface{}{map[string]interface{}{"itemName": "测试项目A"}},
+		"process_instance_id": int64(999),
+	})
+	if err != nil {
+		t.Fatalf("insert failed: %v", err)
+	}
+	// 子表 create_user = operator（不回落 "system"）
+	var childUser int64
+	if err := db.QueryRow("SELECT create_user FROM biz_child WHERE parent_id = ?", pk).Scan(&childUser); err != nil {
+		t.Fatalf("query child failed: %v", err)
+	}
+	if childUser != operator {
+		t.Fatalf("child create_user should be operator: %d", childUser)
+	}
+	// 主表 create_user 同 operator
+	var parentUser int64
+	if err := db.QueryRow("SELECT create_user FROM biz_parent WHERE id = ?", pk).Scan(&parentUser); err != nil {
+		t.Fatalf("query parent failed: %v", err)
+	}
+	if parentUser != operator {
+		t.Fatalf("parent create_user should be operator: %d", parentUser)
+	}
+	// Update：EXPAND 展开列 + 状态字段直通（子表不参与中途更新）
+	if _, err := writer.Update("biz_parent", map[string]interface{}{
+		"address": map[string]interface{}{"province": "北京市", "city": "海淀区"},
+		"finish":  20,
+	}, "process_instance_id", int64(999)); err != nil {
+		t.Fatalf("update failed: %v", err)
+	}
+	var province, city string
+	var finish int
+	if err := db.QueryRow("SELECT province, city, finish FROM biz_parent WHERE id = ?", pk).
+		Scan(&province, &city, &finish); err != nil {
+		t.Fatalf("query after update failed: %v", err)
+	}
+	if province != "北京市" || city != "海淀区" {
+		t.Fatalf("expand update mismatch: %s %s", province, city)
+	}
+	if finish != 20 {
+		t.Fatalf("state update mismatch: %d", finish)
+	}
+	// 读侧：EXPAND 展开列不重复平铺带出（对象形式已消费，issues/24）
+	result, err := reader.ReadByProcessInstance("biz_parent", int64(999))
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if _, ok := result["province"]; ok {
+		t.Fatalf("expand column should not be flat: %v", result)
+	}
+	addr, _ := result["address"].(map[string]interface{})
+	if addr == nil || addr["city"] != "海淀区" {
+		t.Fatalf("address object mismatch: %v", result["address"])
+	}
+}

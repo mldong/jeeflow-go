@@ -129,15 +129,28 @@ func (r *MetaTableReader) Assemble(meta *TableMeta, row map[string]interface{}) 
 			}
 		}
 	}
-	// 未在元数据中的列（process_instance_id/apply_user_id/系统字段）带出（key 统一小写）
+	// 未在元数据中的列（process_instance_id/apply_user_id/系统字段）带出（key 统一小写）；
+	// EXPAND 展开列（挂在某字段 expandFields 映射里，对象形式已带出）不重复平铺（issues/24）
 	for k, v := range row {
-		if meta.FindFieldByColumn(k) == nil {
+		if meta.FindFieldByColumn(k) == nil && !meta.isExpandColumn(k) {
 			if _, ok := result[strings.ToLower(k)]; !ok {
 				result[strings.ToLower(k)] = v
 			}
 		}
 	}
 	return result, nil
+}
+
+// isExpandColumn 判断列是否为某字段的 EXPAND 展开列（issues/24：已消费，不重复平铺带出）
+func (m *TableMeta) isExpandColumn(column string) bool {
+	for _, f := range m.Fields {
+		for _, col := range f.ExpandFields {
+			if strings.EqualFold(col, column) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // expandFrom EXPAND 反展开：多列 → 对象

@@ -27,6 +27,9 @@ type DynamicTableWriter interface {
 	FilterColumns(tableName string, columns []string) ([]string, error)
 	// Insert 参数化 INSERT（按 FilterColumns 结果落库），返回生成主键
 	Insert(tableName string, data map[string]interface{}) (interface{}, error)
+	// Update 参数化 UPDATE（按 FilterColumns 结果组装 SET 列；条件列排除，防注入），
+	// 返回受影响行数（SYNC 同步演进，issues/24；不支持时返回明确错误）
+	Update(tableName string, data map[string]interface{}, whereColumn string, whereValue interface{}) (int64, error)
 	// Exists 幂等检查：指定业务键（如 process_instance_id）是否已存在
 	Exists(tableName, bizKey string, bizKeyValue interface{}) (bool, error)
 	// FillSystemFields 按配置列名填充系统字段（未配置的列跳过）
@@ -290,6 +293,43 @@ func (w *JdbcDynamicTableWriter) Insert(tableName string, data map[string]interf
 		return nil, nil // 不支持自增键的驱动（如 PG）不返回 ID，不算错误
 	}
 	return id, nil
+}
+
+// Update 参数化 UPDATE（SYNC 同步演进，issues/24）：列过滤（宽松匹配）+ 条件列排除 +
+// 参数化 SET，返回受影响行数。对齐 Java JdbcDynamicTableWriter.update。
+func (w *JdbcDynamicTableWriter) Update(tableName string, data map[string]interface{}, whereColumn string, whereValue interface{}) (int64, error) {
+	if err := checkTableName(tableName); err != nil {
+		return 0, err
+	}
+	if whereColumn == "" {
+		return 0, fmt.Errorf("persist: update %s requires where column", tableName)
+	}
+	metas, err := w.tableColumns(context.Background(), tableName)
+	if err != nil {
+		return 0, err
+	}
+	var sets []string
+	var args []interface{}
+	for _, m := range metas {
+		if normalizeColumn(m.name) == normalizeColumn(whereColumn) {
+			continue // 条件列不参与 SET
+		}
+		if key := w.findDataKey(data, m.name); key != "" {
+			sets = append(sets, m.name+" = ?")
+			args = append(args, data[key])
+		}
+	}
+	if len(sets) == 0 {
+		return 0, nil // 无更新列（如结束节点仅状态探测未命中）
+	}
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s = ?", tableName,
+		strings.Join(sets, ","), whereColumn)
+	args = append(args, whereValue)
+	res, err := w.db.ExecContext(context.Background(), query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("persist: update %s failed: %w", tableName, err)
+	}
+	return res.RowsAffected()
 }
 
 // findColumn 列匹配（issues/20）：严格=忽略大小写精确；宽松（默认）=驼峰↔下划线归一匹配

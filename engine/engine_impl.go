@@ -95,6 +95,9 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 
 	curNode := findNode(&flow, task.TaskName)
 	if curNode != nil {
+		// 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
+		// createTask 触发的同节点 PostHandle 幂等一致（同一节点同一次执行仅更新一次）
+		e.firePostInterceptors(curNode, inst)
 		ct, _ := stringFromProps(curNode.Properties, "countersignType")
 		if ct == "SEQUENTIAL" {
 			doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
@@ -253,14 +256,17 @@ func (e *EngineImpl) loadAndCheck(ctx context.Context, taskID int64, operator st
 }
 
 func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}) error {
+	// 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
+	// 任务完成的拦截器由 ExecuteProcessTask 显式触发，1.8.0 SYNC 同步演进）
+	if node.Type == model.TypeTask || node.Type == model.TypeCustom {
+		return e.createTask(ctx, node, inst, operator, vars)
+	}
 	if !e.firePreInterceptors(node, inst) {
 		return nil
 	}
 	defer e.firePostInterceptors(node, inst)
 
 	switch node.Type {
-	case model.TypeTask, model.TypeCustom:
-		return e.createTask(ctx, node, inst, operator, vars)
 	case model.TypeDecision:
 		return e.evaluateDecision(ctx, flow, inst, node, operator, vars)
 	case model.TypeFork:
@@ -277,7 +283,13 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 		}
 		return nil
 	case model.TypeEnd:
-		inst.Finish(time.Now())
+		// 对齐 Java EndProcessHandler：submitType=REJECT → Reject，否则 Finish
+		submitType, ok := inst.Variables[KeySubmitType]
+		if ok && toIntOf(submitType) == int(model.SubmitTypeReject) {
+			inst.Reject(time.Now())
+		} else {
+			inst.Finish(time.Now())
+		}
 		inst.Variables = vars
 		e.repo.UpdateInstance(ctx, inst)
 		e.fireEvent(ProcessEvent{Type: EventProcessFinish, InstanceID: inst.ID, Operator: operator})
@@ -642,4 +654,17 @@ func stringFromProps(props map[string]interface{}, key string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// toIntOf 宽松数字转换（submitType 变量可能为 int/int64/float64）
+func toIntOf(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	}
+	return -1
 }
