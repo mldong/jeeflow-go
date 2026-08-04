@@ -18,6 +18,7 @@ type EngineImpl struct {
 	exprEval spi.ExpressionEvaluator
 	ext      *Extensions
 	registry *HandlerRegistry
+	interceptorCache map[int64][]FlowInterceptor
 }
 
 func New(repo spi.ProcessRepository, userProv spi.UserProvider, idGen spi.IDGenerator, exprEval spi.ExpressionEvaluator) *EngineImpl {

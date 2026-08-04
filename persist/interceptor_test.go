@@ -3,6 +3,7 @@ package persist_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/mldong/jeeflow-go/engine"
+	"github.com/mldong/jeeflow-go/facade"
 	"github.com/mldong/jeeflow-go/memory"
 	"github.com/mldong/jeeflow-go/model"
 	"github.com/mldong/jeeflow-go/persist"
@@ -554,4 +556,148 @@ func TestSyncPermBypass(t *testing.T) {
 	if approve1 != 10 || approve2 != 10 || finish != 20 {
 		t.Fatalf("state mismatch: %d/%d/%d", approve1, approve2, finish)
 	}
+}
+
+// ⑨ issues/34：定义级拦截器（postInterceptors 声明 + 注册表按名解析，未声明不触发）
+func TestDefineLevelInterceptor(t *testing.T) {
+	repo := memory.New()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite failed: %v", err)
+	}
+	defer db.Close()
+	db.Exec(`CREATE TABLE biz_decl (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT,
+		process_instance_id INTEGER, is_deleted INTEGER
+	)`)
+	w := persist.NewJdbcDynamicTableWriter(db)
+	ic := persist.NewPersistPostInterceptor(w, repo.FindDefineByID)
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	// 注册表挂载（定义级）
+	eng.SetExtensions(&engine.Extensions{Interceptors: nil,
+		InterceptorRegistry: map[string]engine.FlowInterceptor{"persist": ic}})
+
+	loadFlow := func(name, table, declared string) *model.ProcessDefine {
+		content := fmt.Sprintf(`{"name": %q, "displayName": %q, "type": "approval",
+			"relTableName": %q, "persistMode": "SYNC", "postInterceptors": %q,
+			"nodes": [{"id": "start", "type": "snaker:start", "properties": {}, "text": {"value": "开始"}},
+			          {"id": "finish", "type": "snaker:end", "properties": {}, "text": {"value": "结束"}}],
+			"edges": [{"id": "e0", "sourceNodeId": "start", "targetNodeId": "finish", "properties": {}}]}`, name, name, table, declared)
+		return &model.ProcessDefine{ID: 0, Name: name, Type: "approval", State: 1, Version: 1, Content: []byte(content)}
+	}
+	d1 := loadFlow("decl1", "biz_decl", "persist")
+	repo.AddDefine(d1)
+	if _, err := eng.StartProcessInstanceByID(context.Background(), d1.ID, "user1",
+		map[string]interface{}{"f_title": "声明流程"}); err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	var n int
+	db.QueryRow("SELECT COUNT(1) FROM biz_decl").Scan(&n)
+	if n != 1 {
+		t.Fatalf("声明了拦截器的流程应落库: %d", n)
+	}
+	d2 := loadFlow("decl2", "biz_decl", "")
+	repo.AddDefine(d2)
+	if _, err := eng.StartProcessInstanceByID(context.Background(), d2.ID, "user2",
+		map[string]interface{}{"f_title": "未声明流程"}); err != nil {
+		t.Fatalf("start2 failed: %v", err)
+	}
+	db.QueryRow("SELECT COUNT(1) FROM biz_decl").Scan(&n)
+	if n != 1 {
+		t.Fatalf("未声明拦截器的流程不应落库: %d", n)
+	}
+}
+
+// ⑩ issues/30/31：facade 顶层 JSON + listByType + bizData
+func TestFacadeListByTypeAndTopLevelJSON(t *testing.T) {
+	repo := memory.New()
+	ext := memory.NewExt()
+	_ = ext.SaveDesign(context.Background(), &model.ProcessDesign{ID: 1, Name: "old", DisplayName: "旧名", Type: "approval"})
+	_ = ext.SaveDesign(context.Background(), &model.ProcessDesign{ID: 2, Name: "old2", DisplayName: "旧名2", Type: "approval"})
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	fac := facade.New(eng, repo, ext)
+
+	// 顶层 JSON 保存（无 content）——issue 31
+	r := fac.Flow("processDesign/updateDefine", map[string]interface{}{
+		"processDesignId": int64(1), "operator": "user1",
+		"name": "topjson", "displayName": "顶层JSON", "type": "approval",
+		"relTableName": "biz_top", "nodes": []interface{}{}, "edges": []interface{}{}})
+	if codeOf(r) != 0 {
+		t.Fatalf("flow failed: %v", r)
+	}
+	d1, _ := ext.FindDesignByID(context.Background(), 1)
+	if d1.Name != "topjson" {
+		t.Fatalf("设计 name 未同步: %v", d1.Name)
+	}
+	his1, _ := ext.ListDesignHis(context.Background(), 1)
+	if len(his1) == 0 || !strings.Contains(string(his1[0].Content), `"nodes"`) {
+		t.Fatalf("顶层 JSON 应序列化为内容快照")
+	}
+	// listByType——issue 30
+	r = fac.Flow("processDesign/listByType", map[string]interface{}{})
+	if codeOf(r) != 0 {
+		t.Fatalf("flow failed: %v", r)
+	}
+	groups, _ := r["data"].(map[string][]map[string]interface{})
+	approval := groups["approval"]
+	if len(approval) == 0 {
+		t.Fatalf("应含 approval 分组: %v", groups)
+	}
+	found := false
+	for _, item := range approval {
+		if item["name"] == "topjson" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("分组应含 topjson: %v", approval)
+	}
+	// bizData：未注册 → 报错；注册后回显
+	// 先部署真实流程（01-simple + relTableName）
+	simple, _ := os.ReadFile("../../jeeflow-java/jeeflow-core/src/test/resources/flows/01-simple.json")
+	content := strings.ReplaceAll(string(simple), `"type": "approval"`, `"type": "approval", "relTableName": "biz_top"`)
+	r = fac.Flow("processDesign/updateDefine", map[string]interface{}{
+		"processDesignId": int64(2), "operator": "user1", "content": content})
+	if codeOf(r) != 0 {
+		t.Fatalf("flow failed: %v", r)
+	}
+	r = fac.Flow("processDesign/deploy", map[string]interface{}{"id": int64(2), "operator": "user1"})
+	if codeOf(r) != 0 {
+		t.Fatalf("flow failed: %v", r)
+	}
+	defineID := r["data"].(map[string]interface{})["processDefineId"]
+	r = fac.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": defineID, "operator": "user1", "f_title": "x"})
+	if codeOf(r) != 0 {
+		t.Fatalf("flow failed: %v", r)
+	}
+	instID := r["data"].(map[string]interface{})["processInstanceId"]
+	r = fac.Flow("processInstance/bizData", map[string]interface{}{"processInstanceId": instID})
+	if codeOf(r) == 0 {
+		t.Fatalf("未注册 reader 应报错: %v", r)
+	}
+	fac.SetMetaReader(&mockMetaReader{})
+	r = fac.Flow("processInstance/bizData", map[string]interface{}{"processInstanceId": instID})
+	if codeOf(r) != 0 {
+		t.Fatalf("flow failed: %v", r)
+	}
+	if r["data"].(map[string]interface{})["tableName"] != "biz_top" {
+		t.Fatalf("bizData 表名错误: %v", r)
+	}
+}
+
+func codeOf(r map[string]interface{}) int {
+	if c, ok := r["code"].(int); ok {
+		return c
+	}
+	if f, ok := r["code"].(float64); ok {
+		return int(f)
+	}
+	return -1
+}
+
+type mockMetaReader struct{}
+
+func (m *mockMetaReader) ReadByProcessInstance(tableName string, processInstanceID interface{}) (interface{}, error) {
+	return map[string]interface{}{"tableName": tableName, "title": "业务数据"}, nil
 }

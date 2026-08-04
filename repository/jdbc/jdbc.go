@@ -15,12 +15,67 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mldong/jeeflow-go/model"
 	"github.com/mldong/jeeflow-go/spi"
 )
+
+// ─── 可空列 Scan 兼容（MySQL 可空列 NULL → 零值）──────────────────────────────
+// database/sql 对 NULL 直接 Scan 到 *string / *time.Time 报错
+// （"converting NULL to string is unsupported"）——引擎 sqlite 自测未覆盖 NULL
+// 场景，集成 mldong（go-sql-driver，mldong-plus 库审计字段可空）时暴露。
+// 包装类型接收后写入目标，NULL → 零值。待引擎正式 issues 闭环。
+
+// nullStrScan 可空字符串列（NULL → ""）
+type nullStrScan struct{ dst *string }
+
+func (n *nullStrScan) Scan(v interface{}) error {
+	if v == nil {
+		*n.dst = ""
+		return nil
+	}
+	switch t := v.(type) {
+	case []byte:
+		*n.dst = string(t)
+	case string:
+		*n.dst = t
+	case int64:
+		*n.dst = strconv.FormatInt(t, 10)
+	case float64:
+		*n.dst = strconv.FormatFloat(t, 'f', -1, 64)
+	case time.Time:
+		*n.dst = t.Format("2006-01-02 15:04:05")
+	default:
+		*n.dst = fmt.Sprint(t)
+	}
+	return nil
+}
+
+// nullTimeScan 可空时间列（NULL → 零值 time.Time）
+type nullTimeScan struct{ dst *time.Time }
+
+func (n *nullTimeScan) Scan(v interface{}) error {
+	if v == nil {
+		*n.dst = time.Time{}
+		return nil
+	}
+	switch t := v.(type) {
+	case time.Time:
+		*n.dst = t
+	case []byte:
+		parsed, err := time.ParseInLocation("2006-01-02 15:04:05", string(t), time.Local)
+		if err != nil {
+			return err
+		}
+		*n.dst = parsed
+	default:
+		return fmt.Errorf("unsupported type for nullTimeScan: %T", v)
+	}
+	return nil
+}
 
 // txKey 是 context 中事务连接的键
 type txKey struct{}
@@ -167,7 +222,8 @@ func (r *Repository) FindDefineByID(ctx context.Context, id int64) (*model.Proce
 	def := &model.ProcessDefine{}
 	var content []byte
 	err := row.Scan(&def.ID, &def.Name, &def.DisplayName, &def.Type, &def.State, &content, &def.Version,
-		&def.CreateTime, &def.CreateUser, &def.UpdateTime, &def.UpdateUser)
+		&nullTimeScan{&def.CreateTime}, &nullStrScan{&def.CreateUser},
+		&nullTimeScan{&def.UpdateTime}, &nullStrScan{&def.UpdateUser})
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -187,7 +243,8 @@ func (r *Repository) FindDefineByName(ctx context.Context, name string) (*model.
 	def := &model.ProcessDefine{}
 	var content []byte
 	err := row.Scan(&def.ID, &def.Name, &def.DisplayName, &def.Type, &def.State, &content, &def.Version,
-		&def.CreateTime, &def.CreateUser, &def.UpdateTime, &def.UpdateUser)
+		&nullTimeScan{&def.CreateTime}, &nullStrScan{&def.CreateUser},
+		&nullTimeScan{&def.UpdateTime}, &nullStrScan{&def.UpdateUser})
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -271,8 +328,9 @@ func (r *Repository) FindInstanceByID(ctx context.Context, id int64) (*model.Pro
 	var expire sql.NullTime
 	var variable []byte
 	err := row.Scan(&inst.ID, &parentID, &inst.DefineID, &inst.State, &inst.ParentNodeName,
-		&inst.BusinessNo, &inst.Operator, &expire, &variable, &inst.CreateTime, &inst.CreateUser,
-		&inst.UpdateTime, &inst.UpdateUser)
+		&inst.BusinessNo, &inst.Operator, &expire, &variable,
+		&nullTimeScan{&inst.CreateTime}, &nullStrScan{&inst.CreateUser},
+		&nullTimeScan{&inst.UpdateTime}, &nullStrScan{&inst.UpdateUser})
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -340,7 +398,8 @@ func scanTask(row scanner) (*model.ProcessTask, error) {
 	var variable []byte
 	err := row.Scan(&t.ID, &t.ProcessInstanceID, &t.TaskName, &t.DisplayName, &t.TaskType,
 		&t.PerformType, &t.TaskState, &t.ActorID, &finish, &expire, &t.FormKey, &parentTaskID,
-		&variable, &t.CreateTime, &t.CreateUser, &t.UpdateTime, &t.UpdateUser)
+		&variable, &nullTimeScan{&t.CreateTime}, &nullStrScan{&t.CreateUser},
+		&nullTimeScan{&t.UpdateTime}, &nullStrScan{&t.UpdateUser})
 	if err != nil {
 		return nil, err
 	}
@@ -611,8 +670,10 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 		var variable []byte
 		var defineVersion sql.NullInt64
 		if err := rows.Scan(&row.ID, &parentID, &row.DefineID, &row.State, &row.ParentNodeName,
-			&row.BusinessNo, &row.Operator, &expire, &variable, &row.CreateTime, &row.CreateUser,
-			&row.UpdateTime, &row.UpdateUser, &row.DefineName, &row.DefineDisplayName, &defineVersion); err != nil {
+			&row.BusinessNo, &row.Operator, &expire, &variable,
+			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
+			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},
+			&row.DefineName, &row.DefineDisplayName, &defineVersion); err != nil {
 			return nil, 0, err
 		}
 		if parentID.Valid {
@@ -661,7 +722,8 @@ func (r *Repository) PageDefines(ctx context.Context, query spi.PageQuery) ([]*m
 	for rows.Next() {
 		row := &model.DefineRow{}
 		if err := rows.Scan(&row.ID, &row.Name, &row.DisplayName, &row.Type, &row.State, &row.Version,
-			&row.CreateTime, &row.CreateUser, &row.UpdateTime, &row.UpdateUser); err != nil {
+			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
+			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser}); err != nil {
 			return nil, 0, err
 		}
 		result = append(result, row)
@@ -697,8 +759,10 @@ func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, ope
 		var variable []byte
 		var defVersion sql.NullInt64
 		if err := rows.Scan(&row.ID, &parentID, &row.DefineID, &row.State, &row.ParentNodeName,
-			&row.BusinessNo, &row.Operator, &expire, &variable, &row.CreateTime, &row.CreateUser,
-			&row.UpdateTime, &row.UpdateUser, &row.DefineName, &row.DefineDisplayName, &defVersion); err != nil {
+			&row.BusinessNo, &row.Operator, &expire, &variable,
+			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
+			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},
+			&row.DefineName, &row.DefineDisplayName, &defVersion); err != nil {
 			return nil, 0, err
 		}
 		if parentID.Valid {
@@ -764,8 +828,10 @@ func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bo
 		var instCreateTime sql.NullTime
 		if err := rows.Scan(&row.ID, &row.ProcessInstanceID, &row.TaskName, &row.DisplayName,
 			&row.TaskType, &row.PerformType, &row.TaskState, &row.Operator, &finish, &expire,
-			&row.FormKey, &parentTaskID, &variable, &row.CreateTime, &row.CreateUser,
-			&row.UpdateTime, &row.UpdateUser, &row.ProcessDefineName, &row.ProcessDefineDisplayName,
+			&row.FormKey, &parentTaskID, &variable,
+			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
+			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},
+			&row.ProcessDefineName, &row.ProcessDefineDisplayName,
 			&row.DefineVersion, &instVariable, &instCreateTime); err != nil {
 			return nil, 0, err
 		}

@@ -159,7 +159,8 @@ func (r *ExtRepository) ListDesignHis(ctx context.Context, designID int64) ([]*m
 	var list []*model.ProcessDesignHis
 	for rows.Next() {
 		his := &model.ProcessDesignHis{}
-		if err := rows.Scan(&his.ID, &his.ProcessDesignID, &his.Content, &his.CreateTime, &his.CreateUser); err != nil {
+		if err := rows.Scan(&his.ID, &his.ProcessDesignID, &his.Content,
+			&nullTimeScan{&his.CreateTime}, &nullStrScan{&his.CreateUser}); err != nil {
 			return nil, err
 		}
 		list = append(list, his)
@@ -362,7 +363,7 @@ func scanDesign(row rowScanner) (*model.ProcessDesign, error) {
 	var createTime, updateTime sql.NullTime
 	var isDeployed sql.NullInt64
 	err := row.Scan(&d.ID, &d.Name, &d.DisplayName, &d.Type, &d.Icon, &isDeployed, &d.Remark,
-		&createTime, &d.CreateUser, &updateTime, &d.UpdateUser)
+		&createTime, &nullStrScan{&d.CreateUser}, &updateTime, &nullStrScan{&d.UpdateUser})
 	if err != nil {
 		return nil, err
 	}
@@ -381,7 +382,8 @@ func scanSurrogate(row rowScanner) (*model.ProcessSurrogate, error) {
 	var startTime, endTime, createTime, updateTime sql.NullTime
 	var enabled sql.NullInt64
 	err := row.Scan(&s.ID, &s.ProcessName, &s.Operator, &s.Surrogate,
-		&startTime, &endTime, &enabled, &createTime, &s.CreateUser, &updateTime, &s.UpdateUser)
+		&startTime, &endTime, &enabled, &createTime, &nullStrScan{&s.CreateUser},
+		&updateTime, &nullStrScan{&s.UpdateUser})
 	if err != nil {
 		return nil, err
 	}

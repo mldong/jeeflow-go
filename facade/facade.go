@@ -33,6 +33,17 @@ type Facade struct {
 	extRepo    spi.ProcessExtRepository // 可空：未接入时设计/委托 action 报错
 	userSearch UserSearch               // 可空：candidatePage 用户搜索依赖
 	orgProv    spi.OrgUserProvider      // 可空：candidatePage candidateGroups 角色取人（v1.6.0）
+	metaReader interface {
+		ReadByProcessInstance(tableName string, processInstanceID interface{}) (interface{}, error)
+	}
+}
+
+// SetMetaReader 注入业务数据读取器（issue 30）：需有 ReadByProcessInstance(tableName, processInstanceID)
+func (f *Facade) SetMetaReader(reader interface {
+	ReadByProcessInstance(tableName string, processInstanceID interface{}) (interface{}, error)
+}) *Facade {
+	f.metaReader = reader
+	return f
 }
 
 // SetUserSearch 注入用户搜索钩子
@@ -110,6 +121,10 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 		data, err = f.designDeploy(args)
 	case "processDesign/redeploy":
 		data, err = f.designRedeploy(args)
+	case "processDesign/listByType":
+		data, err = f.designListByType(args)
+	case "processInstance/bizData":
+		data, err = f.bizData(args)
 	case "processSurrogate/page":
 		data, err = f.surrogatePage(args)
 	case "processSurrogate/save":
@@ -250,6 +265,19 @@ func (f *Facade) redeploy(args map[string]interface{}) error {
 }
 
 func (f *Facade) removeDefine(args map[string]interface{}) error {
+	// issues/28：兼容 {ids} 批量（boot3 前端 IdsParam 惯例）与单 {id}
+	if ids, ok := asList(args["ids"]); ok {
+		for _, i := range ids {
+			id, err := toInt64(i)
+			if err != nil {
+				return errors.New("id 缺失或非法")
+			}
+			if err := f.repo.RemoveDefine(context.Background(), id); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	id, err := toInt64(args["id"])
 	if err != nil {
 		return errors.New("id 缺失或非法")
@@ -258,13 +286,26 @@ func (f *Facade) removeDefine(args map[string]interface{}) error {
 }
 
 func (f *Facade) upAndDown(args map[string]interface{}) error {
+	// issues/28：兼容 {ids, opType} 批量；opType/state 二选一
+	state, err := toInt(firstNonNil(args["opType"], args["state"]))
+	if err != nil {
+		return errors.New("opType/state 缺失或非法")
+	}
+	if ids, ok := asList(args["ids"]); ok {
+		for _, i := range ids {
+			id, err := toInt64(i)
+			if err != nil {
+				return errors.New("id 缺失或非法")
+			}
+			if err := f.repo.UpdateDefineState(context.Background(), id, state); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	id, err := toInt64(args["id"])
 	if err != nil {
 		return errors.New("id 缺失或非法")
-	}
-	state, err := toInt(args["state"])
-	if err != nil {
-		return errors.New("state 缺失或非法")
 	}
 	return f.repo.UpdateDefineState(context.Background(), id, state)
 }
@@ -448,11 +489,103 @@ func (f *Facade) designSave(args map[string]interface{}) (interface{}, error) {
 }
 
 func (f *Facade) designRemove(args map[string]interface{}) error {
+	// issues/28：兼容 {ids} 批量（boot3 前端 IdsParam 惯例）与单 {id}
+	if ids, ok := asList(args["ids"]); ok {
+		for _, i := range ids {
+			id, err := toInt64(i)
+			if err != nil {
+				return errors.New("id 缺失或非法")
+			}
+			if err := f.ext().RemoveDesign(context.Background(), id); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	id, err := toInt64(args["id"])
 	if err != nil {
 		return errors.New("id 缺失或非法")
 	}
 	return f.ext().RemoveDesign(context.Background(), id)
+}
+
+// designListByType 按类型分组列出流程设计（issue 30，对齐 Java issues/28）：不依赖框架字典
+func (f *Facade) designListByType(args map[string]interface{}) (interface{}, error) {
+	ext := f.ext()
+	query := spi.PageQuery{PageNum: 1, PageSize: 10000, Conditions: parseMQuery(args)}
+	rows, _, err := ext.PageDesigns(context.Background(), query)
+	if err != nil {
+		return nil, err
+	}
+	// 每 name 最新 define（version 最大）
+	defQuery := spi.PageQuery{PageNum: 1, PageSize: 10000}
+	defRows, _, err := f.repo.PageDefines(context.Background(), defQuery)
+	if err != nil {
+		return nil, err
+	}
+	latestByName := map[string]*model.DefineRow{}
+	for _, r := range defRows {
+		if prev, ok := latestByName[r.Name]; !ok || r.Version > prev.Version {
+			latestByName[r.Name] = r
+		}
+	}
+	groups := map[string][]map[string]interface{}{}
+	for _, d := range rows {
+		key := d.Type
+		item := map[string]interface{}{
+			"processDesignId": d.ID,
+			"name":            d.Name,
+			"displayName":     d.DisplayName,
+			"icon":            d.Icon,
+			"remark":          d.Remark,
+		}
+		if latest, ok := latestByName[d.Name]; ok {
+			item["processDefineId"] = latest.ID
+			item["processDefineState"] = latest.State
+		}
+		if his, err := ext.ListDesignHis(context.Background(), d.ID); err == nil && len(his) > 0 {
+			var graph map[string]interface{}
+			if json.Unmarshal(his[0].Content, &graph) == nil {
+				item["jsonObject"] = graph
+			}
+		}
+		groups[key] = append(groups[key], item)
+	}
+	return groups, nil
+}
+
+// bizData 按流程实例回显业务数据（issue 30，对齐 Java issues/28）：metaReader 注入式，未注入清晰报错
+func (f *Facade) bizData(args map[string]interface{}) (interface{}, error) {
+	instanceID, err := toInt64(firstNonNil(args["processInstanceId"], args["id"]))
+	if err != nil {
+		return nil, errors.New("processInstanceId 缺失")
+	}
+	inst, err := f.repo.FindInstanceByID(context.Background(), instanceID)
+	if err != nil || inst == nil {
+		return nil, errors.New("流程实例不存在")
+	}
+	def, err := f.repo.FindDefineByID(context.Background(), inst.DefineID)
+	if err != nil || def == nil {
+		return nil, errors.New("流程定义不存在")
+	}
+	var meta struct {
+		RelTableName string `json:"relTableName"`
+		Name         string `json:"name"`
+	}
+	if json.Unmarshal(def.Content, &meta) != nil {
+		return nil, errors.New("流程定义解析失败")
+	}
+	tableName := strings.TrimSpace(meta.RelTableName)
+	if tableName == "" {
+		tableName = strings.TrimSpace(meta.Name)
+	}
+	if tableName == "" {
+		return nil, errors.New("流程定义未配置 relTableName")
+	}
+	if f.metaReader == nil {
+		return nil, errors.New("业务数据读取器未注册（facade.SetMetaReader(...)）")
+	}
+	return f.metaReader.ReadByProcessInstance(tableName, instanceID)
 }
 
 func (f *Facade) designDeploy(args map[string]interface{}) (interface{}, error) {
@@ -1158,7 +1291,21 @@ func (f *Facade) ext() spi.ProcessExtRepository {
 func contentBytes(args map[string]interface{}) ([]byte, error) {
 	content, ok := args["content"]
 	if !ok || content == nil {
-		return nil, errors.New("content 缺失")
+		// issues/31：兼容 boot3 顶层 JSON（无 content 字段）——非保留字段序列化为内容快照
+		copy := make(map[string]interface{}, len(args))
+		for k, v := range args {
+			if k != "processDesignId" && k != "operator" {
+				copy[k] = v
+			}
+		}
+		if len(copy) == 0 {
+			return nil, errors.New("content 缺失")
+		}
+		bs, err := json.Marshal(copy)
+		if err != nil {
+			return nil, errors.New("content 序列化失败")
+		}
+		return bs, nil
 	}
 	switch v := content.(type) {
 	case []byte:
@@ -1532,4 +1679,41 @@ func parseVarMap(s string) map[string]interface{} {
 	}
 	_ = json.Unmarshal([]byte(s), &m)
 	return m
+}
+
+// asList 宽松取列表（{ids: [...]} 或单值）
+func asList(v interface{}) ([]interface{}, bool) {
+	switch t := v.(type) {
+	case []interface{}:
+		return t, true
+	case []int64:
+		out := make([]interface{}, len(t))
+		for i, x := range t {
+			out[i] = x
+		}
+		return out, true
+	case []int:
+		out := make([]interface{}, len(t))
+		for i, x := range t {
+			out[i] = x
+		}
+		return out, true
+	case []string:
+		out := make([]interface{}, len(t))
+		for i, x := range t {
+			out[i] = x
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+// firstNonNil 取第一个非 nil 参数
+func firstNonNil(vals ...interface{}) interface{} {
+	for _, v := range vals {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
 }

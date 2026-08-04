@@ -1,5 +1,11 @@
 package engine
 
+import (
+	"context"
+	"encoding/json"
+	"strings"
+)
+
 import "github.com/mldong/jeeflow-go/model"
 
 // ─── Interceptor ───────────────────────────────────────────────────────────────
@@ -57,6 +63,8 @@ type ProcessEventListener func(event ProcessEvent)
 // Extensions 引擎扩展配置
 type Extensions struct {
 	Interceptors     []FlowInterceptor
+	// 定义级拦截器注册表（issue 34）：名字 → 实例；流程定义顶层 postInterceptors 按名解析
+	InterceptorRegistry map[string]FlowInterceptor
 	AssignmentHandler AssignmentHandler
 	DecisionHandler   DecisionHandler
 	Listeners        []ProcessEventListener
@@ -64,14 +72,45 @@ type Extensions struct {
 
 func (e *EngineImpl) SetExtensions(ext *Extensions) {
 	e.ext = ext
+	e.interceptorCache = map[int64][]FlowInterceptor{}
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
+// interceptorCache 定义级拦截器解析缓存（issue 34，按 defineId）
+func (e *EngineImpl) resolveInterceptors(inst *model.ProcessInstance) []FlowInterceptor {
+	if e.ext == nil { return nil }
+	if inst == nil || inst.DefineID == 0 {
+		return e.ext.Interceptors
+	}
+	if cached, ok := e.interceptorCache[inst.DefineID]; ok {
+		return cached
+	}
+	list := e.ext.Interceptors
+	if def, err := e.repo.FindDefineByID(context.Background(), inst.DefineID); err == nil && def != nil {
+		var meta struct {
+			PostInterceptors string `json:"postInterceptors"`
+		}
+		if json.Unmarshal(def.Content, &meta) == nil && strings.TrimSpace(meta.PostInterceptors) != "" {
+			list = nil
+			for _, name := range strings.Split(meta.PostInterceptors, ",") {
+				name = strings.TrimSpace(name)
+				if name != "" {
+					if ic, ok := e.ext.InterceptorRegistry[name]; ok {
+						list = append(list, ic)
+					}
+				}
+			}
+		}
+	}
+	e.interceptorCache[inst.DefineID] = list
+	return list
+}
+
 // firePreInterceptors 执行前置拦截器
 func (e *EngineImpl) firePreInterceptors(node *model.FlowNode, inst *model.ProcessInstance) bool {
 	if e.ext == nil { return true }
-	for _, ic := range e.ext.Interceptors {
+	for _, ic := range e.resolveInterceptors(inst) {
 		if !ic.PreHandle(node, inst) { return false }
 	}
 	return true
@@ -80,7 +119,7 @@ func (e *EngineImpl) firePreInterceptors(node *model.FlowNode, inst *model.Proce
 // firePostInterceptors 执行后置拦截器
 func (e *EngineImpl) firePostInterceptors(node *model.FlowNode, inst *model.ProcessInstance) {
 	if e.ext == nil { return }
-	for _, ic := range e.ext.Interceptors {
+	for _, ic := range e.resolveInterceptors(inst) {
 		ic.PostHandle(node, inst)
 	}
 }
