@@ -237,3 +237,52 @@ func TestStrictColumnMatch(t *testing.T) {
 		t.Fatalf("strict mode should filter camel key: title=%s start_time=%v", title, startTime)
 	}
 }
+
+// ⑪ 非自增主键生成（issues/21）：TEXT 主键（雪花/应用生成）配生成器后插入成功
+func TestPrimaryKeyGenerator(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite failed: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("CREATE TABLE biz_snow (id TEXT PRIMARY KEY, title TEXT)"); err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+	w := persist.NewJdbcDynamicTableWriter(db)
+	w.PrimaryKeyGenerator = func(tableName string) interface{} { return "snow-888" }
+	if _, err := w.Insert("biz_snow", map[string]interface{}{"title": "snow"}); err != nil {
+		t.Fatalf("insert failed: %v", err)
+	}
+	var id, title string
+	if err := db.QueryRow("SELECT id, title FROM biz_snow").Scan(&id, &title); err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if id != "snow-888" || title != "snow" {
+		t.Fatalf("pk should be generated: id=%s title=%s", id, title)
+	}
+	// data 已含主键值 → 用之，不调生成器
+	if _, err := w.Insert("biz_snow", map[string]interface{}{"id": "manual-1", "title": "m"}); err != nil {
+		t.Fatalf("insert with manual pk failed: %v", err)
+	}
+	var n int
+	if err := db.QueryRow("SELECT COUNT(1) FROM biz_snow WHERE id='manual-1'").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("manual pk should be kept: n=%d err=%v", n, err)
+	}
+}
+
+// ⑫ 非自增主键未配生成器（issues/21）：清晰报错
+func TestMissingPrimaryKeyGenerator(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite failed: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("CREATE TABLE biz_snow (id TEXT PRIMARY KEY, title TEXT)"); err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+	w := persist.NewJdbcDynamicTableWriter(db) // 未配置生成器
+	_, err = w.Insert("biz_snow", map[string]interface{}{"title": "x"})
+	if err == nil || !strings.Contains(err.Error(), "primary key generator") {
+		t.Fatalf("should fail with clear error, got: %v", err)
+	}
+}
