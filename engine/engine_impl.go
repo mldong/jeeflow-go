@@ -70,6 +70,15 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 	if err != nil {
 		return nil, err
 	}
+	// issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）——
+	// 被拒值无法经流程变量落到下游节点写入，上游只读声明不可被绕过
+	var flow model.FlowModel
+	def, _ := e.repo.FindDefineByID(ctx, inst.DefineID)
+	if def != nil {
+		json.Unmarshal(def.Content, &flow)
+	}
+	args = filterFieldByPerm(args, findNode(&flow, task.TaskName))
+
 	vars := mergeVars(args, inst.Variables)
 	for k, v := range task.Variables {
 		vars[k] = v
@@ -85,11 +94,6 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 	syncTaskToAggregate(inst, task)
 	e.fireEvent(ProcessEvent{Type: EventTaskComplete, InstanceID: inst.ID, TaskID: task.ID, NodeID: task.TaskName, Operator: operator})
 
-	var flow model.FlowModel
-	def, _ := e.repo.FindDefineByID(ctx, inst.DefineID)
-	if def != nil {
-		json.Unmarshal(def.Content, &flow)
-	}
 	inst.Variables = vars
 	e.repo.UpdateInstance(ctx, inst)
 
@@ -667,4 +671,37 @@ func toIntOf(v interface{}) int {
 		return int(n)
 	}
 	return -1
+}
+
+// filterFieldByPerm 办理提交的 f_ 字段按任务节点 field 权限过滤（issues/26）——
+// 任务节点 properties.field 声明 PERMISSION_f_{全名}（前端约定，优先）或
+// PERMISSION_{去前缀名}（兼容）的字段，值非 EDIT(2)（只读 1/隐藏 3 等）→ 剔除不入变量。
+// 键格式双兼容（issues/25），与 persist 拦截器 isEditable 同契约。
+func filterFieldByPerm(args map[string]interface{}, node *model.FlowNode) map[string]interface{} {
+	if len(args) == 0 || node == nil || (node.Type != model.TypeTask && node.Type != model.TypeCustom) {
+		return args
+	}
+	field, ok := node.Properties["field"]
+	if !ok {
+		return args
+	}
+	fieldPerm, ok := field.(map[string]interface{})
+	if !ok || len(fieldPerm) == 0 {
+		return args
+	}
+	out := make(map[string]interface{}, len(args))
+	for k, v := range args {
+		if strings.HasPrefix(k, "f_") && len(k) > 2 {
+			name := k[2:]
+			perm, ok := fieldPerm["PERMISSION_f_"+name]
+			if !ok {
+				perm, ok = fieldPerm["PERMISSION_"+name]
+			}
+			if ok && toIntOf(perm) != 2 {
+				continue // 只读/隐藏：剔除（不入变量）
+			}
+		}
+		out[k] = v
+	}
+	return out
 }

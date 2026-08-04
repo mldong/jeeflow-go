@@ -472,3 +472,86 @@ type testExprEval struct{}
 func (e *testExprEval) Eval(expr string, vars map[string]interface{}) (interface{}, error) {
 	return false, nil
 }
+
+// ⑧ issues/26：办理提交被拒字段（只读/隐藏）不入变量——下游无权限节点无法绕过上游只读
+func TestSyncPermBypass(t *testing.T) {
+	repo := memory.New()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite failed: %v", err)
+	}
+	defer db.Close()
+	db.Exec(`CREATE TABLE biz_perm3 (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		title TEXT, amount REAL,
+		apply INTEGER, approve1 INTEGER, approve2 INTEGER, finish INTEGER,
+		process_instance_id INTEGER,
+		create_user TEXT, is_deleted INTEGER
+	)`)
+	w := persist.NewJdbcDynamicTableWriter(db)
+	ic := persist.NewPersistPostInterceptor(w, repo.FindDefineByID)
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}})
+
+	content := `{"name": "perm3", "displayName": "权限绕过验证", "type": "approval",
+		"relTableName": "biz_perm3", "persistMode": "SYNC",
+		"nodes": [
+			{"id": "start", "type": "snaker:start", "properties": {}, "text": {"value": "开始"}},
+			{"id": "apply", "type": "snaker:task", "properties": {"assignee": "applicant", "taskType": 0, "performType": 0}, "text": {"value": "发起申请"}},
+			{"id": "approve1", "type": "snaker:task", "properties": {"assignee": "leader1", "taskType": 0, "performType": 0, "field": {"PERMISSION_f_title": 1, "PERMISSION_amount": 2}}, "text": {"value": "审批一"}},
+			{"id": "approve2", "type": "snaker:task", "properties": {"assignee": "leader2", "taskType": 0, "performType": 0}, "text": {"value": "审批二"}},
+			{"id": "finish", "type": "snaker:end", "properties": {}, "text": {"value": "结束"}}
+		],
+		"edges": [
+			{"id": "e0", "sourceNodeId": "start", "targetNodeId": "apply", "properties": {}},
+			{"id": "e1", "sourceNodeId": "apply", "targetNodeId": "approve1", "properties": {}},
+			{"id": "e2", "sourceNodeId": "approve1", "targetNodeId": "approve2", "properties": {}},
+			{"id": "e3", "sourceNodeId": "approve2", "targetNodeId": "finish", "properties": {}}
+		]}`
+	def := &model.ProcessDefine{ID: 2, Name: "perm3", Type: "approval", State: 1, Version: 1, Content: []byte(content)}
+	repo.AddDefine(def)
+
+	inst, err := eng.StartProcessInstanceByID(context.Background(), 2, "user1",
+		map[string]interface{}{"f_title": "原始标题", "f_amount": 800.0, "u_deptId": "D01"})
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	completeNamed := func(name, actor string, args map[string]interface{}) {
+		doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
+		for _, d := range doing {
+			if d.TaskName == name {
+				repo.AddTaskActor(context.Background(), d.ID, []string{actor})
+				d.ActorIDs = append(d.ActorIDs, actor)
+				if _, err := eng.ExecuteProcessTask(context.Background(), d.ID, actor, args); err != nil {
+					t.Fatalf("%s failed: %v", name, err)
+				}
+				return
+			}
+		}
+		t.Fatalf("task %s not found", name)
+	}
+	completeNamed("apply", "user1", map[string]interface{}{engine.KeySubmitType: 0})
+	// approve1 只读 title，提交 TRY_HACK → 引擎入口过滤 → 不入变量 → 不落库
+	completeNamed("approve1", "leader1",
+		map[string]interface{}{engine.KeySubmitType: 1, "f_title": "TRY_HACK"})
+	// approve2 无权限声明——变量无 TRY_HACK，title 保持原值
+	completeNamed("approve2", "leader2",
+		map[string]interface{}{engine.KeySubmitType: 1, "f_amount": 999.0})
+
+	var title string
+	var amount float64
+	var approve1, approve2, finish int
+	if err := db.QueryRow("SELECT title, amount, approve1, approve2, finish FROM biz_perm3").
+		Scan(&title, &amount, &approve1, &approve2, &finish); err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if title != "原始标题" {
+		t.Fatalf("readonly bypass: title=%s", title)
+	}
+	if amount != 999.0 {
+		t.Fatalf("editable not updated: amount=%v", amount)
+	}
+	if approve1 != 10 || approve2 != 10 || finish != 20 {
+		t.Fatalf("state mismatch: %d/%d/%d", approve1, approve2, finish)
+	}
+}
