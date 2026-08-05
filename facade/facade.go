@@ -970,7 +970,7 @@ func (f *Facade) buildNodeProgress(flow *model.FlowModel, tasks []*model.Process
 		if v, ok := nodeProps["countersignType"].(string); ok {
 			csType = v
 		}
-		isCs := csType != "" || toStr(nodeProps["performType"], "") == "1"
+		isCs := csType != "" || engine.IsCountersign(nodeProps["performType"])
 		memberList := []map[string]interface{}{}
 		for _, id := range members {
 			m := map[string]interface{}{"id": id, "name": ""}

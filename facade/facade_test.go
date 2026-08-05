@@ -882,3 +882,43 @@ func TestHighLightNodeProgress(t *testing.T) {
 		t.Fatalf("完成后全部 done: %v", m3)
 	}
 }
+
+// TestPerformTypeStringCompat performType 字符串兼容（issue 42）：
+// 'ALL' 面板格式会签行为与数字 1 一致（对齐 Java codeOf）
+func TestPerformTypeStringCompat(t *testing.T) {
+	f, repo, _ := setupFacade()
+	// 面板格式：performType 存 'ALL' 字符串
+	contentAll := strings.Replace(string(flowContent(t, "05-countersign-parallel.json")),
+		`"performType": 1`, `"performType": "ALL"`, 1)
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": contentAll})
+	if code, _ := r0["code"].(int); code != 0 {
+		t.Fatalf("deploy: %v", r0)
+	}
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"], "operator": "user1",
+	})
+	if code, _ := r1["code"].(int); code != 0 {
+		t.Fatalf("start: %v", r1)
+	}
+	instanceID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	doing, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
+	cs := []string{}
+	for _, t := range doing {
+		if t.TaskName == "task1" {
+			cs = append(cs, t.ActorIDs[0])
+		}
+	}
+	// 并行会签：3 参与者 → 3 个任务（普通语义只有 1 个）
+	if len(cs) != 3 {
+		t.Fatalf("ALL 格式应生成 3 个会签任务: %v", cs)
+	}
+	// nodeProgress 对 ALL 格式同样识别为会签（type=PARALLEL）
+	hl := f.Flow("processInstance/highLight", map[string]interface{}{"id": instanceID})
+	if code, _ := hl["code"].(int); code != 0 {
+		t.Fatalf("highLight: %v", hl)
+	}
+	np := hl["data"].(map[string]interface{})["nodeProgress"].(map[string]interface{})
+	if np["task1"].(map[string]interface{})["type"] != "PARALLEL" {
+		t.Fatalf("ALL 格式 nodeProgress type 应为 PARALLEL: %v", np["task1"])
+	}
+}

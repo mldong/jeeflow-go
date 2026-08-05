@@ -12,12 +12,12 @@ import (
 )
 
 type EngineImpl struct {
-	repo     spi.ProcessRepository
-	userProv spi.UserProvider
-	idGen    spi.IDGenerator
-	exprEval spi.ExpressionEvaluator
-	ext      *Extensions
-	registry *HandlerRegistry
+	repo             spi.ProcessRepository
+	userProv         spi.UserProvider
+	idGen            spi.IDGenerator
+	exprEval         spi.ExpressionEvaluator
+	ext              *Extensions
+	registry         *HandlerRegistry
 	interceptorCache map[int64][]FlowInterceptor
 }
 
@@ -372,12 +372,12 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 	if len(actors) == 0 {
 		return nil
 	}
-	performType, _ := intFromProps(node.Properties, "performType")
 	ct, _ := stringFromProps(node.Properties, "countersignType")
 	now := time.Now()
 	form := formKeyOf(node)
 
-	if performType == 1 && ct != "" {
+	// issue 42：performType 字符串兼容（'1'/'ALL'/'COUNTERSIGN' → 会签，对齐 Java codeOf）
+	if IsCountersign(node.Properties["performType"]) && ct != "" {
 		switch ct {
 		case "PARALLEL":
 			for _, actor := range actors {
@@ -705,4 +705,13 @@ func filterFieldByPerm(args map[string]interface{}, node *model.FlowNode) map[st
 		out[k] = v
 	}
 	return out
+}
+
+// isCountersign 会签判定（issue 42，对齐 Java ProcessTaskPerformTypeEnum.codeOf）：
+// '1'/'ALL'/'COUNTERSIGN'（大小写不敏感）→ 会签。设计器属性面板保存 'ALL' 字符串符合契约
+// IsCountersign 会签判定（issue 42，对齐 Java ProcessTaskPerformTypeEnum.codeOf）：
+// '1'/'ALL'/'COUNTERSIGN'（大小写不敏感）→ 会签。设计器属性面板保存 'ALL' 字符串符合契约
+func IsCountersign(v interface{}) bool {
+	s := strings.ToUpper(strings.TrimSpace(fmt.Sprintf("%v", v)))
+	return s == "1" || s == "ALL" || s == "COUNTERSIGN"
 }
