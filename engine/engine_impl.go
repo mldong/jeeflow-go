@@ -25,6 +25,11 @@ func New(repo spi.ProcessRepository, userProv spi.UserProvider, idGen spi.IDGene
 	return &EngineImpl{repo: repo, userProv: userProv, idGen: idGen, exprEval: exprEval}
 }
 
+// UserProvider 用户提供者访问（issue 41 补强：nodeProgress 姓名解析用）
+func (e *EngineImpl) UserProvider() spi.UserProvider {
+	return e.userProv
+}
+
 // EvalExpr 表达式求值（v1.5.0，门面 highLight 决策分支过滤用）
 func (e *EngineImpl) EvalExpr(expr string, vars map[string]interface{}) (interface{}, error) {
 	if e.exprEval == nil {

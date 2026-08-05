@@ -852,6 +852,10 @@ func TestHighLightNodeProgress(t *testing.T) {
 	if members[0]["id"] != "userA" || members[0]["active"] != true {
 		t.Fatalf("userA 应 active: %v", members)
 	}
+	// 姓名走 UserProvider SPI 解析（testUserProv realName = "用户" + id）
+	if members[0]["name"] != "用户userA" {
+		t.Fatalf("name 应经 SPI 解析: %v", members[0])
+	}
 	if members[1]["id"] != "userB" || members[1]["done"] != nil || members[1]["active"] != nil {
 		t.Fatalf("userB 应无标记: %v", members)
 	}

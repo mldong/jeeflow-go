@@ -971,9 +971,18 @@ func (f *Facade) buildNodeProgress(flow *model.FlowModel, tasks []*model.Process
 			csType = v
 		}
 		isCs := csType != "" || engine.IsCountersign(nodeProps["performType"])
+		// 姓名走 UserProvider SPI 解析（issue 41 补强）：未注入/查不到缺省空串
+		nameMap := map[string]string{}
+		if up := f.engine.UserProvider(); up != nil {
+			for _, id := range members {
+				if u, err := up.GetUser(id); err == nil && u != nil && u.RealName != "" {
+					nameMap[id] = u.RealName
+				}
+			}
+		}
 		memberList := []map[string]interface{}{}
 		for _, id := range members {
-			m := map[string]interface{}{"id": id, "name": ""}
+			m := map[string]interface{}{"id": id, "name": nameMap[id]}
 			if doneSet[id] {
 				m["done"] = true
 			} else if id == activeActor {
