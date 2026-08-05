@@ -360,48 +360,31 @@ type rowScanner interface {
 
 func scanDesign(row rowScanner) (*model.ProcessDesign, error) {
 	d := &model.ProcessDesign{}
-	var createTime, updateTime sql.NullTime
 	var isDeployed sql.NullInt64
-	err := row.Scan(&d.ID, &d.Name, &d.DisplayName, &d.Type, &d.Icon, &isDeployed, &d.Remark,
-		&createTime, &nullStrScan{&d.CreateUser}, &updateTime, &nullStrScan{&d.UpdateUser})
+	err := row.Scan(&d.ID, &nullStrScan{&d.Name}, &nullStrScan{&d.DisplayName},
+		&nullStrScan{&d.Type}, &nullStrScan{&d.Icon}, &isDeployed,
+		&nullStrScan{&d.Remark},
+		&nullTimeScan{&d.CreateTime}, &nullStrScan{&d.CreateUser},
+		&nullTimeScan{&d.UpdateTime}, &nullStrScan{&d.UpdateUser})
 	if err != nil {
 		return nil, err
 	}
 	d.IsDeployed = int(isDeployed.Int64)
-	if createTime.Valid {
-		d.CreateTime = createTime.Time
-	}
-	if updateTime.Valid {
-		d.UpdateTime = updateTime.Time
-	}
 	return d, nil
 }
 
 func scanSurrogate(row rowScanner) (*model.ProcessSurrogate, error) {
 	s := &model.ProcessSurrogate{}
-	var startTime, endTime, createTime, updateTime sql.NullTime
 	var enabled sql.NullInt64
-	err := row.Scan(&s.ID, &s.ProcessName, &s.Operator, &s.Surrogate,
-		&startTime, &endTime, &enabled, &createTime, &nullStrScan{&s.CreateUser},
-		&updateTime, &nullStrScan{&s.UpdateUser})
+	err := row.Scan(&s.ID, &nullStrScan{&s.ProcessName}, &nullStrScan{&s.Operator},
+		&nullStrScan{&s.Surrogate},
+		&nullTimePtrScan{&s.StartTime}, &nullTimePtrScan{&s.EndTime}, &enabled,
+		&nullTimeScan{&s.CreateTime}, &nullStrScan{&s.CreateUser},
+		&nullTimeScan{&s.UpdateTime}, &nullStrScan{&s.UpdateUser})
 	if err != nil {
 		return nil, err
 	}
 	s.Enabled = int(enabled.Int64)
-	if startTime.Valid {
-		t := startTime.Time
-		s.StartTime = &t
-	}
-	if endTime.Valid {
-		t := endTime.Time
-		s.EndTime = &t
-	}
-	if createTime.Valid {
-		s.CreateTime = createTime.Time
-	}
-	if updateTime.Valid {
-		s.UpdateTime = updateTime.Time
-	}
 	return s, nil
 }
 

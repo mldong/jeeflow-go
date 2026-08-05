@@ -77,6 +77,24 @@ func (n *nullTimeScan) Scan(v interface{}) error {
 	return nil
 }
 
+// nullTimePtrScan 可空时间指针列（NULL → 保持 nil）——Go 1.22+ 的 sql.NullTime.Scan
+// 对 []byte 直接报错（issues/37 遗留：parseTime=false 下 expire/finish 等列全挂），
+// 引擎侧统一用本包装。
+type nullTimePtrScan struct{ dst **time.Time }
+
+func (n *nullTimePtrScan) Scan(v interface{}) error {
+	if v == nil {
+		*n.dst = nil
+		return nil
+	}
+	var t time.Time
+	if err := (&nullTimeScan{&t}).Scan(v); err != nil {
+		return err
+	}
+	*n.dst = &t
+	return nil
+}
+
 // txKey 是 context 中事务连接的键
 type txKey struct{}
 
@@ -325,10 +343,9 @@ func (r *Repository) FindInstanceByID(ctx context.Context, id int64) (*model.Pro
 		"SELECT "+instanceCols+" FROM wf_process_instance WHERE id = ?", id)
 	inst := &model.ProcessInstance{}
 	var parentID sql.NullInt64
-	var expire sql.NullTime
 	var variable []byte
 	err := row.Scan(&inst.ID, &parentID, &inst.DefineID, &inst.State, &inst.ParentNodeName,
-		&inst.BusinessNo, &inst.Operator, &expire, &variable,
+		&inst.BusinessNo, &inst.Operator, &nullTimePtrScan{&inst.ExpireTime}, &variable,
 		&nullTimeScan{&inst.CreateTime}, &nullStrScan{&inst.CreateUser},
 		&nullTimeScan{&inst.UpdateTime}, &nullStrScan{&inst.UpdateUser})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -340,10 +357,6 @@ func (r *Repository) FindInstanceByID(ctx context.Context, id int64) (*model.Pro
 	if parentID.Valid {
 		v := parentID.Int64
 		inst.ParentID = &v
-	}
-	if expire.Valid {
-		t := expire.Time
-		inst.ExpireTime = &t
 	}
 	if len(variable) > 0 {
 		_ = json.Unmarshal(variable, &inst.Variables)
@@ -393,23 +406,15 @@ type scanner interface {
 
 func scanTask(row scanner) (*model.ProcessTask, error) {
 	t := &model.ProcessTask{}
-	var finish, expire sql.NullTime
 	var parentTaskID sql.NullInt64
 	var variable []byte
 	err := row.Scan(&t.ID, &t.ProcessInstanceID, &t.TaskName, &t.DisplayName, &t.TaskType,
-		&t.PerformType, &t.TaskState, &t.ActorID, &finish, &expire, &t.FormKey, &parentTaskID,
+		&t.PerformType, &t.TaskState, &t.ActorID, &nullTimePtrScan{&t.FinishTime},
+		&nullTimePtrScan{&t.ExpireTime}, &t.FormKey, &parentTaskID,
 		&variable, &nullTimeScan{&t.CreateTime}, &nullStrScan{&t.CreateUser},
 		&nullTimeScan{&t.UpdateTime}, &nullStrScan{&t.UpdateUser})
 	if err != nil {
 		return nil, err
-	}
-	if finish.Valid {
-		v := finish.Time
-		t.FinishTime = &v
-	}
-	if expire.Valid {
-		v := expire.Time
-		t.ExpireTime = &v
 	}
 	if parentTaskID.Valid {
 		v := parentTaskID.Int64
@@ -666,11 +671,10 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 	for rows.Next() {
 		row := &model.CcInstanceRow{}
 		var parentID sql.NullInt64
-		var expire sql.NullTime
 		var variable []byte
 		var defineVersion sql.NullInt64
 		if err := rows.Scan(&row.ID, &parentID, &row.DefineID, &row.State, &row.ParentNodeName,
-			&row.BusinessNo, &row.Operator, &expire, &variable,
+			&row.BusinessNo, &row.Operator, &nullTimePtrScan{&row.ExpireTime}, &variable,
 			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
 			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},
 			&row.DefineName, &row.DefineDisplayName, &defineVersion); err != nil {
@@ -679,10 +683,6 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 		if parentID.Valid {
 			v := parentID.Int64
 			row.ParentID = &v
-		}
-		if expire.Valid {
-			t := expire.Time
-			row.ExpireTime = &t
 		}
 		if len(variable) > 0 {
 			_ = json.Unmarshal(variable, &row.Variables)
@@ -755,11 +755,10 @@ func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, ope
 	for rows.Next() {
 		row := &model.InstanceRow{}
 		var parentID sql.NullInt64
-		var expire sql.NullTime
 		var variable []byte
 		var defVersion sql.NullInt64
 		if err := rows.Scan(&row.ID, &parentID, &row.DefineID, &row.State, &row.ParentNodeName,
-			&row.BusinessNo, &row.Operator, &expire, &variable,
+			&row.BusinessNo, &row.Operator, &nullTimePtrScan{&row.ExpireTime}, &variable,
 			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
 			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},
 			&row.DefineName, &row.DefineDisplayName, &defVersion); err != nil {
@@ -768,10 +767,6 @@ func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, ope
 		if parentID.Valid {
 			v := parentID.Int64
 			row.ParentID = &v
-		}
-		if expire.Valid {
-			v := expire.Time
-			row.ExpireTime = &v
 		}
 		if len(variable) > 0 {
 			_ = json.Unmarshal(variable, &row.Variables)
@@ -822,26 +817,17 @@ func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bo
 	var result []*model.TaskRow
 	for rows.Next() {
 		row := &model.TaskRow{}
-		var finish, expire sql.NullTime
 		var parentTaskID sql.NullInt64
 		var variable, instVariable []byte
-		var instCreateTime sql.NullTime
 		if err := rows.Scan(&row.ID, &row.ProcessInstanceID, &row.TaskName, &row.DisplayName,
-			&row.TaskType, &row.PerformType, &row.TaskState, &row.Operator, &finish, &expire,
+			&row.TaskType, &row.PerformType, &row.TaskState, &row.Operator,
+			&nullTimePtrScan{&row.FinishTime}, &nullTimePtrScan{&row.ExpireTime},
 			&row.FormKey, &parentTaskID, &variable,
 			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
 			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},
 			&row.ProcessDefineName, &row.ProcessDefineDisplayName,
-			&row.DefineVersion, &instVariable, &instCreateTime); err != nil {
+			&row.DefineVersion, &instVariable, &nullTimeScan{&row.InstanceCreateTime}); err != nil {
 			return nil, 0, err
-		}
-		if finish.Valid {
-			v := finish.Time
-			row.FinishTime = &v
-		}
-		if expire.Valid {
-			v := expire.Time
-			row.ExpireTime = &v
 		}
 		if parentTaskID.Valid {
 			v := parentTaskID.Int64
@@ -852,9 +838,6 @@ func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bo
 		}
 		if len(instVariable) > 0 {
 			row.InstanceVariable = string(instVariable)
-		}
-		if instCreateTime.Valid {
-			row.InstanceCreateTime = instCreateTime.Time
 		}
 		result = append(result, row)
 	}
