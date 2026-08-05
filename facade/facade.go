@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mldong/jeeflow-go/engine"
@@ -971,14 +972,23 @@ func (f *Facade) buildNodeProgress(flow *model.FlowModel, tasks []*model.Process
 			csType = v
 		}
 		isCs := csType != "" || engine.IsCountersign(nodeProps["performType"])
-		// 姓名走 UserProvider SPI 解析（issue 41 补强）：未注入/查不到缺省空串
+		// 姓名走 UserProvider SPI 解析（issue 43/E15）：goroutine 并行批量，查不到缺省空串
 		nameMap := map[string]string{}
 		if up := f.engine.UserProvider(); up != nil {
+			var mu sync.Mutex
+			var wg sync.WaitGroup
 			for _, id := range members {
-				if u, err := up.GetUser(id); err == nil && u != nil && u.RealName != "" {
-					nameMap[id] = u.RealName
-				}
+				wg.Add(1)
+				go func(id string) {
+					defer wg.Done()
+					if u, err := up.GetUser(id); err == nil && u != nil && u.RealName != "" {
+						mu.Lock()
+						nameMap[id] = u.RealName
+						mu.Unlock()
+					}
+				}(id)
 			}
+			wg.Wait()
 		}
 		memberList := []map[string]interface{}{}
 		for _, id := range members {
