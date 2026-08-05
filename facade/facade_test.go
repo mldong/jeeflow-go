@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -142,7 +143,7 @@ func TestFacadeInstanceTaskAndWithdraw(t *testing.T) {
 	r := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(content)})
 	defineID := int64(0)
 	if data, ok := r["data"].(map[string]interface{}); ok {
-		defineID = data["processDefineId"].(int64)
+		defineID = mustI64(data["processDefineId"])
 	}
 
 	// startAndExecute：发起并自动完成 apply → task1(leader)
@@ -152,7 +153,7 @@ func TestFacadeInstanceTaskAndWithdraw(t *testing.T) {
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("startAndExecute failed: %v", r)
 	}
-	instanceID := r["data"].(map[string]interface{})["processInstanceId"].(int64)
+	instanceID := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
 
 	// execute（AGREE=1）：leader 完成任务 → 实例完成
 	doing, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
@@ -174,7 +175,7 @@ func TestFacadeInstanceTaskAndWithdraw(t *testing.T) {
 	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{
 		"processDefineId": defineID, "operator": "zhangsan",
 	})
-	instanceID2 := r["data"].(map[string]interface{})["processInstanceId"].(int64)
+	instanceID2 := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
 	r = f.Flow("processInstance/withdraw", map[string]interface{}{"id": instanceID2, "operator": "zhangsan"})
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("withdraw failed: %v", r)
@@ -196,7 +197,7 @@ func TestFacadeDesignAndSurrogate(t *testing.T) {
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("design save failed: %v", r)
 	}
-	designID := r["data"].(map[string]interface{})["id"].(int64)
+	designID := mustI64(r["data"].(map[string]interface{})["id"])
 
 	// detail：含历史 + jsonObject
 	r = f.Flow("processDesign/detail", map[string]interface{}{"id": designID})
@@ -228,7 +229,7 @@ func TestFacadeDesignAndSurrogate(t *testing.T) {
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("surrogate save failed: %v", r)
 	}
-	surrogateID := r["data"].(map[string]interface{})["id"].(int64)
+	surrogateID := mustI64(r["data"].(map[string]interface{})["id"])
 	hit, _ := extRepo.GetSurrogate(context.Background(), "zhangsan", "leave", time.Now())
 	if hit == nil || hit.Surrogate != "lisi" {
 		t.Fatalf("getSurrogate = %+v, want lisi", hit)
@@ -251,7 +252,7 @@ func TestFacadeViewEndpoints(t *testing.T) {
 	f, repo, _ := setupFacade()
 	content := string(flowContent(t, "01-simple.json"))
 	r := f.Flow("processDefine/deploy", map[string]interface{}{"content": content})
-	defineID := r["data"].(map[string]interface{})["processDefineId"].(int64)
+	defineID := mustI64(r["data"].(map[string]interface{})["processDefineId"])
 
 	// getLastByName
 	r = f.Flow("processDefine/getLastByName", map[string]interface{}{"processDefineName": "simple"})
@@ -266,7 +267,7 @@ func TestFacadeViewEndpoints(t *testing.T) {
 	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{
 		"processDefineId": defineID, "operator": "zhangsan",
 	})
-	instanceID := r["data"].(map[string]interface{})["processInstanceId"].(int64)
+	instanceID := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
 
 	r = f.Flow("processInstance/approvalRecord", map[string]interface{}{"id": instanceID})
 	if code, _ := r["code"].(int); code != 0 {
@@ -430,7 +431,7 @@ func TestStartAndExecutePreAssign(t *testing.T) {
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("startAndExecute failed: %v", r)
 	}
-	inst1 := int64(toFloat(r["data"].(map[string]interface{})["processInstanceId"]))
+	inst1 := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
 	doing, _ := repo.FindDoingTasks(context.Background(), inst1, nil)
 	if len(doing) != 1 || doing[0].TaskName != "task1" {
 		t.Fatalf("want task1, got %+v", doing)
@@ -447,7 +448,7 @@ func TestStartAndExecutePreAssign(t *testing.T) {
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("startAndExecute failed: %v", r)
 	}
-	inst2 := int64(toFloat(r["data"].(map[string]interface{})["processInstanceId"]))
+	inst2 := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
 	doing2, _ := repo.FindDoingTasks(context.Background(), inst2, nil)
 	if len(doing2) != 1 || doing2[0].TaskName != "task1" {
 		t.Fatalf("want task1, got %+v", doing2)
@@ -481,7 +482,7 @@ func TestHighLightFiltersDecisionBranch(t *testing.T) {
 	f, repo, _ := setupFacade()
 	content := string(flowContent(t, "03-decision-expr.json"))
 	r := f.Flow("processDefine/deploy", map[string]interface{}{"content": content})
-	defineID := r["data"].(map[string]interface{})["processDefineId"].(int64)
+	defineID := mustI64(r["data"].(map[string]interface{})["processDefineId"])
 
 	// amount=500 → 走「amount <= 1000」分支（task3），task2 分支未执行
 	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{
@@ -490,7 +491,7 @@ func TestHighLightFiltersDecisionBranch(t *testing.T) {
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("startAndExecute failed: %v", r)
 	}
-	instanceID := r["data"].(map[string]interface{})["processInstanceId"].(int64)
+	instanceID := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
 
 	// 推进：task1(leader) → decision → task3(director) → end
 	doing, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
@@ -547,7 +548,7 @@ func TestDetailJsonObject(t *testing.T) {
 	f, repo, _ := setupFacade()
 	content := string(flowContent(t, "01-simple.json"))
 	r := f.Flow("processDefine/deploy", map[string]interface{}{"content": content})
-	defineID := r["data"].(map[string]interface{})["processDefineId"].(int64)
+	defineID := mustI64(r["data"].(map[string]interface{})["processDefineId"])
 
 	r = f.Flow("processDefine/detail", map[string]interface{}{"id": defineID})
 	if code, _ := r["code"].(int); code != 0 {
@@ -560,7 +561,7 @@ func TestDetailJsonObject(t *testing.T) {
 	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{
 		"processDefineId": defineID, "operator": "zhangsan",
 	})
-	instanceID := r["data"].(map[string]interface{})["processInstanceId"].(int64)
+	instanceID := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
 	r = f.Flow("processInstance/detail", map[string]interface{}{"id": instanceID})
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("instanceDetail failed: %v", r)
@@ -615,7 +616,7 @@ func TestMQueryParams(t *testing.T) {
 
 	// 实例列表：m_pd_LIKE_displayName（别名 pd → pd.display_name）
 	r = f.Flow("processDefine/getLastByName", map[string]interface{}{"processDefineName": "simple"})
-	defineID := r["data"].(map[string]interface{})["id"].(int64)
+	defineID := mustI64(r["data"].(map[string]interface{})["id"])
 	if r := f.Flow("processInstance/startAndExecute", map[string]interface{}{
 		"processDefineId": defineID, "operator": "zhangsan",
 	}); r["code"].(int) != 0 {
@@ -676,7 +677,7 @@ func TestDesignDeployRedeployIsDeployed(t *testing.T) {
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("save: %v", r)
 	}
-	designID := r["data"].(map[string]interface{})["id"].(int64)
+	designID := mustI64(r["data"].(map[string]interface{})["id"])
 	design, _ := extRepo.FindDesignByID(nil, designID)
 	if design.IsDeployed != 0 {
 		t.Fatalf("保存后应为未部署: %v", design.IsDeployed)
@@ -687,7 +688,7 @@ func TestDesignDeployRedeployIsDeployed(t *testing.T) {
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("deploy: %v", r)
 	}
-	defineID := r["data"].(map[string]interface{})["processDefineId"].(int64)
+	defineID := mustI64(r["data"].(map[string]interface{})["processDefineId"])
 	design, _ = extRepo.FindDesignByID(nil, designID)
 	if design.IsDeployed != 1 {
 		t.Fatalf("部署后应为已部署: %v", design.IsDeployed)
@@ -698,7 +699,7 @@ func TestDesignDeployRedeployIsDeployed(t *testing.T) {
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("redeploy: %v", r)
 	}
-	if got := r["data"].(map[string]interface{})["processDefineId"].(int64); got != defineID {
+	if got := mustI64(r["data"].(map[string]interface{})["processDefineId"]); got != defineID {
 		t.Fatalf("redeploy 应复用同一 defineId: %d != %d", got, defineID)
 	}
 	design, _ = extRepo.FindDesignByID(nil, designID)
@@ -769,5 +770,50 @@ func TestSnowflakeIDPrecision(t *testing.T) {
 	}
 	if msg, _ := r["msg"].(string); !strings.Contains(msg, "2084320543834124290") {
 		t.Fatalf("字符串应精确解析（消息应含原始雪花 id）: %v", r)
+	}
+}
+
+// mustI64 出口 id 解析（1.8.5 起出口 id 为 string，issues/38 E9）——兼容 string/int64
+func mustI64(v interface{}) int64 {
+	switch t := v.(type) {
+	case string:
+		n, _ := strconv.ParseInt(t, 10, 64)
+		return n
+	case int64:
+		return t
+	case int:
+		return int64(t)
+	}
+	return 0
+}
+
+// TestFacadeIDStringify 出口 id string 化（issues/38 E9 对齐 Node/Java 全局序列化）：
+// API 返回的 id 类字段必须是 string（前端 JS number 无法承载雪花 id）
+func TestFacadeIDStringify(t *testing.T) {
+	f, _, _ := setupFacade()
+	r := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("deploy: %v", r)
+	}
+	pid, ok := r["data"].(map[string]interface{})["processDefineId"].(string)
+	if !ok || pid == "" {
+		t.Fatalf("processDefineId 应为 string: %v", r)
+	}
+	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{"processDefineId": pid, "operator": "user1"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("start: %v", r)
+	}
+	if _, ok := r["data"].(map[string]interface{})["processInstanceId"].(string); !ok {
+		t.Fatalf("processInstanceId 应为 string: %v", r)
+	}
+	// 列表行 id 也为 string
+	r = f.Flow("processDefine/page", map[string]interface{}{"pageNum": 1, "pageSize": 10})
+	rows, ok := r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	if !ok || len(rows) == 0 {
+		t.Fatalf("rows 应为非空列表: %v", r)
+	}
+	row := rows[0]
+	if _, ok := row["id"].(string); !ok {
+		t.Fatalf("列表行 id 应为 string: %v", row)
 	}
 }

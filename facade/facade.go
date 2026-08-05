@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -169,7 +170,9 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 	if err != nil {
 		return errorResult(err.Error())
 	}
-	return okResult(data)
+	// issues/38 E9 出口统一：id 类字段转 string（对齐 Node 全程 string / Java 集成层
+	// Jackson ToStringSerializer）——前端 JS number 无法承载雪花 id（>2^53）
+	return okResult(stringifyIDs(data))
 }
 
 // ═══ 流程定义 / 实例 ═══
@@ -1336,6 +1339,66 @@ func pageData(pageNum, pageSize, total int, rows interface{}) map[string]interfa
 
 func okResult(data interface{}) map[string]interface{} {
 	return map[string]interface{}{"code": 0, "msg": "成功", "data": data}
+}
+
+// ═══ 出口 id stringify（issues/38 E9） ═══════════════════════════════════════
+
+// isIDKey id 类字段名判定（对齐 Java 实体 id 命名）：精确 'id' 或以 'Id' 结尾
+// （processDefineId/processInstanceId/processTaskId/processDesignId/parentId/taskParentId/...）
+func isIDKey(k string) bool {
+	return k == "id" || strings.HasSuffix(k, "Id")
+}
+
+// toIDString id 值转字符串：nil 保持 nil；字符串直通；数字转十进制字符串。
+// 防御 float64（引擎内部理论不走此型）：仅整数值转换。
+func toIDString(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case int64:
+		return strconv.FormatInt(t, 10)
+	case int:
+		return strconv.Itoa(t)
+	case float64:
+		if t == math.Trunc(t) {
+			return strconv.FormatInt(int64(t), 10)
+		}
+	}
+	return fmt.Sprintf("%v", v)
+}
+
+// stringifyIDs 递归把返回结构中 id 类字段值统一转字符串（反射兼容
+// map[string]interface{} / []interface{} / []map[string]interface{} 等真实类型）
+func stringifyIDs(v interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Map:
+		if rv.Type().Key().Kind() != reflect.String {
+			return v
+		}
+		out := reflect.MakeMap(rv.Type())
+		for _, k := range rv.MapKeys() {
+			ks := k.String()
+			val := rv.MapIndex(k).Interface()
+			if isIDKey(ks) {
+				out.SetMapIndex(k, reflect.ValueOf(toIDString(val)))
+			} else {
+				out.SetMapIndex(k, reflect.ValueOf(stringifyIDs(val)))
+			}
+		}
+		return out.Interface()
+	case reflect.Slice, reflect.Array:
+		out := reflect.MakeSlice(rv.Type(), rv.Len(), rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out.Index(i).Set(reflect.ValueOf(stringifyIDs(rv.Index(i).Interface())))
+		}
+		return out.Interface()
+	default:
+		return v
+	}
 }
 
 func errorResult(msg string) map[string]interface{} {
