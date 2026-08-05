@@ -5,6 +5,11 @@
 // （code=0 成功 / 99999999 失败）。
 //
 // 操作人约定：门面不感知登录态，args["operator"] 显式传入。
+//
+// ⚠️ id 传参约定（issues/38 E9 对齐 Node）：id 类参数（processDefineId/processTaskId/...）
+// 建议以**字符串**传递。集成方若用 encoding/json 把请求体解析为 map，数字默认变 float64
+// （53 位尾数），Java 雪花 id（>2^53）在解析层就已丢精度——门面对超 2^53 的 float64
+// 显性报错（不静默截断），字符串路径 strconv.ParseInt 精确无损。
 package facade
 
 import (
@@ -13,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -171,7 +177,7 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 func (f *Facade) startAndExecute(args map[string]interface{}) (interface{}, error) {
 	defineID, err := toInt64(args["processDefineId"])
 	if err != nil {
-		return nil, errors.New("processDefineId 缺失或非法")
+		return nil, fmt.Errorf("processDefineId 缺失或非法: %v", err)
 	}
 	operator := toStr(args["operator"], "user1")
 	flowArgs := map[string]interface{}{}
@@ -244,7 +250,7 @@ func (f *Facade) deploy(args map[string]interface{}) (interface{}, error) {
 func (f *Facade) redeploy(args map[string]interface{}) error {
 	defineID, err := toInt64(args["processDefineId"])
 	if err != nil {
-		return errors.New("processDefineId 缺失或非法")
+		return fmt.Errorf("processDefineId 缺失或非法: %v", err)
 	}
 	content, err := contentBytes(args)
 	if err != nil {
@@ -270,7 +276,7 @@ func (f *Facade) removeDefine(args map[string]interface{}) error {
 		for _, i := range ids {
 			id, err := toInt64(i)
 			if err != nil {
-				return errors.New("id 缺失或非法")
+				return fmt.Errorf("id 缺失或非法: %v", err)
 			}
 			if err := f.repo.RemoveDefine(context.Background(), id); err != nil {
 				return err
@@ -280,7 +286,7 @@ func (f *Facade) removeDefine(args map[string]interface{}) error {
 	}
 	id, err := toInt64(args["id"])
 	if err != nil {
-		return errors.New("id 缺失或非法")
+		return fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	return f.repo.RemoveDefine(context.Background(), id)
 }
@@ -289,13 +295,13 @@ func (f *Facade) upAndDown(args map[string]interface{}) error {
 	// issues/28：兼容 {ids, opType} 批量；opType/state 二选一
 	state, err := toInt(firstNonNil(args["opType"], args["state"]))
 	if err != nil {
-		return errors.New("opType/state 缺失或非法")
+		return fmt.Errorf("opType/state 缺失或非法: %v", err)
 	}
 	if ids, ok := asList(args["ids"]); ok {
 		for _, i := range ids {
 			id, err := toInt64(i)
 			if err != nil {
-				return errors.New("id 缺失或非法")
+				return fmt.Errorf("id 缺失或非法: %v", err)
 			}
 			if err := f.repo.UpdateDefineState(context.Background(), id, state); err != nil {
 				return err
@@ -305,7 +311,7 @@ func (f *Facade) upAndDown(args map[string]interface{}) error {
 	}
 	id, err := toInt64(args["id"])
 	if err != nil {
-		return errors.New("id 缺失或非法")
+		return fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	return f.repo.UpdateDefineState(context.Background(), id, state)
 }
@@ -313,7 +319,7 @@ func (f *Facade) upAndDown(args map[string]interface{}) error {
 func (f *Facade) withdraw(args map[string]interface{}) error {
 	instanceID, err := toInt64(args["id"])
 	if err != nil {
-		return errors.New("id 缺失或非法")
+		return fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	inst, err := f.repo.FindInstanceByID(context.Background(), instanceID)
 	if err != nil || inst == nil {
@@ -338,7 +344,7 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 func (f *Facade) execute(args map[string]interface{}) error {
 	taskID, err := toInt64(args["processTaskId"])
 	if err != nil {
-		return errors.New("processTaskId 缺失或非法")
+		return fmt.Errorf("processTaskId 缺失或非法: %v", err)
 	}
 	operator := toStr(args["operator"], "user1")
 	submitType, err := toInt(args["submitType"])
@@ -388,7 +394,7 @@ func (f *Facade) designDetail(args map[string]interface{}) (interface{}, error) 
 	ext := f.ext()
 	id, err := toInt64(args["id"])
 	if err != nil {
-		return nil, errors.New("id 缺失或非法")
+		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	design, err := ext.FindDesignByID(context.Background(), id)
 	if err != nil || design == nil {
@@ -494,7 +500,7 @@ func (f *Facade) designRemove(args map[string]interface{}) error {
 		for _, i := range ids {
 			id, err := toInt64(i)
 			if err != nil {
-				return errors.New("id 缺失或非法")
+				return fmt.Errorf("id 缺失或非法: %v", err)
 			}
 			if err := f.ext().RemoveDesign(context.Background(), id); err != nil {
 				return err
@@ -504,7 +510,7 @@ func (f *Facade) designRemove(args map[string]interface{}) error {
 	}
 	id, err := toInt64(args["id"])
 	if err != nil {
-		return errors.New("id 缺失或非法")
+		return fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	return f.ext().RemoveDesign(context.Background(), id)
 }
@@ -592,7 +598,7 @@ func (f *Facade) designDeploy(args map[string]interface{}) (interface{}, error) 
 	ext := f.ext()
 	id, err := toInt64(args["id"])
 	if err != nil {
-		return nil, errors.New("id 缺失或非法")
+		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	design, err := ext.FindDesignByID(context.Background(), id)
 	if err != nil || design == nil {
@@ -626,7 +632,7 @@ func (f *Facade) designUpdate(args map[string]interface{}) error {
 	ext := f.ext()
 	id, err := toInt64(args["id"])
 	if err != nil {
-		return errors.New("id 缺失或非法")
+		return fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	design, err := ext.FindDesignByID(context.Background(), id)
 	if err != nil || design == nil {
@@ -656,7 +662,7 @@ func (f *Facade) designUpdateDefine(args map[string]interface{}) error {
 	ext := f.ext()
 	designID, err := toInt64(args["processDesignId"])
 	if err != nil {
-		return errors.New("processDesignId 缺失或非法")
+		return fmt.Errorf("processDesignId 缺失或非法: %v", err)
 	}
 	design, err := ext.FindDesignByID(context.Background(), designID)
 	if err != nil || design == nil {
@@ -703,7 +709,7 @@ func (f *Facade) designRedeploy(args map[string]interface{}) (interface{}, error
 	ext := f.ext()
 	designID, err := toInt64(args["id"])
 	if err != nil {
-		return nil, errors.New("id 缺失或非法")
+		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	design, err := ext.FindDesignByID(context.Background(), designID)
 	if err != nil || design == nil {
@@ -824,7 +830,7 @@ func (f *Facade) surrogateSave(args map[string]interface{}) (interface{}, error)
 func (f *Facade) surrogateRemove(args map[string]interface{}) error {
 	id, err := toInt64(args["id"])
 	if err != nil {
-		return errors.New("id 缺失或非法")
+		return fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	return f.ext().RemoveSurrogate(context.Background(), id)
 }
@@ -855,7 +861,7 @@ func (f *Facade) getLastByName(args map[string]interface{}) (interface{}, error)
 func (f *Facade) highLight(args map[string]interface{}) (interface{}, error) {
 	instanceID, err := toInt64(args["id"])
 	if err != nil {
-		return nil, errors.New("id 缺失或非法")
+		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	inst, err := f.repo.FindInstanceByID(context.Background(), instanceID)
 	if err != nil || inst == nil {
@@ -982,7 +988,7 @@ func containsStr(list []string, s string) bool {
 func (f *Facade) approvalRecord(args map[string]interface{}) (interface{}, error) {
 	instanceID, err := toInt64(args["id"])
 	if err != nil {
-		return nil, errors.New("id 缺失或非法")
+		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	his, err := f.repo.FindHistoryTasks(context.Background(), instanceID)
 	if err != nil {
@@ -1004,7 +1010,7 @@ func (f *Facade) approvalRecord(args map[string]interface{}) (interface{}, error
 func (f *Facade) getAssigneeTextData(args map[string]interface{}) (interface{}, error) {
 	instanceID, err := toInt64(args["id"])
 	if err != nil {
-		return nil, errors.New("id 缺失或非法")
+		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	includeNodeName := true
 	if v, ok := args["includeNodeName"].(bool); ok {
@@ -1028,7 +1034,7 @@ func (f *Facade) getAssigneeTextData(args map[string]interface{}) (interface{}, 
 func (f *Facade) createCCInstance(args map[string]interface{}) error {
 	instanceID, err := toInt64(args["processInstanceId"])
 	if err != nil {
-		return errors.New("processInstanceId 缺失或非法")
+		return fmt.Errorf("processInstanceId 缺失或非法: %v", err)
 	}
 	operator := toStr(args["operator"], "user1")
 	actors := toStringSlice2(args["actorIds"])
@@ -1041,7 +1047,7 @@ func (f *Facade) createCCInstance(args map[string]interface{}) error {
 func (f *Facade) updateCCStatus(args map[string]interface{}) error {
 	instanceID, err := toInt64(args["processInstanceId"])
 	if err != nil {
-		return errors.New("processInstanceId 缺失或非法")
+		return fmt.Errorf("processInstanceId 缺失或非法: %v", err)
 	}
 	operator := toStr(args["operator"], "user1")
 	return f.repo.UpdateCcStatus(context.Background(), instanceID, operator)
@@ -1065,7 +1071,7 @@ func (f *Facade) ccList(args map[string]interface{}) (interface{}, error) {
 func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 	taskID, err := toInt64(args["id"])
 	if err != nil {
-		return nil, errors.New("id 缺失或非法")
+		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	operator := toStr(args["operator"], "user1")
 	task, err := f.repo.FindTaskByID(context.Background(), taskID)
@@ -1109,7 +1115,7 @@ func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 func (f *Facade) jumpAbleTaskNameList(args map[string]interface{}) (interface{}, error) {
 	instanceID, err := toInt64(args["processInstanceId"])
 	if err != nil {
-		return nil, errors.New("processInstanceId 缺失或非法")
+		return nil, fmt.Errorf("processInstanceId 缺失或非法: %v", err)
 	}
 	done, _ := f.repo.FindDoneTasks(context.Background(), instanceID, nil)
 	rows := []map[string]interface{}{}
@@ -1233,7 +1239,7 @@ func (f *Facade) nextTaskCandidates(flow *model.FlowModel, taskName string) []st
 func (f *Facade) taskAddActor(args map[string]interface{}) error {
 	taskID, err := toInt64(args["processTaskId"])
 	if err != nil {
-		return errors.New("processTaskId 缺失或非法")
+		return fmt.Errorf("processTaskId 缺失或非法: %v", err)
 	}
 	actors := toStringSlice2(args["actorIds"])
 	if len(actors) == 0 {
@@ -1245,7 +1251,7 @@ func (f *Facade) taskAddActor(args map[string]interface{}) error {
 func (f *Facade) taskLatest(args map[string]interface{}) (interface{}, error) {
 	instanceID, err := toInt64(args["processInstanceId"])
 	if err != nil {
-		return nil, errors.New("processInstanceId 缺失或非法")
+		return nil, fmt.Errorf("processInstanceId 缺失或非法: %v", err)
 	}
 	doing, _ := f.repo.FindDoingTasks(context.Background(), instanceID, nil)
 	if len(doing) == 0 {
@@ -1353,6 +1359,12 @@ func toInt64(v interface{}) (int64, error) {
 	case int:
 		return int64(t), nil
 	case float64:
+		// encoding/json 默认把 JSON 数字解析为 float64——只有 53 位尾数。
+		// Java 雪花 id（≈2.08e18）> 2^53 时 float64 必然已丢精度，静默截断会产生
+		// 错误 id（define not found: ...288）。显性报错，要求以字符串传递（issues/38 E9 对齐 Node）
+		if math.Abs(t) > 1<<53 {
+			return 0, fmt.Errorf("id %v 超出 float64 精确范围（2^53），请以字符串传递", t)
+		}
 		return int64(t), nil
 	case string:
 		return strconv.ParseInt(strings.TrimSpace(t), 10, 64)
@@ -1398,7 +1410,7 @@ func (f *Facade) definePage(args map[string]interface{}) (interface{}, error) {
 func (f *Facade) defineDetail(args map[string]interface{}) (interface{}, error) {
 	id, err := toInt64(args["id"])
 	if err != nil {
-		return nil, errors.New("id 缺失或非法")
+		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	def, err := f.repo.FindDefineByID(context.Background(), id)
 	if err != nil || def == nil {
@@ -1438,7 +1450,7 @@ func (f *Facade) instancePage(args map[string]interface{}) (interface{}, error) 
 func (f *Facade) instanceDetail(args map[string]interface{}) (interface{}, error) {
 	id, err := toInt64(args["id"])
 	if err != nil {
-		return nil, errors.New("id 缺失或非法")
+		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	inst, err := f.repo.FindInstanceByID(context.Background(), id)
 	if err != nil || inst == nil {

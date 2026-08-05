@@ -1,9 +1,10 @@
 package facade_test
 
 import (
-	"reflect"
 	"context"
 	"os"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -61,7 +62,7 @@ var _ spi.ExpressionEvaluator = (*testExprEval)(nil)
 
 type testOrgUserProv struct{}
 
-func (p *testOrgUserProv) FindDeptLeaders(deptID string) ([]string, error)    { return nil, nil }
+func (p *testOrgUserProv) FindDeptLeaders(deptID string) ([]string, error)     { return nil, nil }
 func (p *testOrgUserProv) FindDeptMainLeaders(deptID string) ([]string, error) { return nil, nil }
 func (p *testOrgUserProv) FindByRole(roleCode string) ([]string, error) {
 	if roleCode == "finance" {
@@ -739,5 +740,34 @@ func TestDesignDeployRedeployIsDeployed(t *testing.T) {
 	design, _ = extRepo.FindDesignByID(nil, designID)
 	if design.IsDeployed != 1 {
 		t.Fatalf("再部署后应为已部署: %v", design.IsDeployed)
+	}
+}
+
+// TestSnowflakeIDPrecision 雪花 id 精度守卫（issues/38 E9 对齐 Node）——
+// 模拟集成方 encoding/json 解析行为：数字 → float64 超 2^53 显性报错（不静默截断），
+// 字符串传递精确解析（报"不存在"而非截断后的错误 id）。
+func TestSnowflakeIDPrecision(t *testing.T) {
+	f, _, _ := setupFacade()
+
+	// ① float64 雪花 id（encoding/json 默认解析产物，已丢精度）→ 显性报错
+	r := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": float64(2084320543834124288), "operator": "user1",
+	})
+	if code, _ := r["code"].(int); code == 0 {
+		t.Fatalf("float64 雪花 id 必须报错: %v", r)
+	}
+	if msg, _ := r["msg"].(string); !strings.Contains(msg, "超出") {
+		t.Fatalf("应提示超出 float64 精确范围: %v", r)
+	}
+
+	// ② 字符串雪花 id → 精确解析（无该定义 → 报不存在，且消息含原始 id）
+	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": "2084320543834124290", "operator": "user1",
+	})
+	if code, _ := r["code"].(int); code == 0 {
+		t.Fatalf("无该定义应失败: %v", r)
+	}
+	if msg, _ := r["msg"].(string); !strings.Contains(msg, "2084320543834124290") {
+		t.Fatalf("字符串应精确解析（消息应含原始雪花 id）: %v", r)
 	}
 }
