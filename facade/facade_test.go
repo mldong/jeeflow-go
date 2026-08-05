@@ -817,3 +817,68 @@ func TestFacadeIDStringify(t *testing.T) {
 		t.Fatalf("列表行 id 应为 string: %v", row)
 	}
 }
+
+// TestHighLightNodeProgress 节点成员进度回显（issue 41）：顺序会签进行中/推进/完成
+func TestHighLightNodeProgress(t *testing.T) {
+	f, repo, _ := setupFacade()
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "06-countersign-sequential.json"))})
+	if code, _ := r0["code"].(int); code != 0 {
+		t.Fatalf("deploy: %v", r0)
+	}
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"], "operator": "user1",
+	})
+	if code, _ := r1["code"].(int); code != 0 {
+		t.Fatalf("start: %v", r1)
+	}
+	instanceID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+
+	hl := f.Flow("processInstance/highLight", map[string]interface{}{"id": instanceID})
+	if code, _ := hl["code"].(int); code != 0 {
+		t.Fatalf("highLight: %v", hl)
+	}
+	np := hl["data"].(map[string]interface{})["nodeProgress"].(map[string]interface{})
+	// 历史节点 apply：发起人 done
+	apply := np["apply"].(map[string]interface{})["members"].([]map[string]interface{})
+	if apply[0]["id"] != "user1" || apply[0]["done"] != true {
+		t.Fatalf("apply 应 done: %v", apply)
+	}
+	// 顺序会签进行中：type=SEQUENTIAL、第一位 active
+	task1 := np["task1"].(map[string]interface{})
+	if task1["type"] != "SEQUENTIAL" {
+		t.Fatalf("task1 type 应为 SEQUENTIAL: %v", task1)
+	}
+	members := task1["members"].([]map[string]interface{})
+	if members[0]["id"] != "userA" || members[0]["active"] != true {
+		t.Fatalf("userA 应 active: %v", members)
+	}
+	if members[1]["id"] != "userB" || members[1]["done"] != nil || members[1]["active"] != nil {
+		t.Fatalf("userB 应无标记: %v", members)
+	}
+	// 推进会签：userA done → userB active
+	doing, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
+	_ = repo.AddTaskActor(context.Background(), doing[0].ID, []string{"userA"})
+	re := f.Flow("processTask/execute", map[string]interface{}{"processTaskId": doing[0].ID, "operator": "userA", "submitType": 1})
+	if code, _ := re["code"].(int); code != 0 {
+		t.Fatalf("execute: %v", re)
+	}
+	hl2 := f.Flow("processInstance/highLight", map[string]interface{}{"id": instanceID})
+	np2 := hl2["data"].(map[string]interface{})["nodeProgress"].(map[string]interface{})
+	m2 := np2["task1"].(map[string]interface{})["members"].([]map[string]interface{})
+	if m2[0]["done"] != true || m2[1]["active"] != true {
+		t.Fatalf("推进后 userA done / userB active: %v", m2)
+	}
+	// 全部完成 → 全部 done
+	doing2, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
+	_ = repo.AddTaskActor(context.Background(), doing2[0].ID, []string{"userB"})
+	re2 := f.Flow("processTask/execute", map[string]interface{}{"processTaskId": doing2[0].ID, "operator": "userB", "submitType": 1})
+	if code, _ := re2["code"].(int); code != 0 {
+		t.Fatalf("execute2: %v", re2)
+	}
+	hl3 := f.Flow("processInstance/highLight", map[string]interface{}{"id": instanceID})
+	np3 := hl3["data"].(map[string]interface{})["nodeProgress"].(map[string]interface{})
+	m3 := np3["task1"].(map[string]interface{})["members"].([]map[string]interface{})
+	if m3[0]["done"] != true || m3[1]["done"] != true || m3[1]["active"] != nil {
+		t.Fatalf("完成后全部 done: %v", m3)
+	}
+}

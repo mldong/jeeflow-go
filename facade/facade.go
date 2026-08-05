@@ -888,10 +888,12 @@ func (f *Facade) highLight(args map[string]interface{}) (interface{}, error) {
 		}
 	}
 	// 路径补全：start 沿 edges 递归，遇活跃节点停止；决策分支按表达式求值过滤（issues/06）
+	nodeProgress := map[string]interface{}{}
 	def, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID)
 	if def != nil {
 		var flow model.FlowModel
 		if json.Unmarshal(def.Content, &flow) == nil {
+			nodeProgress = f.buildNodeProgress(&flow, his)
 			f.collectPath(&flow, "start", "", active, &history, &edges, map[string]bool{}, inst.Variables, his)
 		}
 	}
@@ -899,7 +901,93 @@ func (f *Facade) highLight(args map[string]interface{}) (interface{}, error) {
 		"activeNodeNames":  active,
 		"historyNodeNames": history,
 		"historyEdgeNames": edges,
+		"nodeProgress":     nodeProgress,
 	}, nil
+}
+
+// buildNodeProgress 节点成员进度（issue 41，对齐 boot3 highLight）：按任务状态 + 会签变量组装。
+// 会签节点带 type（PARALLEL/SEQUENTIAL）；done 按任务完成状态逐人标记，active = 进行中任务首位；
+// 动态参与人节点（无静态 actorIds）不返回；name 缺省（引擎不持有宿主用户体系，前端降级显示 id）
+func (f *Facade) buildNodeProgress(flow *model.FlowModel, tasks []*model.ProcessTask) map[string]interface{} {
+	progress := map[string]interface{}{}
+	names := []string{}
+	seen := map[string]bool{}
+	for _, t := range tasks {
+		if !seen[t.TaskName] {
+			seen[t.TaskName] = true
+			names = append(names, t.TaskName)
+		}
+	}
+	for _, name := range names {
+		var ts []*model.ProcessTask
+		for _, t := range tasks {
+			if t.TaskName == name {
+				ts = append(ts, t)
+			}
+		}
+		vars := map[string]interface{}{}
+		if len(ts) > 0 && ts[0].Variables != nil {
+			vars = ts[0].Variables
+		}
+		// 完整办理人列表：会签变量 operatorList_{node} 优先（顺序会签全量），否则任务 actorIds 并集
+		members := toStringSlice2(vars["operatorList_"+name])
+		if len(members) == 0 {
+			set := map[string]bool{}
+			for _, t := range ts {
+				for _, a := range t.ActorIDs {
+					set[a] = true
+				}
+			}
+			for a := range set {
+				members = append(members, a)
+			}
+		}
+		if len(members) == 0 {
+			continue // 动态参与人：无静态成员，不返回
+		}
+		doneSet := map[string]bool{}
+		for _, t := range ts {
+			if t.TaskState == model.TaskStateDone {
+				for _, a := range t.ActorIDs {
+					doneSet[a] = true
+				}
+			}
+		}
+		activeActor := ""
+		for _, t := range ts {
+			if t.TaskState == model.TaskStateDoing && len(t.ActorIDs) > 0 {
+				activeActor = t.ActorIDs[0]
+				break
+			}
+		}
+		// 会签判定：定义节点属性（引擎创建任务时 PerformType 未落任务表，取模型为准）
+		node := findNodeIn(flow, name)
+		var nodeProps map[string]interface{}
+		if node != nil {
+			nodeProps = node.Properties
+		}
+		csType := ""
+		if v, ok := nodeProps["countersignType"].(string); ok {
+			csType = v
+		}
+		isCs := csType != "" || toStr(nodeProps["performType"], "") == "1"
+		memberList := []map[string]interface{}{}
+		for _, id := range members {
+			m := map[string]interface{}{"id": id, "name": ""}
+			if doneSet[id] {
+				m["done"] = true
+			} else if id == activeActor {
+				m["active"] = true
+			}
+			memberList = append(memberList, m)
+		}
+		item := map[string]interface{}{"members": memberList}
+		if isCs && csType != "" {
+			item["type"] = csType
+		}
+		progress[name] = item
+	}
+	return progress
 }
 
 // collectPath 从节点沿输出边递归（遇活跃节点停止），补全历史节点与边；
