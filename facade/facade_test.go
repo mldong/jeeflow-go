@@ -943,7 +943,7 @@ func TestE2EFeedbackRegression(t *testing.T) {
 		t.Fatalf("start: %v", r1)
 	}
 	instanceID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
-	ccs, cctotal, _ := repo.PageCcInstances(context.Background(), 1, 10, "wangqiang")
+	ccs, cctotal, _ := repo.PageCcInstances(context.Background(), spi.PageQuery{PageNum: 1, PageSize: 10}, "wangqiang")
 	if cctotal < 1 || len(ccs) == 0 {
 		t.Fatalf("抄送应创建: total=%d", cctotal)
 	}
@@ -963,9 +963,9 @@ func TestE2EFeedbackRegression(t *testing.T) {
 	if len(cs) != 3 {
 		t.Fatalf("会签任务数: %d", len(cs))
 	}
-	for _, t := range cs {
-		if t.PerformType != 1 {
-			t.Fatalf("会签任务 PerformType 应=1: %d", t.PerformType)
+	for _, ct := range cs {
+		if ct.PerformType != 1 {
+			t.Fatalf("会签任务 PerformType 应=1: %d", ct.PerformType)
 		}
 	}
 	// 53：撤回状态 30
