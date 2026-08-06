@@ -389,6 +389,7 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1))
 			}
 		case "SEQUENTIAL":
+			// 顺序会签任务也是会签任务（issues/57 E29 修正：仅普通分支默认 0）
 			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, 1)
 			nt.Variables = map[string]interface{}{
 				prefixKey("nrOfInstances", node.ID): len(actors),
@@ -404,7 +405,7 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 		return nil
 	}
 	// 普通任务：一个任务，全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
-	nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, 1)
+	nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now)
 	if len(actors) > 1 {
 		nt.ActorIDs = actors
 	}

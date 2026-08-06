@@ -53,7 +53,7 @@ func indexOf(s, sub string) int {
 func runFlow(t *testing.T, eng *engine.EngineImpl, repo *memory.Repository, defineID int64, agree bool) *model.ProcessInstance {
 	t.Helper()
 	args := map[string]interface{}{
-		"f_title": "年假申请",
+		"f_title":  "年假申请",
 		"f_amount": 800.0,
 		"u_deptId": "D01",
 	}
@@ -638,19 +638,21 @@ func TestFacadeListByTypeAndTopLevelJSON(t *testing.T) {
 	if codeOf(r) != 0 {
 		t.Fatalf("flow failed: %v", r)
 	}
-	groups, _ := r["data"].(map[string][]map[string]interface{})
-	approval := groups["approval"]
-	if len(approval) == 0 {
+	// issues/58 E30：出口统一 map[string]interface{}（值 []interface{}，id 字符串化）
+	groups, _ := r["data"].(map[string]interface{})
+	approvalAny, _ := groups["approval"].([]interface{})
+	if len(approvalAny) == 0 {
 		t.Fatalf("应含 approval 分组: %v", groups)
 	}
 	found := false
-	for _, item := range approval {
+	for _, it := range approvalAny {
+		item, _ := it.(map[string]interface{})
 		if item["name"] == "topjson" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("分组应含 topjson: %v", approval)
+		t.Fatalf("分组应含 topjson: %v", approvalAny)
 	}
 	// bizData：未注册 → 报错；注册后回显
 	// 先部署真实流程（01-simple + relTableName）

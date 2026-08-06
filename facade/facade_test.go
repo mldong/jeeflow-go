@@ -2,6 +2,7 @@ package facade_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"reflect"
 	"strconv"
@@ -238,9 +239,10 @@ func TestFacadeDesignAndSurrogate(t *testing.T) {
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("surrogate page failed: %v", r)
 	}
-	rows := r["data"].(map[string]interface{})["rows"].([]*model.ProcessSurrogate)
-	if len(rows) != 1 {
-		t.Fatalf("surrogate page rows = %d, want 1", len(rows))
+	// issues/58 E30：出口结构体切片已转 []interface{}（id 字符串化）
+	rowsAny := r["data"].(map[string]interface{})["rows"].([]interface{})
+	if len(rowsAny) != 1 {
+		t.Fatalf("surrogate page rows = %d, want 1", len(rowsAny))
 	}
 	r = f.Flow("processSurrogate/remove", map[string]interface{}{"id": surrogateID})
 	if code, _ := r["code"].(int); code != 0 {
@@ -273,8 +275,8 @@ func TestFacadeViewEndpoints(t *testing.T) {
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("approvalRecord failed: %v", r)
 	}
-	if len(r["data"].([]map[string]interface{})) != 2 { // apply + task1
-		t.Fatalf("approvalRecord rows = %d, want 2", len(r["data"].([]map[string]interface{})))
+	if len(r["data"].([]interface{})) != 2 { // apply + task1
+		t.Fatalf("approvalRecord rows = %d, want 2", len(r["data"].([]interface{})))
 	}
 
 	r = f.Flow("processInstance/highLight", map[string]interface{}{"id": instanceID})
@@ -282,7 +284,7 @@ func TestFacadeViewEndpoints(t *testing.T) {
 		t.Fatalf("highLight failed: %v", r)
 	}
 	hl := r["data"].(map[string]interface{})
-	if !containsStr2(hl["activeNodeNames"].([]string), "task1") {
+	if !containsStr2(toStrings(hl["activeNodeNames"].([]interface{})), "task1") {
 		t.Fatalf("highLight active should contain task1: %v", hl)
 	}
 
@@ -325,11 +327,12 @@ func TestFacadeViewEndpoints(t *testing.T) {
 		t.Fatalf("ccList failed: %v", r)
 	}
 	ccData := r["data"].(map[string]interface{})
-	ccRows := ccData["rows"].([]map[string]interface{})
+	ccRows := ccData["rows"].([]interface{})
 	if len(ccRows) != 1 {
 		t.Fatalf("ccList rows = %d, want 1", len(ccRows))
 	}
-	if _, ok := ccRows[0]["ext"]; !ok {
+	row0, _ := ccRows[0].(map[string]interface{})
+	if _, ok := row0["ext"]; !ok {
 		t.Fatalf("ccList 行缺 ext: %v", ccRows[0])
 	}
 
@@ -398,13 +401,14 @@ func TestCandidatePageDualSource(t *testing.T) {
 		t.Fatalf("candidatePage failed: %v", r)
 	}
 	data := r["data"].(map[string]interface{})
-	rows := data["rows"].([]map[string]interface{})
+	rows := data["rows"].([]interface{})
 	if len(rows) != 4 {
 		t.Fatalf("candidates = %d, want 4 (userA/userB + finA/finB)", len(rows))
 	}
 	got := map[string]bool{}
-	for _, row := range rows {
-		got[row["userId"].(string)] = true
+	for _, rw := range rows {
+		m, _ := rw.(map[string]interface{})
+		got[m["userId"].(string)] = true
 	}
 	for _, want := range []string{"userA", "userB", "finA", "finB"} {
 		if !got[want] {
@@ -524,8 +528,8 @@ func TestHighLightFiltersDecisionBranch(t *testing.T) {
 		t.Fatalf("highLight failed: %v", r)
 	}
 	hl := r["data"].(map[string]interface{})
-	histEdges := hl["historyEdgeNames"].([]string)
-	histNodes := hl["historyNodeNames"].([]string)
+	histEdges := toStrings(hl["historyEdgeNames"].([]interface{}))
+	histNodes := toStrings(hl["historyNodeNames"].([]interface{}))
 	// 走过的分支：e4（amount<=1000 → task3）+ e6（task3→end）
 	if !containsStr2(histEdges, "e4") || !containsStr2(histEdges, "e6") {
 		t.Fatalf("应包含走过的边 e4/e6: %v", histEdges)
@@ -597,19 +601,19 @@ func TestMQueryParams(t *testing.T) {
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("definePage: %v", r)
 	}
-	rows := r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	rows := r["data"].(map[string]interface{})["rows"].([]interface{})
 	if len(rows) != 1 {
 		t.Fatalf("m_LIKE_name 应过滤到 1 行: %v", r)
 	}
 
 	r = f.Flow("processDefine/page", map[string]interface{}{"m_LIKE_displayName": "简单"})
-	rows = r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	rows = r["data"].(map[string]interface{})["rows"].([]interface{})
 	if len(rows) != 1 {
 		t.Fatalf("m_LIKE_displayName 应过滤到 1 行: %v", r)
 	}
 
 	r = f.Flow("processDefine/page", map[string]interface{}{"m_LIKE_displayName": "流程"})
-	rows = r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	rows = r["data"].(map[string]interface{})["rows"].([]interface{})
 	if len(rows) != 2 {
 		t.Fatalf("m_LIKE_displayName 应匹配全部: %v", r)
 	}
@@ -625,14 +629,14 @@ func TestMQueryParams(t *testing.T) {
 	r = f.Flow("processInstance/page", map[string]interface{}{
 		"operator": "zhangsan", "m_pd_LIKE_displayName": "简单",
 	})
-	rows = r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	rows = r["data"].(map[string]interface{})["rows"].([]interface{})
 	if len(rows) != 1 {
 		t.Fatalf("m_pd_LIKE_displayName 应命中: %v", r)
 	}
 	r = f.Flow("processInstance/page", map[string]interface{}{
 		"operator": "zhangsan", "m_pd_LIKE_displayName": "zzz",
 	})
-	rows = r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	rows = r["data"].(map[string]interface{})["rows"].([]interface{})
 	if len(rows) != 0 {
 		t.Fatalf("m_pd_LIKE_displayName 不应命中: %v", r)
 	}
@@ -641,14 +645,14 @@ func TestMQueryParams(t *testing.T) {
 	r = f.Flow("processTask/todoList", map[string]interface{}{
 		"operator": "leader", "m_t_LIKE_displayName": "审批",
 	})
-	rows = r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	rows = r["data"].(map[string]interface{})["rows"].([]interface{})
 	if len(rows) != 1 {
 		t.Fatalf("m_t_LIKE_displayName 应命中待办: %v", r)
 	}
 	r = f.Flow("processTask/todoList", map[string]interface{}{
 		"operator": "leader", "m_t_LIKE_displayName": "zzz",
 	})
-	rows = r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	rows = r["data"].(map[string]interface{})["rows"].([]interface{})
 	if len(rows) != 0 {
 		t.Fatalf("m_t_LIKE_displayName 不应命中: %v", r)
 	}
@@ -808,11 +812,11 @@ func TestFacadeIDStringify(t *testing.T) {
 	}
 	// 列表行 id 也为 string
 	r = f.Flow("processDefine/page", map[string]interface{}{"pageNum": 1, "pageSize": 10})
-	rows, ok := r["data"].(map[string]interface{})["rows"].([]map[string]interface{})
+	rows, ok := r["data"].(map[string]interface{})["rows"].([]interface{})
 	if !ok || len(rows) == 0 {
 		t.Fatalf("rows 应为非空列表: %v", r)
 	}
-	row := rows[0]
+	row, _ := rows[0].(map[string]interface{})
 	if _, ok := row["id"].(string); !ok {
 		t.Fatalf("列表行 id 应为 string: %v", row)
 	}
@@ -839,8 +843,9 @@ func TestHighLightNodeProgress(t *testing.T) {
 	}
 	np := hl["data"].(map[string]interface{})["nodeProgress"].(map[string]interface{})
 	// 历史节点 apply：发起人 done
-	apply := np["apply"].(map[string]interface{})["members"].([]map[string]interface{})
-	if apply[0]["id"] != "user1" || apply[0]["done"] != true {
+	apply := np["apply"].(map[string]interface{})["members"].([]interface{})
+	apply0, _ := apply[0].(map[string]interface{})
+	if apply0["id"] != "user1" || apply0["done"] != true {
 		t.Fatalf("apply 应 done: %v", apply)
 	}
 	// 顺序会签进行中：type=SEQUENTIAL、第一位 active
@@ -848,15 +853,17 @@ func TestHighLightNodeProgress(t *testing.T) {
 	if task1["type"] != "SEQUENTIAL" {
 		t.Fatalf("task1 type 应为 SEQUENTIAL: %v", task1)
 	}
-	members := task1["members"].([]map[string]interface{})
-	if members[0]["id"] != "userA" || members[0]["active"] != true {
+	members := task1["members"].([]interface{})
+	member0, _ := members[0].(map[string]interface{})
+	if member0["id"] != "userA" || member0["active"] != true {
 		t.Fatalf("userA 应 active: %v", members)
 	}
 	// 姓名走 UserProvider SPI 解析（testUserProv realName = "用户" + id）
-	if members[0]["name"] != "用户userA" {
+	if member0["name"] != "用户userA" {
 		t.Fatalf("name 应经 SPI 解析: %v", members[0])
 	}
-	if members[1]["id"] != "userB" || members[1]["done"] != nil || members[1]["active"] != nil {
+	member1, _ := members[1].(map[string]interface{})
+	if member1["id"] != "userB" || member1["done"] != nil || member1["active"] != nil {
 		t.Fatalf("userB 应无标记: %v", members)
 	}
 	// 推进会签：userA done → userB active
@@ -868,8 +875,8 @@ func TestHighLightNodeProgress(t *testing.T) {
 	}
 	hl2 := f.Flow("processInstance/highLight", map[string]interface{}{"id": instanceID})
 	np2 := hl2["data"].(map[string]interface{})["nodeProgress"].(map[string]interface{})
-	m2 := np2["task1"].(map[string]interface{})["members"].([]map[string]interface{})
-	if m2[0]["done"] != true || m2[1]["active"] != true {
+	m2 := np2["task1"].(map[string]interface{})["members"].([]interface{})
+	if m2[0].(map[string]interface{})["done"] != true || m2[1].(map[string]interface{})["active"] != true {
 		t.Fatalf("推进后 userA done / userB active: %v", m2)
 	}
 	// 全部完成 → 全部 done
@@ -881,8 +888,8 @@ func TestHighLightNodeProgress(t *testing.T) {
 	}
 	hl3 := f.Flow("processInstance/highLight", map[string]interface{}{"id": instanceID})
 	np3 := hl3["data"].(map[string]interface{})["nodeProgress"].(map[string]interface{})
-	m3 := np3["task1"].(map[string]interface{})["members"].([]map[string]interface{})
-	if m3[0]["done"] != true || m3[1]["done"] != true || m3[1]["active"] != nil {
+	m3 := np3["task1"].(map[string]interface{})["members"].([]interface{})
+	if m3[0].(map[string]interface{})["done"] != true || m3[1].(map[string]interface{})["done"] != true || m3[1].(map[string]interface{})["active"] != nil {
 		t.Fatalf("完成后全部 done: %v", m3)
 	}
 }
@@ -981,4 +988,13 @@ func TestE2EFeedbackRegression(t *testing.T) {
 	if len(doingAfter) != 0 {
 		t.Fatalf("撤回后无 doing: %d", len(doingAfter))
 	}
+}
+
+// toStrings 出口字符串数组转换（issues/58 E30：出口统一 []interface{}）
+func toStrings(v []interface{}) []string {
+	out := make([]string, 0, len(v))
+	for _, x := range v {
+		out = append(out, fmt.Sprintf("%v", x))
+	}
+	return out
 }

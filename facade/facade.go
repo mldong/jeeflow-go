@@ -351,16 +351,21 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 		return errors.New("流程实例不存在")
 	}
 	// 撤回：废弃全部 doing 任务 + 实例状态（v1.0.1：updateInstance 级联落库）
+	// 注意：FindInstanceByID 不加载 Tasks（空），必须按实例查 doing 任务废弃
 	operator := toStr(args["operator"], "user1")
 	now := time.Now()
-	abandoned := inst.AbandonAllDoing(now)
-	inst.Withdraw(now) // issues/53 E25：撤回状态 Withdraw(30) 而非 Reject(45)
-	inst.UpdateUser = operator
-	for _, t := range abandoned {
-		if err := f.repo.UpdateTask(context.Background(), t); err != nil {
-			return err
-		}
+	doing, err := f.repo.FindDoingTasks(context.Background(), instanceID, nil)
+	if err != nil {
+		return err
 	}
+	// issues/53 E25 补正：废弃副本必须同步回聚合（UpdateInstance 级联会用聚合内
+	// 旧任务副本覆盖已废弃状态——先 updateTask 再 updateInstance 会被覆盖回 DOING）
+	for _, t := range doing {
+		t.Abandon(now)
+	}
+	inst.Withdraw(now) // 撤回状态 Withdraw(30) 而非 Reject(45)
+	inst.UpdateUser = operator
+	inst.Tasks = doing
 	return f.repo.UpdateInstance(context.Background(), inst)
 }
 
@@ -1507,23 +1512,65 @@ func stringifyIDs(v interface{}) interface{} {
 		if rv.Type().Key().Kind() != reflect.String {
 			return v
 		}
-		out := reflect.MakeMap(rv.Type())
+		out := make(map[string]interface{}, rv.Len())
 		for _, k := range rv.MapKeys() {
 			ks := k.String()
 			val := rv.MapIndex(k).Interface()
 			if isIDKey(ks) {
-				out.SetMapIndex(k, reflect.ValueOf(toIDString(val)))
+				out[ks] = toIDString(val)
 			} else {
-				out.SetMapIndex(k, reflect.ValueOf(stringifyIDs(val)))
+				out[ks] = stringifyIDs(val)
 			}
 		}
-		return out.Interface()
+		return out
 	case reflect.Slice, reflect.Array:
-		out := reflect.MakeSlice(rv.Type(), rv.Len(), rv.Len())
-		for i := 0; i < rv.Len(); i++ {
-			out.Index(i).Set(reflect.ValueOf(stringifyIDs(rv.Index(i).Interface())))
+		// []byte 原样（Content 等二进制字段，json 序列化为 base64）
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return v
 		}
-		return out.Interface()
+		out := make([]interface{}, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = stringifyIDs(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Ptr:
+		if rv.IsNil() {
+			return v
+		}
+		return stringifyIDs(rv.Elem().Interface())
+	case reflect.Struct:
+		// issues/58 E30：结构体（含 *Struct 切片元素）转 map（json tag 名），
+		// id 类字段字符串化——time.Time 等无导出字段的结构体原样返回
+		hasExported := false
+		for i := 0; i < rv.NumField(); i++ {
+			if rv.Type().Field(i).IsExported() {
+				hasExported = true
+				break
+			}
+		}
+		if !hasExported {
+			return v
+		}
+		m := map[string]interface{}{}
+		for i := 0; i < rv.NumField(); i++ {
+			f := rv.Type().Field(i)
+			if !f.IsExported() {
+				continue
+			}
+			name := f.Name
+			if tag := f.Tag.Get("json"); tag != "" {
+				if n := strings.Split(tag, ",")[0]; n != "" && n != "-" {
+					name = n
+				}
+			}
+			fv := rv.Field(i)
+			val := stringifyIDs(fv.Interface())
+			if isIDKey(name) {
+				val = toIDString(fv.Interface())
+			}
+			m[name] = val
+		}
+		return m
 	default:
 		return v
 	}
