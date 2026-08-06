@@ -11,6 +11,7 @@
 | [流程定义格式](./flow-definition.md) | LogicFlow JSON 结构、节点类型 |
 | [SPI 扩展指南](./spi-guide.md) | `ProcessRepository` / `UserProvider` 等 SPI |
 | [GoFrame 集成](./goframe-demo.md) | GoFrame 演示站接入 |
+| [Web 框架接入](./web-frameworks.md) | **任意 Web 框架接入门面**：GoFrame/Gin/Echo 转发层对照（雪花 id 精度两连坑） |
 
 ## 演示站
 
