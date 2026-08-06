@@ -926,3 +926,59 @@ func TestPerformTypeStringCompat(t *testing.T) {
 		t.Fatalf("ALL 格式 nodeProgress type 应为 PARALLEL: %v", np["task1"])
 	}
 }
+
+// TestE2EFeedbackRegression E2E 反馈回归（issues 53/52/56）：撤回状态 30 / 会签 performType 落库 / 发起抄送
+func TestE2EFeedbackRegression(t *testing.T) {
+	f, repo, _ := setupFacade()
+	// 56：发起时抄送 f_ccActors
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
+	if code, _ := r0["code"].(int); code != 0 {
+		t.Fatalf("deploy: %v", r0)
+	}
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"],
+		"operator":        "user1", "f_ccActors": "wangqiang,zhaomin",
+	})
+	if code, _ := r1["code"].(int); code != 0 {
+		t.Fatalf("start: %v", r1)
+	}
+	instanceID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	ccs, cctotal, _ := repo.PageCcInstances(context.Background(), 1, 10, "wangqiang")
+	if cctotal < 1 || len(ccs) == 0 {
+		t.Fatalf("抄送应创建: total=%d", cctotal)
+	}
+	// 52：会签任务 performType 落库
+	r2 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "05-countersign-parallel.json"))})
+	r3 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r2["data"].(map[string]interface{})["processDefineId"], "operator": "user1",
+	})
+	csID := mustI64(r3["data"].(map[string]interface{})["processInstanceId"])
+	csDoing, _ := repo.FindDoingTasks(context.Background(), csID, nil)
+	cs := []*model.ProcessTask{}
+	for _, t := range csDoing {
+		if t.TaskName == "task1" {
+			cs = append(cs, t)
+		}
+	}
+	if len(cs) != 3 {
+		t.Fatalf("会签任务数: %d", len(cs))
+	}
+	for _, t := range cs {
+		if t.PerformType != 1 {
+			t.Fatalf("会签任务 PerformType 应=1: %d", t.PerformType)
+		}
+	}
+	// 53：撤回状态 30
+	r4 := f.Flow("processInstance/withdraw", map[string]interface{}{"id": instanceID, "operator": "user1"})
+	if code, _ := r4["code"].(int); code != 0 {
+		t.Fatalf("withdraw: %v", r4)
+	}
+	inst, _ := repo.FindInstanceByID(context.Background(), instanceID)
+	if inst == nil || inst.State != model.InstanceStateWithdraw {
+		t.Fatalf("撤回状态应=Withdraw(30): %v", inst.State)
+	}
+	doingAfter, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
+	if len(doingAfter) != 0 {
+		t.Fatalf("撤回后无 doing: %d", len(doingAfter))
+	}
+}

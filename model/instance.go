@@ -60,6 +60,12 @@ func (p *ProcessInstance) Reject(now time.Time) {
 	p.UpdateTime = now
 }
 
+// Withdraw 撤回流程（issues/53 E25：withdraw 用 Withdraw(30)，与 reject 区分）
+func (p *ProcessInstance) Withdraw(now time.Time) {
+	p.State = InstanceStateWithdraw
+	p.UpdateTime = now
+}
+
 // AddVariable 追加变量
 func (p *ProcessInstance) AddVariable(vars map[string]interface{}) {
 	for k, v := range vars {
@@ -99,13 +105,17 @@ func (p *ProcessInstance) IsAllTasksFinished() bool {
 	return true
 }
 
-// CreateTask 创建任务（子实体工厂）
-func (p *ProcessInstance) CreateTask(id int64, taskName, displayName, actor, operator, formKey string, now time.Time) *ProcessTask {
+// CreateTask 创建任务（子实体工厂）——performType：0 普通 / 1 会签（issues/52 E24 落库对齐 Java）
+func (p *ProcessInstance) CreateTask(id int64, taskName, displayName, actor, operator, formKey string, now time.Time, performType ...int) *ProcessTask {
+	pt := 0
+	if len(performType) > 0 {
+		pt = performType[0]
+	}
 	task := &ProcessTask{
 		ID: id, ProcessInstanceID: p.ID,
 		TaskName: taskName, DisplayName: displayName, TaskState: TaskStateDoing,
 		ActorIDs: []string{actor},
-		FormKey: formKey,
+		FormKey:  formKey, PerformType: pt,
 		CreateTime: now, UpdateTime: now, CreateUser: operator, UpdateUser: operator,
 	}
 	p.Tasks = append(p.Tasks, task)

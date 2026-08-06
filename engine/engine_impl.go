@@ -115,7 +115,7 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 				actors, lc := getCsState(vars, curNode.ID)
 				if actors != nil && lc+1 < len(actors) {
 					// 聚合根：创建串行会签下一步任务
-					nt := inst.CreateTask(e.nextID(), curNode.ID, curNode.Text.Value, actors[lc+1], operator, formKeyOf(curNode), now)
+					nt := inst.CreateTask(e.nextID(), curNode.ID, curNode.Text.Value, actors[lc+1], operator, formKeyOf(curNode), now, 1)
 					nt.Variables = map[string]interface{}{
 						prefixKey("nrOfInstances", curNode.ID): len(actors),
 						prefixKey("loopCounter", curNode.ID):   lc + 1,
@@ -386,10 +386,10 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 		switch ct {
 		case "PARALLEL":
 			for _, actor := range actors {
-				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now))
+				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1))
 			}
 		case "SEQUENTIAL":
-			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now)
+			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, 1)
 			nt.Variables = map[string]interface{}{
 				prefixKey("nrOfInstances", node.ID): len(actors),
 				prefixKey("loopCounter", node.ID):   0,
@@ -398,13 +398,13 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 			e.repo.SaveTask(ctx, nt)
 		default:
 			for _, actor := range actors {
-				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now))
+				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1))
 			}
 		}
 		return nil
 	}
 	// 普通任务：一个任务，全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
-	nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now)
+	nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, 1)
 	if len(actors) > 1 {
 		nt.ActorIDs = actors
 	}

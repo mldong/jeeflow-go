@@ -344,7 +344,7 @@ func (r *Repository) FindInstanceByID(ctx context.Context, id int64) (*model.Pro
 	inst := &model.ProcessInstance{}
 	var parentID sql.NullInt64
 	var variable []byte
-	err := row.Scan(&inst.ID, &parentID, &inst.DefineID, &inst.State, &inst.ParentNodeName,
+	err := row.Scan(&inst.ID, &parentID, &inst.DefineID, &inst.State, &nullStrScan{&inst.ParentNodeName},
 		&inst.BusinessNo, &inst.Operator, &nullTimePtrScan{&inst.ExpireTime}, &variable,
 		&nullTimeScan{&inst.CreateTime}, &nullStrScan{&inst.CreateUser},
 		&nullTimeScan{&inst.UpdateTime}, &nullStrScan{&inst.UpdateUser})
@@ -673,7 +673,7 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 		var parentID sql.NullInt64
 		var variable []byte
 		var defineVersion sql.NullInt64
-		if err := rows.Scan(&row.ID, &parentID, &row.DefineID, &row.State, &row.ParentNodeName,
+		if err := rows.Scan(&row.ID, &parentID, &row.DefineID, &row.State, &nullStrScan{&row.ParentNodeName},
 			&row.BusinessNo, &row.Operator, &nullTimePtrScan{&row.ExpireTime}, &variable,
 			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
 			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},
@@ -757,7 +757,7 @@ func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, ope
 		var parentID sql.NullInt64
 		var variable []byte
 		var defVersion sql.NullInt64
-		if err := rows.Scan(&row.ID, &parentID, &row.DefineID, &row.State, &row.ParentNodeName,
+		if err := rows.Scan(&row.ID, &parentID, &row.DefineID, &row.State, &nullStrScan{&row.ParentNodeName},
 			&row.BusinessNo, &row.Operator, &nullTimePtrScan{&row.ExpireTime}, &variable,
 			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
 			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},

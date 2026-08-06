@@ -195,6 +195,27 @@ func (f *Facade) startAndExecute(args map[string]interface{}) (interface{}, erro
 	if err != nil {
 		return nil, err
 	}
+	// issues/56 E28：发起时抄送（f_ccActors）创建 cc 实例（对齐 Java enableCcActors 语义）
+	if cc, ok := flowArgs["f_ccActors"]; ok {
+		var actors []string
+		switch v := cc.(type) {
+		case []interface{}:
+			for _, a := range v {
+				actors = append(actors, fmt.Sprintf("%v", a))
+			}
+		case string:
+			for _, a := range strings.Split(v, ",") {
+				if a = strings.TrimSpace(a); a != "" {
+					actors = append(actors, a)
+				}
+			}
+		}
+		if len(actors) > 0 {
+			if err := f.repo.CreateCcInstance(context.Background(), inst.ID, operator, actors...); err != nil {
+				return nil, err
+			}
+		}
+	}
 	// startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
 	doing, err := f.repo.FindDoingTasks(context.Background(), inst.ID, nil)
 	if err != nil {
@@ -333,7 +354,7 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 	operator := toStr(args["operator"], "user1")
 	now := time.Now()
 	abandoned := inst.AbandonAllDoing(now)
-	inst.Reject(now)
+	inst.Withdraw(now) // issues/53 E25：撤回状态 Withdraw(30) 而非 Reject(45)
 	inst.UpdateUser = operator
 	for _, t := range abandoned {
 		if err := f.repo.UpdateTask(context.Background(), t); err != nil {
