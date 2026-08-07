@@ -1454,6 +1454,13 @@ func contentBytes(args map[string]interface{}) ([]byte, error) {
 		return v, nil
 	case string:
 		return []byte(v), nil
+	case map[string]interface{}, []interface{}:
+		// content 为对象（前端直接传 JSON 对象）：序列化为 JSON
+		bs, err := json.Marshal(v)
+		if err != nil {
+			return nil, errors.New("content 序列化失败")
+		}
+		return bs, nil
 	default:
 		return nil, errors.New("content 必须是字符串或字节数组")
 	}
