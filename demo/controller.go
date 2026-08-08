@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gogf/gf/v2/net/ghttp"
@@ -15,26 +17,48 @@ import (
 )
 
 type Controller struct {
-	repo   *memory.Repository // stats 等 demo 特有统计用
-	facade *facade.Facade     // /wf/** 统一门面转发（v1.5.0 重构）
+	mu     sync.RWMutex
+	repo   *memory.Repository      // stats 等 demo 特有统计用
+	ext    *memory.ExtRepository   // 扩展仓储（内存实现）：流程设计/历史/委托
+	facade *facade.Facade          // /wf/** 统一门面转发（v1.5.0 重构）
 }
 
 func New() *Controller {
-	repo := memory.New()
-	eng := engine.New(repo, &demoUserProvider{}, &demoIDGen{}, &demoExprEval{})
-	loadFlows(repo)
-	return &Controller{repo: repo, facade: facade.New(eng, repo, nil)}
+	c := &Controller{}
+	c.rebuild()
+	return c
 }
 
-// flow 门面转发：action 固定，body JSON 原样透传，返回 {code, msg, data}
-func (c *Controller) flow(action string) func(r *ghttp.Request) {
-	return func(r *ghttp.Request) {
-		body := map[string]interface{}{}
-		if b := r.GetBody(); len(b) > 0 {
-			_ = json.Unmarshal(b, &body)
-		}
-		r.Response.WriteJson(c.facade.Flow(action, body))
+// rebuild 组装引擎与门面（启动与 /api/reset 复用）：
+// 接入内存扩展仓储（design/surrogate 可用）+ 用户搜索/组织提供者（candidatePage 闭环）
+func (c *Controller) rebuild() {
+	repo := memory.New()
+	ext := memory.NewExt()
+	userProv := &demoUserProvider{}
+	eng := engine.New(repo, userProv, &demoIDGen{}, &demoExprEval{})
+	// 内置参与者 handler（部门领导/角色取人等，assignment-handler 流程依赖）
+	reg := engine.NewHandlerRegistry()
+	engine.RegisterBuiltinAssignments(reg, userProv, demoOrgProvider{})
+	eng.SetRegistry(reg)
+	loadFlows(repo)
+	c.repo, c.ext = repo, ext
+	c.facade = facade.New(eng, repo, ext).
+		SetUserSearch(demoUserSearch).
+		SetOrgUserProvider(demoOrgProvider{})
+}
+
+// flowAny 门面通配转发：POST /wf/{action}（action 多段，如 processDefine/page），
+// body JSON 原样透传，返回 {code, msg, data}。对齐 Java/Python/Node 的通配模式，40 action 全可达。
+func (c *Controller) flowAny(r *ghttp.Request) {
+	action := strings.TrimPrefix(r.URL.Path, "/wf/")
+	body := map[string]interface{}{}
+	if b := r.GetBody(); len(b) > 0 {
+		_ = json.Unmarshal(b, &body)
 	}
+	c.mu.RLock()
+	f := c.facade
+	c.mu.RUnlock()
+	r.Response.WriteJson(f.Flow(action, body))
 }
 
 func loadFlows(repo *memory.Repository) {
@@ -81,45 +105,51 @@ func loadFlows(repo *memory.Repository) {
 }
 
 func (c *Controller) RegisterRoutes(s *ghttp.Server) {
-	s.Group("/wf", func(g *ghttp.RouterGroup) {
-		g.POST("/processDefine/page", c.flow("processDefine/page"))
-		g.POST("/processDefine/detail", c.flow("processDefine/detail"))
-		g.POST("/processDefine/startAndExecute", c.flow("processDefine/startAndExecute"))
-		g.POST("/processInstance/startAndExecute", c.flow("processInstance/startAndExecute"))
-		g.POST("/processInstance/page", c.flow("processInstance/page"))
-		g.POST("/processInstance/detail", c.flow("processInstance/detail"))
-		g.POST("/processInstance/highLight", c.flow("processInstance/highLight"))
-		g.POST("/processInstance/approvalRecord", c.flow("processInstance/approvalRecord"))
-		g.POST("/processTask/todoList", c.flow("processTask/todoList"))
-		g.POST("/processTask/doneList", c.flow("processTask/doneList"))
-		g.POST("/processTask/execute", c.flow("processTask/execute"))
-		g.POST("/processTask/jumpAbleTaskNameList", c.flow("processTask/jumpAbleTaskNameList"))
-	})
+	s.BindHandler("POST:/wf/*action", c.flowAny)
+	s.BindHandler("GET:/healthz", c.healthz)
 	s.Group("/api", func(g *ghttp.RouterGroup) {
 		g.GET("/stats", c.stats)
+		g.POST("/reset", c.reset)
 	})
 }
 
 type M = map[string]interface{}
 
+// healthz 健康检查（四端对齐）
+func (c *Controller) healthz(r *ghttp.Request) {
+	r.Response.WriteJson(M{"status": "UP", "backend": "go"})
+}
+
+// stats 统计（四端统一口径：todoCount 按任务参与者，myInstanceCount 按 instance.operator）
 func (c *Controller) stats(r *ghttp.Request) {
 	userID := r.Get("userId", "user1").String()
+	c.mu.RLock()
+	repo := c.repo
+	c.mu.RUnlock()
 	count := 0
-	for _, t := range c.repo.AllTasks() {
+	for _, t := range repo.AllTasks() {
 		if t.TaskState == model.TaskStateDoing {
-			actors, _ := c.repo.FindTaskActors(r.Context(), t.ID)
+			actors, _ := repo.FindTaskActors(r.Context(), t.ID)
 			if contains(t.ActorIDs, userID) || contains(actors, userID) {
 				count++
 			}
 		}
 	}
 	instCount := 0
-	for _, inst := range c.repo.AllInstances() {
+	for _, inst := range repo.AllInstances() {
 		if inst.Operator == userID {
 			instCount++
 		}
 	}
 	r.Response.WriteJson(M{"code": 0, "msg": "成功", "data": M{"todoCount": count, "myInstanceCount": instCount}})
+}
+
+// reset 一键重置演示数据（对齐 Python /api/reset）：重建内存库与扩展仓储 + 重载种子流程定义
+func (c *Controller) reset(r *ghttp.Request) {
+	c.mu.Lock()
+	c.rebuild()
+	c.mu.Unlock()
+	r.Response.WriteJson(M{"code": 0, "msg": "成功", "data": nil})
 }
 
 func contains(slice []string, item string) bool {
@@ -129,12 +159,6 @@ func contains(slice []string, item string) bool {
 		}
 	}
 	return false
-}
-
-type demoUserProvider struct{}
-
-func (p *demoUserProvider) GetUser(userID string) (*model.UserInfo, error) {
-	return &model.UserInfo{UserID: userID, RealName: "用户" + userID}, nil
 }
 
 type demoIDGen struct{ n int64 }
