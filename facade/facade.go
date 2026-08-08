@@ -781,7 +781,9 @@ func (f *Facade) designRedeploy(args map[string]interface{}) (interface{}, error
 			DisplayName: flow.DisplayName,
 			Type:        flow.Type,
 			Content:     content,
-			UpdateUser:  toStr(args["operator"], "system"),
+			// issues/59：保留原 version（替换语义，不递增）；缺失时 JDBC 兜底会误写 1
+			Version:    last.Version,
+			UpdateUser: toStr(args["operator"], "system"),
 		}); err != nil {
 			return nil, err
 		}

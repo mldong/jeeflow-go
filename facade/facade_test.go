@@ -671,7 +671,7 @@ func TestMQueryParams(t *testing.T) {
 
 func TestDesignDeployRedeployIsDeployed(t *testing.T) {
 	// issues/08：部署/重新部署/设计稿变更的 is_deployed 状态同步
-	f, _, extRepo := setupFacade()
+	f, repo, extRepo := setupFacade()
 	content := string(flowContent(t, "01-simple.json"))
 
 	// 保存（含内容快照）→ 未部署
@@ -697,6 +697,7 @@ func TestDesignDeployRedeployIsDeployed(t *testing.T) {
 	if design.IsDeployed != 1 {
 		t.Fatalf("部署后应为已部署: %v", design.IsDeployed)
 	}
+	defAfterDeploy, _ := repo.FindDefineByID(nil, defineID)
 
 	// 重新部署 → 同一 defineId（内容替换，version 不变）+ is_deployed=1
 	r = f.Flow("processDesign/redeploy", map[string]interface{}{"id": designID, "operator": "zhangsan"})
@@ -705,6 +706,11 @@ func TestDesignDeployRedeployIsDeployed(t *testing.T) {
 	}
 	if got := mustI64(r["data"].(map[string]interface{})["processDefineId"]); got != defineID {
 		t.Fatalf("redeploy 应复用同一 defineId: %d != %d", got, defineID)
+	}
+	// issues/59：redeploy 是替换语义，version 必须保持（JDBC 仓储曾因未携带 version 兜底误写 1）
+	defAfterRedeploy, _ := repo.FindDefineByID(nil, defineID)
+	if defAfterRedeploy.Version != defAfterDeploy.Version {
+		t.Fatalf("redeploy 后 version 应不变: %d != %d", defAfterRedeploy.Version, defAfterDeploy.Version)
 	}
 	design, _ = extRepo.FindDesignByID(nil, designID)
 	if design.IsDeployed != 1 {
@@ -745,6 +751,23 @@ func TestDesignDeployRedeployIsDeployed(t *testing.T) {
 	design, _ = extRepo.FindDesignByID(nil, designID)
 	if design.IsDeployed != 1 {
 		t.Fatalf("再部署后应为已部署: %v", design.IsDeployed)
+	}
+
+	// issues/59 强回归：把定义 version 抬到 >0 后 redeploy 必须保持
+	// （修复前 facade 未携带 Version，memory 仓储整对象覆盖会把 version 打回 0，JDBC 兜底会误写 1）
+	defineID2 := mustI64(r["data"].(map[string]interface{})["processDefineId"])
+	defV1, _ := repo.FindDefineByID(nil, defineID2)
+	defV1.Version = 5
+	if err := repo.UpdateDefine(nil, defV1); err != nil {
+		t.Fatalf("抬 version 失败: %v", err)
+	}
+	r = f.Flow("processDesign/redeploy", map[string]interface{}{"id": designID, "operator": "zhangsan"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("redeploy(2): %v", r)
+	}
+	defV2, _ := repo.FindDefineByID(nil, defineID2)
+	if defV2.Version != 5 {
+		t.Fatalf("redeploy 后 version 应保持 5, got %d", defV2.Version)
 	}
 }
 
