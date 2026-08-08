@@ -1,0 +1,20 @@
+# jeeflow-go demo Docker 镜像
+# 构建阶段
+FROM golang:1.25-alpine AS builder
+WORKDIR /build
+# 国内网络环境使用 goproxy.cn 加速依赖下载
+ENV GOPROXY=https://goproxy.cn,direct
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /go-demo ./cmd/demo
+
+# 运行阶段
+FROM alpine:3.20
+RUN apk --no-cache add ca-certificates tzdata
+COPY --from=builder /go-demo /go-demo
+# 共享 flows 目录（loadFlows 硬编码相对路径候选链，须放到候选位置）
+WORKDIR /app
+COPY jeeflow-java/jeeflow-core/src/test/resources/flows /app/jeeflow-java/jeeflow-core/src/test/resources/flows
+EXPOSE 8081
+CMD ["/go-demo"]

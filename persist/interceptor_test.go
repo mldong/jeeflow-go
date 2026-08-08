@@ -13,6 +13,7 @@ import (
 	"github.com/mldong/jeeflow-go/engine"
 	"github.com/mldong/jeeflow-go/facade"
 	"github.com/mldong/jeeflow-go/memory"
+	"github.com/mldong/jeeflow-go/metadata"
 	"github.com/mldong/jeeflow-go/model"
 	"github.com/mldong/jeeflow-go/persist"
 )
@@ -605,6 +606,52 @@ func TestDefineLevelInterceptor(t *testing.T) {
 	db.QueryRow("SELECT COUNT(1) FROM biz_decl").Scan(&n)
 	if n != 1 {
 		t.Fatalf("未声明拦截器的流程不应落库: %d", n)
+	}
+}
+
+// ⑨.1 issues/60：定义级声明未注册 → 显式报错（不静默跳过）
+func TestDeclaredInterceptorMissingRegistry(t *testing.T) {
+	repo := memory.New()
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	eng.SetExtensions(&engine.Extensions{Interceptors: nil,
+		InterceptorRegistry: map[string]engine.FlowInterceptor{}})
+
+	content := fmt.Sprintf(`{"name": "ghost", "displayName": "幽灵拦截器", "type": "approval",
+		"relTableName": "biz_ghost", "persistMode": "SYNC", "postInterceptors": "com.xxx.GhostInterceptor",
+		"nodes": [{"id": "start", "type": "snaker:start", "properties": {}, "text": {"value": "开始"}},
+		          {"id": "finish", "type": "snaker:end", "properties": {}, "text": {"value": "结束"}}],
+		"edges": [{"id": "e0", "sourceNodeId": "start", "targetNodeId": "finish", "properties": {}}]}`)
+	def := &model.ProcessDefine{ID: 0, Name: "ghost", Type: "approval", State: 1, Version: 1, Content: []byte(content)}
+	repo.AddDefine(def)
+	_, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "user1",
+		map[string]interface{}{"f_title": "幽灵流程"})
+	if err == nil {
+		t.Fatalf("声明未注册的拦截器应显式报错")
+	}
+	if !strings.Contains(err.Error(), "未注册") {
+		t.Fatalf("错误应含未注册提示: %v", err)
+	}
+}
+
+// ⑪ issues/60：注册助手 RegisterMeta（字典 1 项 / 全名 / 显示名 / post 组 / 二次注册追加）
+func TestRegisterMeta(t *testing.T) {
+	reg := metadata.NewHandlerRegistry()
+	persist.RegisterMeta(reg)
+	metas := reg.ListHandlers("FlowInterceptor")
+	if len(metas) != 1 {
+		t.Fatalf("注册后 FlowInterceptor 应为 1 项: %d", len(metas))
+	}
+	m := metas[0]
+	if m.ClassName != "com.mldong.jeeflow.persist.interceptor.PersistPostInterceptor" {
+		t.Fatalf("className 应为全名: %s", m.ClassName)
+	}
+	if m.DisplayName != "业务数据自动入库" || m.Group != "post" || m.Order != 0 {
+		t.Fatalf("meta 不匹配: %+v", m)
+	}
+	// 二次注册追加（同名覆盖语义，与 Java 一致）
+	persist.RegisterMeta(reg)
+	if n := len(reg.ListHandlers("FlowInterceptor")); n != 2 {
+		t.Fatalf("二次注册应追加为 2 项: %d", n)
 	}
 }
 

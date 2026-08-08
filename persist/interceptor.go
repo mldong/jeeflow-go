@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/mldong/jeeflow-go/engine"
+	"github.com/mldong/jeeflow-go/metadata"
 	"github.com/mldong/jeeflow-go/model"
 )
 
@@ -301,4 +302,18 @@ func toInt(v interface{}) int {
 		}
 	}
 	return -1
+}
+
+// ─── 注册助手（issues/60）────────────────────────────────────────────────────
+
+// RegisterMeta 将 PersistPostInterceptor 元数据注册进处理器注册中心（SPI 字典源），
+// 集成方在实例组装处调用一次即可，保证"字典项 ⟺ 实例"同步（避免各端写死注册遗漏/名不一致）。
+func RegisterMeta(reg *metadata.HandlerRegistry) {
+	reg.Register(metadata.HandlerMeta{
+		Type:        "FlowInterceptor",
+		ClassName:   "com.mldong.jeeflow.persist.interceptor.PersistPostInterceptor",
+		DisplayName: "业务数据自动入库",
+		Order:       0,
+		Group:       "post",
+	})
 }

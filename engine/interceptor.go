@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -78,13 +79,17 @@ func (e *EngineImpl) SetExtensions(ext *Extensions) {
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 // interceptorCache 定义级拦截器解析缓存（issue 34，按 defineId）
-func (e *EngineImpl) resolveInterceptors(inst *model.ProcessInstance) []FlowInterceptor {
-	if e.ext == nil { return nil }
+// issues/60：解析与校验分离——声明中存在未注册名时返回显式错误（不静默跳过），
+// 且错误不写缓存，保证后续执行持续报错直至注册补齐。
+func (e *EngineImpl) resolveInterceptors(inst *model.ProcessInstance) ([]FlowInterceptor, error) {
+	if e.ext == nil {
+		return nil, nil
+	}
 	if inst == nil || inst.DefineID == 0 {
-		return e.ext.Interceptors
+		return e.ext.Interceptors, nil
 	}
 	if cached, ok := e.interceptorCache[inst.DefineID]; ok {
-		return cached
+		return cached, nil
 	}
 	list := e.ext.Interceptors
 	if def, err := e.repo.FindDefineByID(context.Background(), inst.DefineID); err == nil && def != nil {
@@ -96,7 +101,9 @@ func (e *EngineImpl) resolveInterceptors(inst *model.ProcessInstance) []FlowInte
 			for _, name := range strings.Split(meta.PostInterceptors, ",") {
 				name = strings.TrimSpace(name)
 				if name != "" {
-					if ic, ok := e.ext.InterceptorRegistry[name]; ok {
+					if ic, ok := e.ext.InterceptorRegistry[name]; !ok {
+						return nil, fmt.Errorf("postInterceptors 声明的拦截器未注册: %s", name)
+					} else {
 						list = append(list, ic)
 					}
 				}
@@ -104,24 +111,39 @@ func (e *EngineImpl) resolveInterceptors(inst *model.ProcessInstance) []FlowInte
 		}
 	}
 	e.interceptorCache[inst.DefineID] = list
-	return list
+	return list, nil
 }
 
 // firePreInterceptors 执行前置拦截器
-func (e *EngineImpl) firePreInterceptors(node *model.FlowNode, inst *model.ProcessInstance) bool {
-	if e.ext == nil { return true }
-	for _, ic := range e.resolveInterceptors(inst) {
-		if !ic.PreHandle(node, inst) { return false }
+func (e *EngineImpl) firePreInterceptors(node *model.FlowNode, inst *model.ProcessInstance) (bool, error) {
+	if e.ext == nil {
+		return true, nil
 	}
-	return true
+	list, err := e.resolveInterceptors(inst)
+	if err != nil {
+		return false, err
+	}
+	for _, ic := range list {
+		if !ic.PreHandle(node, inst) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // firePostInterceptors 执行后置拦截器
-func (e *EngineImpl) firePostInterceptors(node *model.FlowNode, inst *model.ProcessInstance) {
-	if e.ext == nil { return }
-	for _, ic := range e.resolveInterceptors(inst) {
+func (e *EngineImpl) firePostInterceptors(node *model.FlowNode, inst *model.ProcessInstance) error {
+	if e.ext == nil {
+		return nil
+	}
+	list, err := e.resolveInterceptors(inst)
+	if err != nil {
+		return err
+	}
+	for _, ic := range list {
 		ic.PostHandle(node, inst)
 	}
+	return nil
 }
 
 // fireEvent 发布事件

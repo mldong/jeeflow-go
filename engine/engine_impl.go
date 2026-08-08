@@ -63,7 +63,10 @@ func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int6
 		return nil, fmt.Errorf("no start node")
 	}
 	for _, node := range followEdges(&flow, startNode.ID) {
-		e.executeNode(ctx, &flow, inst, node, operator, vars)
+		// issues/60：executeNode 错误（拦截器解析等）必须传播，不静默吞掉
+		if err := e.executeNode(ctx, &flow, inst, node, operator, vars); err != nil {
+			return nil, err
+		}
 	}
 	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
 	return inst, nil
@@ -107,7 +110,10 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 	if curNode != nil {
 		// 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
 		// createTask 触发的同节点 PostHandle 幂等一致（同一节点同一次执行仅更新一次）
-		e.firePostInterceptors(curNode, inst)
+		// issues/60：声明未解析 → 显式报错（不静默跳过）
+		if err := e.firePostInterceptors(curNode, inst); err != nil {
+			return nil, err
+		}
 		ct, _ := stringFromProps(curNode.Properties, "countersignType")
 		if ct == "SEQUENTIAL" {
 			doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
@@ -271,24 +277,38 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 	if node.Type == model.TypeTask || node.Type == model.TypeCustom {
 		return e.createTask(ctx, node, inst, operator, vars)
 	}
-	if !e.firePreInterceptors(node, inst) {
+	// issues/60：声明未解析 → 显式报错（不静默跳过）
+	proceed, err := e.firePreInterceptors(node, inst)
+	if err != nil {
+		return err
+	}
+	if !proceed {
 		return nil
 	}
-	defer e.firePostInterceptors(node, inst)
+	defer func() {
+		// 错误理论不可达：resolve 已由上方 firePre 校验并缓存（同 inst/DefineID）
+		_ = e.firePostInterceptors(node, inst)
+	}()
 
 	switch node.Type {
 	case model.TypeDecision:
 		return e.evaluateDecision(ctx, flow, inst, node, operator, vars)
 	case model.TypeFork:
 		for _, n := range followEdges(flow, node.ID) {
-			e.executeNode(ctx, flow, inst, n, operator, vars)
+			// issues/60：错误传播（拦截器解析等）
+			if err := e.executeNode(ctx, flow, inst, n, operator, vars); err != nil {
+				return err
+			}
 		}
 		return nil
 	case model.TypeJoin:
 		doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
 		if len(doing) == 0 {
 			for _, n := range followEdges(flow, node.ID) {
-				e.executeNode(ctx, flow, inst, n, operator, vars)
+				// issues/60：错误传播（拦截器解析等）
+				if err := e.executeNode(ctx, flow, inst, n, operator, vars); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
