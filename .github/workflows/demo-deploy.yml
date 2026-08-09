@@ -1,0 +1,48 @@
+name: Demo Deploy
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy Go demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: true
+      - name: Build demo binary
+        run: CGO_ENABLED=0 go build -o go-demo ./cmd/demo
+      - name: Build Docker image
+        run: |
+          cat > Dockerfile.ci << 'EOF'
+          FROM alpine:3.20
+          RUN apk --no-cache add ca-certificates tzdata
+          COPY go-demo /go-demo
+          EXPOSE 8081
+          CMD ["/go-demo"]
+          EOF
+          docker build -f Dockerfile.ci -t jeeflow-go-demo:latest .
+      - name: Export image
+        run: docker save jeeflow-go-demo:latest -o jeeflow-go-demo.tar
+      - name: Upload to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: jeeflow-go-demo.tar
+          target: /java_projects/jeeflow/demo/
+      - name: Load image and restart
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd /java_projects/jeeflow/demo
+            docker load -i jeeflow-go-demo.tar
+            docker-compose up -d jeeflow-go-demo
+            rm -f jeeflow-go-demo.tar
+            echo "✅ Go demo deployed"
