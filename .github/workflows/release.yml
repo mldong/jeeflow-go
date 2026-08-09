@@ -28,7 +28,9 @@ jobs:
           cache: true
 
       - name: Run tests
-        run: go test ./... -v
+        run: |
+          # 跳过 jdbc 测试（需要 MySQL，CI 无法访问）
+          go test $(go list ./... | grep -v '/repository/jdbc') -v
         working-directory: jeeflow-go
 
   verify:
