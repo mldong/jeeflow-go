@@ -9,13 +9,27 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Checkout jeeflow-java（测试依赖共享流程 JSON）
+      - name: Checkout jeeflow-java
+        uses: actions/checkout@v4
+        with:
+          repository: mldong/jeeflow-java
+          path: jeeflow-java
+
+      # Checkout jeeflow-go
+      - name: Checkout jeeflow-go
+        uses: actions/checkout@v4
+        with:
+          path: jeeflow-go
+
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
           cache: true
+
       - name: Run tests
         run: go test ./... -v
+        working-directory: jeeflow-go
 
   verify:
     name: Verify Go module
