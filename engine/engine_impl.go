@@ -51,6 +51,7 @@ func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int6
 	}
 	vars := mergeVars(args, nil)
 	e.addUserInfo(operator, vars)
+	e.addAutoGenTitle(def.DisplayName, vars)
 
 	now := time.Now()
 	// 聚合根工厂创建实例
@@ -560,6 +561,12 @@ func (e *EngineImpl) addUserInfo(operator string, vars map[string]interface{}) {
 	if u.PostName != "" {
 		vars[KeyPostName] = u.PostName
 	}
+}
+
+func (e *EngineImpl) addAutoGenTitle(displayName string, vars map[string]interface{}) {
+	realName, _ := vars[KeyRealName].(string)
+	title := fmt.Sprintf("%s的%s-%s", realName, displayName, time.Now().Format("2006-01-02 15:04"))
+	vars[KeyAutoGenTitle] = title
 }
 
 func (e *EngineImpl) nextID() int64 {

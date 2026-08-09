@@ -86,6 +86,10 @@ func Test01SimpleFlow(t *testing.T) {
 	eng, repo := setup()
 	def := registerFlow(repo, "01-simple.json")
 	inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
+	// issue 29：autoGenTitle 自动生成验证
+	if title, ok := inst.Variables[engine.KeyAutoGenTitle].(string); !ok || title == "" {
+		t.Fatalf("autoGenTitle should be set in instance variables, got: %v", inst.Variables[engine.KeyAutoGenTitle])
+	}
 	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
 	if len(doing) != 1 || doing[0].TaskName != "task1" {
 		t.Fatal("expected task1")
