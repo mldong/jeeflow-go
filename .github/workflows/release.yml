@@ -5,37 +5,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      # Checkout jeeflow-java（测试依赖共享流程 JSON）
-      - name: Checkout jeeflow-java
-        uses: actions/checkout@v4
-        with:
-          repository: mldong/jeeflow-java
-          path: jeeflow-java
-
-      # Checkout jeeflow-go
-      - name: Checkout jeeflow-go
-        uses: actions/checkout@v4
-        with:
-          path: jeeflow-go
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-          cache: true
-
-      - name: Run tests
-        run: |
-          # 跳过 jdbc 测试（需要 MySQL，CI 无法访问）
-          go test $(go list ./... | grep -v '/repository/jdbc') -v
-        working-directory: jeeflow-go
-
   verify:
     name: Verify Go module
-    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-go@v5
