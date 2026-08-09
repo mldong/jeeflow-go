@@ -1,5 +1,7 @@
 name: Demo Deploy
 on:
+  push:
+    tags: ['v*.*.*']
   workflow_dispatch:
 
 jobs:
