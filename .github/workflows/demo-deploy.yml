@@ -27,7 +27,9 @@ jobs:
           EOF
           docker build -f Dockerfile.ci -t jeeflow-go-demo:latest .
       - name: Export image
-        run: docker save jeeflow-go-demo:latest -o jeeflow-go-demo.tar
+        run: |
+          docker save jeeflow-go-demo:latest -o jeeflow-go-demo.tar
+          chmod 644 jeeflow-go-demo.tar
       - name: Upload to server
         uses: appleboy/scp-action@v0.1.7
         with:
@@ -45,6 +47,8 @@ jobs:
           script: |
             cd /java_projects/jeeflow/demo
             docker load -i jeeflow-go-demo.tar
-            docker-compose up -d jeeflow-go-demo
+            # Stop and remove old container if exists
+            docker stop jeeflow-go-demo 2>/dev/null && docker rm jeeflow-go-demo 2>/dev/null || true
+            docker run -d --name jeeflow-go-demo --restart always -p 16081:8081 jeeflow-go-demo:latest
             rm -f jeeflow-go-demo.tar
-            echo "✅ Go demo deployed"
+            echo "✅ Go demo deployed (port 16081->8081)"
