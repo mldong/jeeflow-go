@@ -301,6 +301,19 @@ func TestFacadeViewEndpoints(t *testing.T) {
 	if exec, _ := r["data"].(map[string]interface{})["executable"].(bool); !exec {
 		t.Fatalf("taskDetail executable should be true")
 	}
+	// issues/62：taskModel 补 form/ext（字段权限）
+	dData := r["data"].(map[string]interface{})
+	tm, _ := dData["taskModel"].(map[string]interface{})
+	if tm["form"] != "leave-form" {
+		t.Fatalf("taskModel.form = %v, want leave-form", tm["form"])
+	}
+	ext, _ := tm["ext"].(map[string]interface{})
+	if ext["PERMISSION_f_leaveType"] != float64(1) {
+		t.Fatalf("taskModel.ext.PERMISSION_f_leaveType = %v, want 1", ext["PERMISSION_f_leaveType"])
+	}
+	if ext["PERMISSION_days"] != float64(2) {
+		t.Fatalf("taskModel.ext.PERMISSION_days = %v, want 2", ext["PERMISSION_days"])
+	}
 
 	r = f.Flow("processTask/latest", map[string]interface{}{"processInstanceId": instanceID})
 	if code, _ := r["code"].(int); code != 0 {

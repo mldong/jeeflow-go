@@ -1238,9 +1238,17 @@ func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 			if json.Unmarshal(def.Content, &flow) == nil {
 				for _, n := range flow.Nodes {
 					if n.ID == task.TaskName {
-						vo["taskModel"] = map[string]interface{}{
+						tm := map[string]interface{}{
 							"name": n.ID, "displayName": n.Text.Value, "type": n.Type,
 						}
+						// issues/62：taskModel 补 form/ext（节点字段权限，对齐 boot2）
+						if v, ok := n.Properties["form"]; ok {
+							tm["form"] = v
+						}
+						if v, ok := n.Properties["field"]; ok {
+							tm["ext"] = v
+						}
+						vo["taskModel"] = tm
 						break
 					}
 				}

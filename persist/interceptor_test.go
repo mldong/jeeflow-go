@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -302,6 +303,9 @@ func registerSyncFlow(repo *memory.Repository, tableName string) *model.ProcessD
 		panic(err.Error())
 	}
 	content := string(data)
+	// issues/62：共享 flow 自带 field（PERMISSION_*）→ 先移除，避免与下方注入重复键（Go JSON 后者覆盖前者）
+	fieldRe := regexp.MustCompile(`,\s*"field":\s*\{[^}]*\}`)
+	content = fieldRe.ReplaceAllString(content, "")
 	content = strings.ReplaceAll(content, `"type": "approval"`,
 		`"type": "approval", "relTableName": "`+tableName+`", "persistMode": "SYNC"`)
 	content = strings.ReplaceAll(content, `"assignee": "leader"`,
