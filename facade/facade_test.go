@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -679,6 +680,40 @@ func TestMQueryParams(t *testing.T) {
 	r = f.Flow("processDesign/page", map[string]interface{}{"m_LIKE_name": "leave"})
 	if got := reflect.ValueOf(r["data"].(map[string]interface{})["rows"]).Len(); got != 1 {
 		t.Fatalf("design m_LIKE_name 应命中 1 行, got %d: %v", got, r)
+	}
+}
+
+// ═══ processDesign/page 时间格式（issues/63）═══
+
+func TestDesignPageTimeFormat(t *testing.T) {
+	f, _, _ := setupFacade()
+	r := f.Flow("processDesign/save", map[string]interface{}{
+		"name": "time-fmt-test", "displayName": "时间格式测试", "operator": "zhangsan",
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("design save failed: %v", r)
+	}
+
+	r = f.Flow("processDesign/page", map[string]interface{}{"pageNum": 1, "pageSize": 100})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("design page failed: %v", r)
+	}
+	rows := r["data"].(map[string]interface{})["rows"].([]interface{})
+	if len(rows) == 0 {
+		t.Fatal("design page should return at least 1 row")
+	}
+	timeRe := regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$`)
+	for i, row := range rows {
+		m := row.(map[string]interface{})
+		for _, field := range []string{"createTime", "updateTime"} {
+			v, ok := m[field].(string)
+			if !ok {
+				t.Fatalf("row[%d].%s should be string, got %T: %v", i, field, m[field], m[field])
+			}
+			if !timeRe.MatchString(v) {
+				t.Fatalf("row[%d].%s = %q should match yyyy-MM-dd HH:mm:ss", i, field, v)
+			}
+		}
 	}
 }
 

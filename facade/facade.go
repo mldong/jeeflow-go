@@ -417,7 +417,11 @@ func (f *Facade) designPage(args map[string]interface{}) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pageData(query.PageNum, query.PageSize, total, rows), nil
+	out := make([]map[string]interface{}, len(rows))
+	for i, r := range rows {
+		out[i] = designRowToMap(r)
+	}
+	return pageData(query.PageNum, query.PageSize, total, out), nil
 }
 
 func (f *Facade) designDetail(args map[string]interface{}) (interface{}, error) {
@@ -1884,6 +1888,16 @@ func defineRowToMap(r *model.DefineRow) map[string]interface{} {
 	return map[string]interface{}{
 		"id": r.ID, "name": r.Name, "displayName": r.DisplayName, "type": r.Type,
 		"state": r.State, "version": r.Version,
+		"createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
+		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
+	}
+}
+
+// designRowToMap 设计行：时间格式化（issues/63）
+func designRowToMap(r *model.ProcessDesign) map[string]interface{} {
+	return map[string]interface{}{
+		"id": r.ID, "name": r.Name, "displayName": r.DisplayName,
+		"type": r.Type, "icon": r.Icon, "isDeployed": r.IsDeployed, "remark": r.Remark,
 		"createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
 		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
 	}
