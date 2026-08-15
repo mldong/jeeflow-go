@@ -1,6 +1,6 @@
 # Go 演示站（Demo）
 
-> 演示站是运行在 :8081 的 GoFrame 应用（内存仓储 + 10 个示例流程），对接 jeeflow-ui 体验完整流程。SDK 集成方式见 [快速开始](./getting-started.md)。
+> 演示站是运行在 :8081 的 GoFrame 应用（内存仓储 + 14 个示例流程），对接 jeeflow-ui 体验完整流程。SDK 集成方式见 [快速开始](./getting-started.md)。
 
 ## 环境要求
 
@@ -16,7 +16,7 @@ go build -o demo.exe ./cmd/demo
 # → http://localhost:8081
 ```
 
-> 演示站从 `jeeflow-java` 的共享流程 JSON 加载 10 个示例流程（候选路径链兼容不同启动目录）。对接 jeeflow-ui（:5173）时右上角切到 `🔷 Go :8081`；接口规范见[统一门面接口文档](../../spec/06-facade)。
+> 演示站从 `jeeflow-java` 的共享流程 JSON 加载 14 个示例流程（候选路径链兼容不同启动目录）。对接 jeeflow-ui（:5173）时右上角切到 `🔷 Go :8081`；接口规范见[统一门面接口文档](../../spec/06-facade)。
 
 > v1.5.0 起 `/wf/**` 为**单入口门面转发**（`JeeflowFacade.flow(action, body)`，URL 路径段即 action）——
 > 集成方 controller 一行转发即可复用全部流程能力，参数与返回结构不变。
