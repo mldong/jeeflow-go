@@ -61,7 +61,7 @@ func (r *JdbcTableReader) QueryList(tableName, whereColumn string, value interfa
 		}
 		row := make(map[string]interface{}, len(cols))
 		for i, c := range cols {
-			row[c] = vals[i]
+			row[c] = decodeDriverValue(vals[i])
 		}
 		result = append(result, row)
 	}
@@ -206,4 +206,18 @@ func (r *MetaTableReader) readSubTable(parentMeta *TableMeta, f *FieldMeta, row 
 		}
 	}
 	return result, nil
+}
+
+// decodeDriverValue 把 database/sql Scan 进 interface{} 的 []byte（MySQL VARCHAR/DECIMAL）
+// 转成 string，避免 encoding/json 编成 Base64（issues/65）。
+// 扫描 NULL 是无类型 nil，原样返回；[]byte(nil) 也当 nil。
+func decodeDriverValue(v interface{}) interface{} {
+	b, ok := v.([]byte)
+	if !ok {
+		return v
+	}
+	if b == nil {
+		return nil
+	}
+	return string(b)
 }
