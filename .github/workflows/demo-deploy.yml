@@ -14,6 +14,12 @@ jobs:
         with:
           go-version: '1.25'
           cache: true
+      # Go demo 依赖共享流程 JSON，需 checkout jeeflow-java（对齐 Node/Python/PHP 的做法）
+      - name: Checkout jeeflow-java
+        uses: actions/checkout@v4
+        with:
+          repository: mldong/jeeflow-java
+          path: jeeflow-java
       - name: Build demo binary
         run: CGO_ENABLED=0 go build -o go-demo ./cmd/demo
       - name: Build Docker image
@@ -22,6 +28,7 @@ jobs:
           FROM alpine:3.20
           RUN apk --no-cache add ca-certificates tzdata
           COPY go-demo /go-demo
+          COPY jeeflow-java/jeeflow-core/src/test/resources/flows /jeeflow-java/jeeflow-core/src/test/resources/flows
           EXPOSE 8081
           CMD ["/go-demo"]
           EOF

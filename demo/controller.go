@@ -62,13 +62,17 @@ func (c *Controller) flowAny(r *ghttp.Request) {
 }
 
 func loadFlows(repo *memory.Repository) {
-	// 候选路径链：兼容不同启动目录（go run cmd/demo / go run . / 仓库根）
-	candidates := []string{
+	// 候选路径链：优先环境变量 JEEFLOW_FLOWS_DIR（容器部署挂载），再兼容不同启动目录
+	candidates := []string{}
+	if dir := os.Getenv("JEEFLOW_FLOWS_DIR"); dir != "" {
+		candidates = append(candidates, dir)
+	}
+	candidates = append(candidates,
 		filepath.Join("..", "jeeflow-java", "jeeflow-core", "src", "test", "resources", "flows"),
 		filepath.Join("..", "..", "..", "jeeflow-java", "jeeflow-core", "src", "test", "resources", "flows"),
 		filepath.Join("jeeflow-java", "jeeflow-core", "src", "test", "resources", "flows"),
 		filepath.Join("jeeflow-hub", "jeeflow-java", "jeeflow-core", "src", "test", "resources", "flows"),
-	}
+	)
 	var flowsDir string
 	var entries []os.DirEntry
 	var err error
