@@ -50,7 +50,7 @@ func (h *OperatorAssignmentHandler) Assign(node *model.FlowNode, inst *model.Pro
 }
 
 // FormFieldAssigneeHandler 按表单字段值分配参与者：
-// 精确匹配 node.ID → vars 字段；node.ID 以 _数字 结尾时去后缀再匹配。
+// issues/48：f_ 前缀优先 → 裸名回落 → _数字 后缀去后缀再匹配。
 // 字段值支持逗号分隔字符串 / []string / []interface{}。
 type FormFieldAssigneeHandler struct{}
 
@@ -170,11 +170,17 @@ func RegisterBuiltinAssignments(reg *HandlerRegistry, userProv spi.UserProvider,
 
 // ─── 工具 ───────────────────────────────────────────────────────────────────────
 
-// findFieldValue 精确匹配 + 编号后缀匹配
+// findFieldValue issues/48：f_ 前缀优先 → 裸名回落 → 编号后缀去后缀匹配裸名
 func findFieldValue(vars map[string]interface{}, fieldName string) interface{} {
+	// 1) f_ 前缀优先（表单字段变量为 f_approver）
+	if v, ok := vars["f_"+fieldName]; ok {
+		return v
+	}
+	// 2) 裸名回落（兼容存量）
 	if v, ok := vars[fieldName]; ok {
 		return v
 	}
+	// 3) _NN 后缀匹配（task_01 → task，仅查裸名）
 	m := numberSuffixPattern.FindStringSubmatch(fieldName)
 	if len(m) == 2 {
 		if v, ok := vars[m[1]]; ok {

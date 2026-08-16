@@ -508,3 +508,37 @@ func Test12BuiltinAssignmentHandlers(t *testing.T) {
 		t.Fatalf("want finished, got %v", reloaded.State)
 	}
 }
+
+func Test13FormFieldAssigneeFPrefix(t *testing.T) {
+	repo := memory.New()
+	reg := engine.NewHandlerRegistry()
+	engine.RegisterBuiltinAssignments(reg, &testUserProv{}, &testOrgUserProv{})
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	eng.SetRegistry(reg)
+
+	def := registerFlow(repo, "11-assignment-handler.json")
+
+	// ① f_ 前缀变量（前端表单提交格式）
+	inst, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "user1",
+		map[string]interface{}{"f_task1": "userA,userB"})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(doing) != 1 || doing[0].TaskName != "task1" {
+		t.Fatalf("want task1, got %+v", doing)
+	}
+	if len(doing[0].ActorIDs) != 2 || doing[0].ActorIDs[0] != "userA" || doing[0].ActorIDs[1] != "userB" {
+		t.Fatalf("① f_ prefix actors: %v", doing[0].ActorIDs)
+	}
+	repo.AddTaskActor(context.Background(), doing[0].ID, doing[0].ActorIDs)
+	eng.ExecuteProcessTask(context.Background(), doing[0].ID, "userA", nil)
+
+	// ② f_ 前缀优先于裸名（两者同时存在时 f_ 命中）
+	inst2, _ := eng.StartProcessInstanceByID(context.Background(), def.ID, "user1",
+		map[string]interface{}{"f_task1": "userX", "task1": "userY"})
+	doing2, _ := repo.FindDoingTasks(context.Background(), inst2.ID, nil)
+	if len(doing2[0].ActorIDs) != 1 || doing2[0].ActorIDs[0] != "userX" {
+		t.Fatalf("② f_ priority actors: %v", doing2[0].ActorIDs)
+	}
+}
