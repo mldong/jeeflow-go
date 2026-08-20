@@ -137,6 +137,10 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 		data, err = f.surrogatePage(args)
 	case "processSurrogate/save":
 		data, err = f.surrogateSave(args)
+	case "processSurrogate/update":
+		data, err = f.surrogateUpdate(args) // issues/77
+	case "processSurrogate/detail":
+		data, err = f.surrogateDetail(args) // issues/77
 	case "processSurrogate/remove":
 		err = f.surrogateRemove(args)
 	case "processDefine/getLastByName":
@@ -813,7 +817,11 @@ func (f *Facade) surrogatePage(args map[string]interface{}) (interface{}, error)
 	if err != nil {
 		return nil, err
 	}
-	return pageData(query.PageNum, query.PageSize, total, rows), nil
+	out := make([]map[string]interface{}, len(rows))
+	for i, r := range rows {
+		out[i] = surrogateRowToMap(r)
+	}
+	return pageData(query.PageNum, query.PageSize, total, out), nil
 }
 
 func (f *Facade) surrogateSave(args map[string]interface{}) (interface{}, error) {
@@ -824,43 +832,98 @@ func (f *Facade) surrogateSave(args map[string]interface{}) (interface{}, error)
 	var err error
 	if id == 0 {
 		surrogate = &model.ProcessSurrogate{
-			Operator:    operator, // 授权人 = 操作人
-			Surrogate:   toStr(args["surrogate"], ""),
-			ProcessName: toStr(args["processName"], ""),
-			CreateUser:  operator,
-			UpdateUser:  operator,
+			Operator:   operator, // 授权人 = 操作人（新建必有）
+			CreateUser: operator,
+			UpdateUser: operator,
 		}
-		if v, ok := args["startTime"].(string); ok && v != "" {
-			if t, perr := time.Parse("2006-01-02T15:04:05", v); perr == nil {
-				surrogate.StartTime = &t
-			}
-		}
-		if v, ok := args["endTime"].(string); ok && v != "" {
-			if t, perr := time.Parse("2006-01-02T15:04:05", v); perr == nil {
-				surrogate.EndTime = &t
-			}
-		}
-		surrogate.Enabled = toIntDef(args["enabled"], 1)
+		applySurrogateFields(surrogate, args, operator)
 		err = ext.SaveSurrogate(context.Background(), surrogate)
 	} else {
 		surrogate, err = ext.FindSurrogateByID(context.Background(), id)
 		if err != nil || surrogate == nil {
 			return nil, errors.New("委托记录不存在")
 		}
-		surrogate.Surrogate = toStr(args["surrogate"], surrogate.Surrogate)
-		if v, ok := args["processName"]; ok {
-			surrogate.ProcessName = toStr(v, "")
-		}
-		if v, ok := args["enabled"]; ok {
-			surrogate.Enabled = toIntDef(v, 1)
-		}
-		surrogate.UpdateUser = operator
+		applySurrogateFields(surrogate, args, operator)
 		err = ext.UpdateSurrogate(context.Background(), surrogate)
 	}
 	if err != nil {
 		return nil, err
 	}
 	return map[string]interface{}{"id": surrogate.ID}, nil
+}
+
+// surrogateUpdate 委托更新（issues/77）：按 id 全字段更新，id 不存在报错
+func (f *Facade) surrogateUpdate(args map[string]interface{}) (interface{}, error) {
+	ext := f.ext()
+	id, err := toInt64(args["id"])
+	if err != nil {
+		return nil, fmt.Errorf("id 缺失或非法: %v", err)
+	}
+	surrogate, err := ext.FindSurrogateByID(context.Background(), id)
+	if err != nil || surrogate == nil {
+		return nil, errors.New("委托记录不存在")
+	}
+	operator := toStr(args["operator"], "user1")
+	applySurrogateFields(surrogate, args, operator)
+	err = ext.UpdateSurrogate(context.Background(), surrogate)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{"id": surrogate.ID}, nil
+}
+
+// surrogateDetail 委托详情（issues/77）：按 id 查单条，返回行结构（时间格式化）
+func (f *Facade) surrogateDetail(args map[string]interface{}) (interface{}, error) {
+	id, err := toInt64(args["id"])
+	if err != nil {
+		return nil, fmt.Errorf("id 缺失或非法: %v", err)
+	}
+	surrogate, err := f.ext().FindSurrogateByID(context.Background(), id)
+	if err != nil || surrogate == nil {
+		return nil, errors.New("委托记录不存在")
+	}
+	return surrogateRowToMap(surrogate), nil
+}
+
+// applySurrogateFields 委托写入公共字段。授权人（operator）仅在显式传入时覆盖，
+// 避免 update 时清空原授权人（前端编辑表单不带 operator；集成层注入时 operator=授权人，覆盖无害）
+func applySurrogateFields(s *model.ProcessSurrogate, args map[string]interface{}, operator string) {
+	s.ProcessName = toStr(args["processName"], "")
+	if v, ok := args["operator"]; ok {
+		s.Operator = toStr(v, "")
+	}
+	s.Surrogate = toStr(args["surrogate"], "")
+	s.StartTime = parseSurrogateTime(args["startTime"])
+	s.EndTime = parseSurrogateTime(args["endTime"])
+	s.Enabled = toIntDef(args["enabled"], 1)
+	s.UpdateUser = operator
+}
+
+// parseSurrogateTime 解析委托时间入参：兼容 yyyy-MM-dd HH:mm:ss（前端 RangePicker/SPEC 契约）
+// 与 ISO T（issues/77）
+func parseSurrogateTime(v interface{}) *time.Time {
+	str, ok := v.(string)
+	if !ok || strings.TrimSpace(str) == "" {
+		return nil
+	}
+	str = strings.TrimSpace(str)
+	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02T15:04:05"} {
+		if t, perr := time.Parse(layout, str); perr == nil {
+			return &t
+		}
+	}
+	return nil
+}
+
+// surrogateRowToMap 委托行：时间格式化（issues/77，对齐 designRowToMap / SPEC）
+func surrogateRowToMap(s *model.ProcessSurrogate) map[string]interface{} {
+	return map[string]interface{}{
+		"id": s.ID, "processName": s.ProcessName, "operator": s.Operator, "surrogate": s.Surrogate,
+		"startTime": fmtTime(s.StartTime), "endTime": fmtTime(s.EndTime),
+		"enabled": s.Enabled,
+		"createTime": fmtTimeV(s.CreateTime), "createUser": s.CreateUser,
+		"updateTime": fmtTimeV(s.UpdateTime), "updateUser": s.UpdateUser,
+	}
 }
 
 func (f *Facade) surrogateRemove(args map[string]interface{}) error {

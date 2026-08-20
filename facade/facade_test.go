@@ -251,6 +251,80 @@ func TestFacadeDesignAndSurrogate(t *testing.T) {
 	}
 }
 
+// TestFacadeSurrogateDetailAndUpdate issues/77：委托编辑链路
+// save（前端空格格式时间窗）→ detail 回显 → update 改字段 → detail 再回显 + 负向 id 不存在
+func TestFacadeSurrogateDetailAndUpdate(t *testing.T) {
+	f, _, extRepo := setupFacade()
+
+	// 新增（带时间窗，前端 RangePicker 实际提交的 yyyy-MM-dd HH:mm:ss 空格格式）
+	r := f.Flow("processSurrogate/save", map[string]interface{}{
+		"operator": "zhangsan", "surrogate": "lisi", "processName": "leave",
+		"startTime": "2026-08-01 00:00:00", "endTime": "2026-08-31 23:59:59", "enabled": 1,
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("surrogate save failed: %v", r)
+	}
+	surrogateID := mustI64(r["data"].(map[string]interface{})["id"])
+
+	// detail 回显：行结构齐全 + 时间格式化
+	r = f.Flow("processSurrogate/detail", map[string]interface{}{"id": surrogateID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("surrogate detail failed: %v", r)
+	}
+	d := r["data"].(map[string]interface{})
+	if d["processName"] != "leave" || d["operator"] != "zhangsan" || d["surrogate"] != "lisi" {
+		t.Fatalf("detail fields = %+v", d)
+	}
+	if d["startTime"] != "2026-08-01 00:00:00" || d["endTime"] != "2026-08-31 23:59:59" {
+		t.Fatalf("detail time window = %v / %v", d["startTime"], d["endTime"])
+	}
+
+	// update：改代理人/时间窗/启用状态（不带 operator，授权人应保留）
+	r = f.Flow("processSurrogate/update", map[string]interface{}{
+		"id": surrogateID, "surrogate": "wangwu", "processName": "leave",
+		"startTime": "2026-09-01 00:00:00", "endTime": "2026-09-30 23:59:59", "enabled": 0,
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("surrogate update failed: %v", r)
+	}
+	if got := mustI64(r["data"].(map[string]interface{})["id"]); got != surrogateID {
+		t.Fatalf("update id = %d, want %d", got, surrogateID)
+	}
+
+	// detail 再回显：变更生效 + 授权人未被清空
+	r = f.Flow("processSurrogate/detail", map[string]interface{}{"id": surrogateID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("surrogate detail(after update) failed: %v", r)
+	}
+	d = r["data"].(map[string]interface{})
+	if d["surrogate"] != "wangwu" || d["operator"] != "zhangsan" || d["enabled"] != 0 {
+		t.Fatalf("detail after update = %+v", d)
+	}
+	if d["startTime"] != "2026-09-01 00:00:00" || d["endTime"] != "2026-09-30 23:59:59" {
+		t.Fatalf("detail after update time window = %v / %v", d["startTime"], d["endTime"])
+	}
+	// 仓储侧同步（update 真的写了）
+	s, _ := extRepo.FindSurrogateByID(context.Background(), surrogateID)
+	if s == nil || s.Surrogate != "wangwu" || s.Enabled != 0 {
+		t.Fatalf("repo surrogate after update = %+v", s)
+	}
+
+	// 负向：id 不存在
+	r = f.Flow("processSurrogate/detail", map[string]interface{}{"id": int64(99999)})
+	if code, _ := r["code"].(int); code != 99999999 {
+		t.Fatalf("detail missing id should be 99999999, got %v", r)
+	}
+	r = f.Flow("processSurrogate/update", map[string]interface{}{"id": int64(99999), "surrogate": "wangwu"})
+	if code, _ := r["code"].(int); code != 99999999 {
+		t.Fatalf("update missing id should be 99999999, got %v", r)
+	}
+	// 负向：update 缺 id
+	r = f.Flow("processSurrogate/update", map[string]interface{}{"surrogate": "wangwu"})
+	if code, _ := r["code"].(int); code != 99999999 {
+		t.Fatalf("update without id should be 99999999, got %v", r)
+	}
+}
+
 func TestFacadeViewEndpoints(t *testing.T) {
 	f, repo, _ := setupFacade()
 	content := string(flowContent(t, "01-simple.json"))
