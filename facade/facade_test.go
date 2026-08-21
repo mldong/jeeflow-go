@@ -672,6 +672,54 @@ func TestDetailJsonObject(t *testing.T) {
 	}
 }
 
+// TestTaskDetailPerformTypeNumeric issues/78：taskDetail performType/taskType 出口数字契约
+// （普通 0 / 会签 1，与 Java 修复后对齐；出口必须是数字而非枚举 name 字符串）。
+func TestTaskDetailPerformTypeNumeric(t *testing.T) {
+	f, repo, _ := setupFacade()
+
+	// 普通流程：task1 performType=0 / taskType=0
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
+	if code, _ := r0["code"].(int); code != 0 {
+		t.Fatalf("deploy: %v", r0)
+	}
+	defID := r0["data"].(map[string]interface{})["processDefineId"]
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{"processDefineId": defID, "operator": "zhangsan"})
+	instID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	doing, _ := repo.FindDoingTasks(context.Background(), instID, nil)
+	if len(doing) == 0 {
+		t.Fatalf("应有进行中任务")
+	}
+	rd := f.Flow("processTask/detail", map[string]interface{}{"id": doing[0].ID, "operator": "leader"})
+	if code, _ := rd["code"].(int); code != 0 {
+		t.Fatalf("taskDetail: %v", rd)
+	}
+	vo := rd["data"].(map[string]interface{})
+	if got := mustIntKind(t, vo["performType"], "普通 performType"); got != 0 {
+		t.Fatalf("普通任务 performType 应=0: %v", vo["performType"])
+	}
+	if got := mustIntKind(t, vo["taskType"], "普通 taskType"); got != 0 {
+		t.Fatalf("普通任务 taskType 应=0: %v", vo["taskType"])
+	}
+
+	// 会签流程：task1 performType=1
+	r2 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "06-countersign-sequential.json"))})
+	csDefID := r2["data"].(map[string]interface{})["processDefineId"]
+	r3 := f.Flow("processInstance/startAndExecute", map[string]interface{}{"processDefineId": csDefID, "operator": "user1"})
+	csInstID := mustI64(r3["data"].(map[string]interface{})["processInstanceId"])
+	csDoing, _ := repo.FindDoingTasks(context.Background(), csInstID, nil)
+	if len(csDoing) == 0 {
+		t.Fatalf("会签应有进行中任务")
+	}
+	rcs := f.Flow("processTask/detail", map[string]interface{}{"id": csDoing[0].ID, "operator": "userA"})
+	if code, _ := rcs["code"].(int); code != 0 {
+		t.Fatalf("会签 taskDetail: %v", rcs)
+	}
+	csVo := rcs["data"].(map[string]interface{})
+	if got := mustIntKind(t, csVo["performType"], "会签 performType"); got != 1 {
+		t.Fatalf("会签任务 performType 应=1（数字，非 \"COUNTERSIGN\"）: %v", csVo["performType"])
+	}
+}
+
 func TestMQueryParams(t *testing.T) {
 	// issues/05-5：m_ 前缀查询参数（m_LIKE_name / m_pd_LIKE_displayName / m_t_LIKE_displayName）
 	f, _, _ := setupFacade()
@@ -933,6 +981,21 @@ func mustI64(v interface{}) int64 {
 	case int:
 		return int64(t)
 	}
+	return 0
+}
+
+// mustIntKind 取整型值（含命名整型，如 model.PerformType）；字符串/非整型 → Fail。
+// issues/78：钉 performType/taskType 出口必须为数字（非枚举 name 字符串）。
+func mustIntKind(t *testing.T, v interface{}, label string) int {
+	t.Helper()
+	if v == nil {
+		t.Fatalf("%s 应为数字，实际为 nil", label)
+	}
+	rv := reflect.ValueOf(v)
+	if rv.Kind() >= reflect.Int && rv.Kind() <= reflect.Uint64 {
+		return int(rv.Int())
+	}
+	t.Fatalf("%s 应为数字，实际为 %T(%v)", label, v, v)
 	return 0
 }
 
