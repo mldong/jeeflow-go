@@ -76,12 +76,164 @@ func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int6
 // ─── Execute ───────────────────────────────────────────────────────────────────
 
 func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	task, inst, err := e.loadAndCheck(ctx, taskID, operator)
+	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args)
 	if err != nil {
 		return nil, err
 	}
-	// issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）——
-	// 被拒值无法经流程变量落到下游节点写入，上游只读声明不可被绕过
+
+		curNode := findNode(flow, task.TaskName)
+		if curNode != nil {
+			// 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
+			// createTask 触发的同节点 PostHandle 幂等一致（同一节点同一次执行仅更新一次）
+			// issues/60：声明未解析 → 显式报错（不静默跳过）
+			if err := e.firePostInterceptors(curNode, inst); err != nil {
+				return nil, err
+			}
+			now := time.Now()
+			ct, _ := stringFromProps(curNode.Properties, "countersignType")
+			// issues/79：会签一票否决（对齐 Java CountersignHandler / PHP setMerged(true)）——
+			// submitType=20 COUNTERSIGN_DISAGREE 时跳过会签"未完成即停留"门控，提前流转后续节点
+			csVeto := ct != "" && toIntOf(vars[KeySubmitType]) == int(model.SubmitTypeCountersignDisagree)
+			if ct == "SEQUENTIAL" && !csVeto {
+				doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
+				if len(doing) == 0 {
+					actors, lc := getCsState(vars, curNode.ID)
+					if actors != nil && lc+1 < len(actors) {
+						// 聚合根：创建串行会签下一步任务
+						nt := inst.CreateTask(e.nextID(), curNode.ID, curNode.Text.Value, actors[lc+1], operator, formKeyOf(curNode), now, 1)
+					nt.Variables = map[string]interface{}{
+						prefixKey("nrOfInstances", curNode.ID): len(actors),
+						prefixKey("loopCounter", curNode.ID):   lc + 1,
+						prefixKey("operatorList", curNode.ID):  actors,
+					}
+					e.repo.SaveTask(ctx, nt)
+					inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
+					return inst, nil
+				}
+			} else {
+				inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
+				return inst, nil
+			}
+		}
+		if (ct == "PARALLEL" || strings.HasPrefix(ct, "RATIO")) && !csVeto {
+			doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
+			if len(doing) > 0 {
+				inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
+				return inst, nil
+			}
+		}
+		for _, node := range followEdges(flow, curNode.ID) {
+			// 统一走 executeNode：结束节点也经节点执行链（拦截器/事件完整触发），
+			// executeNode 内部 TypeEnd 分支完成聚合根 Finish + 事件发布
+			e.executeNode(ctx, flow, inst, node, operator, vars)
+		}
+	}
+	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
+	return inst, nil
+}
+
+// syncTaskToAggregate 把外部任务对象的最新状态同步回聚合根任务副本
+// （v1.0.1：updateInstance 级联持久化依赖聚合内任务副本为最新状态）
+func syncTaskToAggregate(inst *model.ProcessInstance, task *model.ProcessTask) {
+	for i, t := range inst.Tasks {
+		if t.ID == task.ID {
+			inst.Tasks[i] = task
+			return
+		}
+	}
+}
+
+// ─── Reject ────────────────────────────────────────────────────────────────────
+
+func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	_, inst, _, _, err := e.prepareExecuteTask(ctx, taskID, operator, args)
+	if err != nil {
+		return nil, err
+	}
+	// 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
+	inst.Reject(time.Now())
+	e.repo.UpdateInstance(ctx, inst)
+	e.fireEvent(ProcessEvent{Type: EventProcessReject, InstanceID: inst.ID, TaskID: taskID, Operator: operator})
+	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
+	return inst, nil
+}
+
+// ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）─────
+
+func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
+	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args)
+	if err != nil {
+		return nil, err
+	}
+	if targetTaskName == "" {
+		// issues/79：ROLLBACK 对齐 Java rejectTask——退回上一任务节点（首条输入边 source），
+		// 新任务 actor=当前任务完成人（退回操作人）；无上一任务节点则不产生新待办
+		prevName := e.previousTaskName(flow, task.TaskName)
+		if prevName != "" {
+			if prev := findNode(flow, prevName); prev != nil {
+				actors := e.resolveActorsForRollback(prev, inst, operator, task)
+				e.createTaskWithActors(ctx, prev, inst, operator, vars, actors)
+			}
+		}
+	} else {
+		// issues/79：对齐 Java——目标节点不存在显式报错（前端 JUMP 无效 taskName 不再静默空操作）
+		target := findNode(flow, targetTaskName)
+		if target == nil {
+			return nil, fmt.Errorf("根据节点名称[%s]无法找到节点模型", targetTaskName)
+		}
+		// 对齐 Java isFirstTaskName：跳首任务节点（start 直接后继）assignee 强制为发起人
+		if target.Type == model.TypeTask && e.isFirstTaskNode(flow, target) {
+			if target.Properties == nil {
+				target.Properties = map[string]interface{}{}
+			}
+			target.Properties["assignee"] = inst.Operator
+		}
+		if err := e.executeNode(ctx, flow, inst, target, operator, vars); err != nil {
+			return nil, err
+		}
+	}
+	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
+	return inst, nil
+}
+
+// ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）──────────────
+
+func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	_, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args)
+	if err != nil {
+		return nil, err
+	}
+	// 找到第一个任务节点，强制参与者为发起人，重新执行
+	if start := findNodeByType(flow, model.TypeStart); start != nil {
+		for _, node := range followEdges(flow, start.ID) {
+			if node.Type == model.TypeTask || node.Type == model.TypeCustom {
+				if node.Properties == nil {
+					node.Properties = map[string]interface{}{}
+				}
+				node.Properties["assignee"] = inst.Operator
+				if err := e.executeNode(ctx, flow, inst, node, operator, vars); err != nil {
+					return nil, err
+				}
+				break
+			}
+		}
+	}
+	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
+	return inst, nil
+}
+
+// ─── Execute 公共序言（对齐 Java prepareExecution）──────────────────────────────
+
+// prepareExecuteTask 执行公共序言（对齐 Java prepareExecution）：权限校验 → f_ 字段权限
+// 过滤 → 完成任务（子实体状态转换 + 实例变量合并，经 UpdateInstance 级联落库）→ 返回
+// 流程模型 + 合并后执行变量。Java jump 路径不废弃其余 DOING 任务（会签兄弟任务不受影响），
+// 此处保持一致。
+func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessTask, *model.ProcessInstance, *model.FlowModel, map[string]interface{}, error) {
+	task, inst, err := e.loadAndCheck(ctx, taskID, operator)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	// issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）
 	var flow model.FlowModel
 	def, _ := e.repo.FindDefineByID(ctx, inst.DefineID)
 	if def != nil {
@@ -106,150 +258,88 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 
 	inst.Variables = vars
 	e.repo.UpdateInstance(ctx, inst)
-
-	curNode := findNode(&flow, task.TaskName)
-	if curNode != nil {
-		// 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
-		// createTask 触发的同节点 PostHandle 幂等一致（同一节点同一次执行仅更新一次）
-		// issues/60：声明未解析 → 显式报错（不静默跳过）
-		if err := e.firePostInterceptors(curNode, inst); err != nil {
-			return nil, err
-		}
-		ct, _ := stringFromProps(curNode.Properties, "countersignType")
-		if ct == "SEQUENTIAL" {
-			doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
-			if len(doing) == 0 {
-				actors, lc := getCsState(vars, curNode.ID)
-				if actors != nil && lc+1 < len(actors) {
-					// 聚合根：创建串行会签下一步任务
-					nt := inst.CreateTask(e.nextID(), curNode.ID, curNode.Text.Value, actors[lc+1], operator, formKeyOf(curNode), now, 1)
-					nt.Variables = map[string]interface{}{
-						prefixKey("nrOfInstances", curNode.ID): len(actors),
-						prefixKey("loopCounter", curNode.ID):   lc + 1,
-						prefixKey("operatorList", curNode.ID):  actors,
-					}
-					e.repo.SaveTask(ctx, nt)
-					inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
-					return inst, nil
-				}
-			} else {
-				inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
-				return inst, nil
-			}
-		}
-		if ct == "PARALLEL" || strings.HasPrefix(ct, "RATIO") {
-			doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
-			if len(doing) > 0 {
-				inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
-				return inst, nil
-			}
-		}
-		for _, node := range followEdges(&flow, curNode.ID) {
-			// 统一走 executeNode：结束节点也经节点执行链（拦截器/事件完整触发），
-			// executeNode 内部 TypeEnd 分支完成聚合根 Finish + 事件发布
-			e.executeNode(ctx, &flow, inst, node, operator, vars)
-		}
-	}
-	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
-	return inst, nil
+	return task, inst, &flow, vars, nil
 }
 
-// syncTaskToAggregate 把外部任务对象的最新状态同步回聚合根任务副本
-// （v1.0.1：updateInstance 级联持久化依赖聚合内任务副本为最新状态）
-func syncTaskToAggregate(inst *model.ProcessInstance, task *model.ProcessTask) {
-	for i, t := range inst.Tasks {
-		if t.ID == task.ID {
-			inst.Tasks[i] = task
-			return
-		}
+// previousTaskName 当前任务节点的首条输入边 source（issues/79 对齐 Java getPreviousTaskName）
+func (e *EngineImpl) previousTaskName(flow *model.FlowModel, taskName string) string {
+	node := findNode(flow, taskName)
+	if node == nil {
+		return ""
 	}
-}
-
-// ─── Reject ────────────────────────────────────────────────────────────────────
-
-func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	task, inst, err := e.loadAndCheck(ctx, taskID, operator)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now()
-	// 聚合根：废弃所有进行中任务
-	for _, t := range inst.AbandonAllDoing(now) {
-		e.repo.UpdateTask(ctx, t)
-	}
-	// 子实体：完成任务
-	task.Finish(operator, task.Variables, now)
-	e.repo.UpdateTask(ctx, task)
-	// v1.0.1：同步回聚合根，避免 updateInstance 级联把任务写回旧状态
-	syncTaskToAggregate(inst, task)
-	// 聚合根：驳回
-	inst.Reject(now)
-	e.repo.UpdateInstance(ctx, inst)
-	e.fireEvent(ProcessEvent{Type: EventProcessReject, InstanceID: inst.ID, TaskID: taskID, Operator: operator})
-	return inst, nil
-}
-
-// ─── Jump ─────────────────────────────────────────────────────────────────────
-
-func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
-	task, inst, err := e.loadAndCheck(ctx, taskID, operator)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now()
-	// 聚合根：废弃所有进行中任务
-	for _, t := range inst.AbandonAllDoing(now) {
-		e.repo.UpdateTask(ctx, t)
-	}
-	// 子实体：完成任务
-	task.Finish(operator, task.Variables, now)
-	e.repo.UpdateTask(ctx, task)
-
-	if targetTaskName != "" {
-		var flow model.FlowModel
-		def, _ := e.repo.FindDefineByID(ctx, inst.DefineID)
-		if def != nil {
-			json.Unmarshal(def.Content, &flow)
-		}
-		target := findNode(&flow, targetTaskName)
-		if target != nil {
-			e.executeNode(ctx, &flow, inst, target, operator, inst.Variables)
-		}
-	}
-	return inst, nil
-}
-
-// ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）──────────────
-
-func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	task, inst, err := e.loadAndCheck(ctx, taskID, operator)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now()
-	// 聚合根：废弃所有进行中任务
-	for _, t := range inst.AbandonAllDoing(now) {
-		e.repo.UpdateTask(ctx, t)
-	}
-	// 子实体：完成任务
-	task.Finish(operator, task.Variables, now)
-	e.repo.UpdateTask(ctx, task)
-	// 找到第一个任务节点，强制参与者为发起人，重新执行
-	var flow model.FlowModel
-	def, _ := e.repo.FindDefineByID(ctx, inst.DefineID)
-	if def != nil {
-		json.Unmarshal(def.Content, &flow)
-	}
-	if start := findNodeByType(&flow, model.TypeStart); start != nil {
-		for _, node := range followEdges(&flow, start.ID) {
-			if node.Type == model.TypeTask || node.Type == model.TypeCustom {
-				node.Properties["assignee"] = inst.Operator
-				e.executeNode(ctx, &flow, inst, node, operator, inst.Variables)
-				break
+	for _, edge := range flow.Edges {
+		if edge.TargetNodeID == node.ID {
+			if src := findNode(flow, edge.SourceNodeID); src != nil &&
+				(src.Type == model.TypeTask || src.Type == model.TypeCustom) {
+				return src.ID
 			}
 		}
 	}
-	return inst, nil
+	return ""
+}
+
+// isFirstTaskNode 是否 start 直接后继任务节点（issues/79 对齐 Java FlowUtil.isFirstTaskName）
+func (e *EngineImpl) isFirstTaskNode(flow *model.FlowModel, node *model.FlowNode) bool {
+	start := findNodeByType(flow, model.TypeStart)
+	if start == nil {
+		return false
+	}
+	for _, edge := range flow.Edges {
+		if edge.SourceNodeID == start.ID && edge.TargetNodeID == node.ID {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveActorsForRollback ROLLBACK 新任务参与者：优先当前任务完成人（退回操作人，
+// 对齐 Java rejectTask Collections.singletonList(currentTask.getActorId())），
+// 其次按目标节点 assignee 解析
+func (e *EngineImpl) resolveActorsForRollback(node *model.FlowNode, inst *model.ProcessInstance, operator string, task *model.ProcessTask) []string {
+	if task.ActorID != "" {
+		return []string{task.ActorID}
+	}
+	actors := e.resolveActors(node, inst, operator, inst.Variables)
+	if len(actors) == 0 {
+		actors = []string{operator}
+	}
+	return actors
+}
+
+// createTaskWithActors 以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）
+func (e *EngineImpl) createTaskWithActors(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}, actors []string) error {
+	if len(actors) == 0 {
+		return nil
+	}
+	ct, _ := stringFromProps(node.Properties, "countersignType")
+	now := time.Now()
+	form := formKeyOf(node)
+	if IsCountersign(node.Properties["performType"]) && ct != "" {
+		switch ct {
+		case "PARALLEL", "":
+			for _, actor := range actors {
+				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1))
+			}
+		case "SEQUENTIAL":
+			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, 1)
+			nt.Variables = map[string]interface{}{
+				prefixKey("nrOfInstances", node.ID): len(actors),
+				prefixKey("loopCounter", node.ID):   0,
+				prefixKey("operatorList", node.ID):  actors,
+			}
+			e.repo.SaveTask(ctx, nt)
+		default:
+			for _, actor := range actors {
+				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1))
+			}
+		}
+		return nil
+	}
+	nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now)
+	if len(actors) > 1 {
+		nt.ActorIDs = actors
+	}
+	return e.repo.SaveTask(ctx, nt)
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────

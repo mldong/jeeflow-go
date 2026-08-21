@@ -1198,6 +1198,240 @@ func TestE2EFeedbackRegression(t *testing.T) {
 	}
 }
 
+// ═══ execute submitType 2/3/4/5/6/20 门面行为（issues/79，前端按钮全量暴露路径）═══
+
+// mustOk 断言门面返回 code=0
+func mustOk(t *testing.T, r map[string]interface{}) {
+	t.Helper()
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("expect code=0, got: %v", r)
+	}
+}
+
+// doingTaskID 查实例下指定节点的进行中任务 id（无则 0）
+func doingTaskID(t *testing.T, repo *memory.Repository, instanceID int64, name string) int64 {
+	t.Helper()
+	doing, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
+	for _, tk := range doing {
+		if tk.TaskName == name {
+			return tk.ID
+		}
+	}
+	return 0
+}
+
+// startMultiTaskAt 02-multi-task：发起（apply 自动完成）→ 推进到名为 name 的任务节点
+func startMultiTaskAt(t *testing.T, f *facade.Facade, repo *memory.Repository, name string) int64 {
+	t.Helper()
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "02-multi-task.json"))})
+	mustOk(t, r0)
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"], "operator": "zhangsan",
+	})
+	mustOk(t, r1)
+	instanceID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	order := []string{"task1", "task2", "task3"}
+	actor := []string{"leader", "manager", "boss"}
+	target := 0
+	for i, n := range order {
+		if n == name {
+			target = i
+		}
+	}
+	for i := 0; i < target; i++ {
+		tid := doingTaskID(t, repo, instanceID, order[i])
+		if tid == 0 {
+			t.Fatalf("应推进到 %s", order[i])
+		}
+		repo.AddTaskActor(context.Background(), tid, []string{actor[i]})
+		mustOk(t, f.Flow("processTask/execute", map[string]interface{}{
+			"processTaskId": tid, "operator": actor[i], "submitType": 1,
+		}))
+	}
+	return instanceID
+}
+
+// TestExecuteSubmitTypeBehavior issues/79：submitType 3/4/5/6 + 负向（对齐 Java 参考实现断言）
+func TestExecuteSubmitTypeBehavior(t *testing.T) {
+	f, repo, _ := setupFacade()
+	ctx := context.Background()
+
+	// ── submitType=3 ROLLBACK：task2 退回上一步 → task1 新待办（actor=退回操作人），实例保持 DOING(10)
+	rb := startMultiTaskAt(t, f, repo, "task2")
+	t2 := doingTaskID(t, repo, rb, "task2")
+	repo.AddTaskActor(ctx, t2, []string{"manager"})
+	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{"processTaskId": t2, "operator": "manager", "submitType": 3}))
+	rbTask1 := doingTaskID(t, repo, rb, "task1")
+	if rbTask1 == 0 {
+		t.Fatalf("ROLLBACK 应在 task1 产生新待办")
+	}
+	if actors, _ := repo.FindTaskActors(ctx, rbTask1); !containsStr2(actors, "manager") {
+		t.Fatalf("退回任务 actor 应为退回操作人 manager: %v", actors)
+	}
+	if inst, _ := repo.FindInstanceByID(ctx, rb); inst.State != model.InstanceStateDoing {
+		t.Fatalf("ROLLBACK 后实例应保持 DOING(10): %d", inst.State)
+	}
+
+	// ── submitType=4 JUMP：task3 跳转 apply（首任务节点 = start 直接后继，assignee 强制发起人）
+	jp := startMultiTaskAt(t, f, repo, "task3")
+	t3 := doingTaskID(t, repo, jp, "task3")
+	repo.AddTaskActor(ctx, t3, []string{"boss"})
+	jl := f.Flow("processTask/jumpAbleTaskNameList", map[string]interface{}{"processInstanceId": jp})
+	mustOk(t, jl)
+	jumpValues := []string{}
+	for _, m := range jl["data"].([]interface{}) {
+		jumpValues = append(jumpValues, m.(map[string]interface{})["value"].(string))
+	}
+	if !containsStr2(jumpValues, "task1") || !containsStr2(jumpValues, "apply") {
+		t.Fatalf("jumpAble 应包含已完成的 task1/apply: %v", jumpValues)
+	}
+	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{
+		"processTaskId": t3, "operator": "boss", "submitType": 4, "taskName": "apply",
+	}))
+	jpApply := doingTaskID(t, repo, jp, "apply")
+	if jpApply == 0 {
+		t.Fatalf("JUMP 应在 apply（首任务节点）产生新待办")
+	}
+	if actors, _ := repo.FindTaskActors(ctx, jpApply); len(actors) != 1 || actors[0] != "zhangsan" {
+		t.Fatalf("跳首任务节点 assignee 强制为发起人 zhangsan: %v", actors)
+	}
+	if inst, _ := repo.FindInstanceByID(ctx, jp); inst.State != model.InstanceStateDoing {
+		t.Fatalf("JUMP 后实例应保持 DOING(10): %d", inst.State)
+	}
+
+	// ── 负向：JUMP taskName 不存在 → 99999999 + 「无法找到节点模型」
+	jn := startMultiTaskAt(t, f, repo, "task2")
+	t2n := doingTaskID(t, repo, jn, "task2")
+	repo.AddTaskActor(ctx, t2n, []string{"manager"})
+	jr := f.Flow("processTask/execute", map[string]interface{}{
+		"processTaskId": t2n, "operator": "manager", "submitType": 4, "taskName": "no-such-node",
+	})
+	if code, _ := jr["code"].(int); code != 99999999 {
+		t.Fatalf("JUMP 无效节点应报 99999999: %v", jr)
+	}
+	if !strings.Contains(fmt.Sprintf("%v", jr["msg"]), "无法找到节点模型") {
+		t.Fatalf("JUMP 无效节点应报「无法找到节点模型」: %v", jr["msg"])
+	}
+
+	// ── submitType=5 RE_APPLY：task1 重新提交（前端 detail 抽屉场景，含 f_ 表单 + tf_nextNodeOperator）
+	ra := startMultiTaskAt(t, f, repo, "task1")
+	t1r := doingTaskID(t, repo, ra, "task1")
+	repo.AddTaskActor(ctx, t1r, []string{"leader"})
+	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{
+		"processTaskId": t1r, "operator": "leader", "submitType": 5,
+		"tf_nextNodeOperator": "manager", "f_leaveType": "annual",
+	}))
+	doingAfter, _ := repo.FindDoingTasks(ctx, ra, nil)
+	if len(doingAfter) != 1 || doingAfter[0].TaskName != "task2" {
+		t.Fatalf("RE_APPLY 后应推进到 task2: %v", doingAfter)
+	}
+	if actors, _ := repo.FindTaskActors(ctx, doingTaskID(t, repo, ra, "task2")); len(actors) != 1 || actors[0] != "manager" {
+		t.Fatalf("tf_nextNodeOperator 应覆盖 task2 处理人: %v", actors)
+	}
+	if inst, _ := repo.FindInstanceByID(ctx, ra); inst.Variables["f_leaveType"] != "annual" {
+		t.Fatalf("f_ 表单字段应落实例变量: %v", inst.Variables)
+	}
+	if inst, _ := repo.FindInstanceByID(ctx, ra); inst.State != model.InstanceStateDoing {
+		t.Fatalf("RE_APPLY 后实例应保持 DOING(10): %d", inst.State)
+	}
+
+	// ── submitType=6 ROLLBACK_TO_OPERATOR：task3 退回发起人 → apply 重执行、actor=发起人 zhangsan
+	ro := startMultiTaskAt(t, f, repo, "task3")
+	t3o := doingTaskID(t, repo, ro, "task3")
+	repo.AddTaskActor(ctx, t3o, []string{"boss"})
+	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{"processTaskId": t3o, "operator": "boss", "submitType": 6}))
+	roApply := doingTaskID(t, repo, ro, "apply")
+	if roApply == 0 {
+		t.Fatalf("ROLLBACK_TO_OPERATOR 应重执行首个任务节点 apply")
+	}
+	if actors, _ := repo.FindTaskActors(ctx, roApply); len(actors) != 1 || actors[0] != "zhangsan" {
+		t.Fatalf("退回发起人 assignee 强制为发起人 zhangsan: %v", actors)
+	}
+	if inst, _ := repo.FindInstanceByID(ctx, ro); inst.State != model.InstanceStateDoing {
+		t.Fatalf("退回发起人后实例应保持 DOING(10): %d", inst.State)
+	}
+
+	// ── 负向：非处理人执行被拒（NOT_ALLOWED_EXECUTE）
+	na := startMultiTaskAt(t, f, repo, "task1")
+	t1n := doingTaskID(t, repo, na, "task1")
+	nr := f.Flow("processTask/execute", map[string]interface{}{"processTaskId": t1n, "operator": "hacker", "submitType": 1})
+	if code, _ := nr["code"].(int); code != 99999999 {
+		t.Fatalf("非处理人执行应报 99999999: %v", nr)
+	}
+	if !strings.Contains(fmt.Sprintf("%v", nr["msg"]), "not allowed") {
+		t.Fatalf("非处理人执行应报参与者错误: %v", nr["msg"])
+	}
+}
+
+// TestExecuteReject issues/79：submitType=2 REJECT 门面参数路径（对齐 Java/PHP）
+func TestExecuteReject(t *testing.T) {
+	f, repo, _ := setupFacade()
+	ctx := context.Background()
+	instID := startMultiTaskAt(t, f, repo, "task1")
+	t1 := doingTaskID(t, repo, instID, "task1")
+	repo.AddTaskActor(ctx, t1, []string{"leader"})
+	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{"processTaskId": t1, "operator": "leader", "submitType": 2}))
+	if inst, _ := repo.FindInstanceByID(ctx, instID); inst.State != model.InstanceStateReject {
+		t.Fatalf("REJECT 后实例应为 REJECT(45): %d", inst.State)
+	}
+	if doing, _ := repo.FindDoingTasks(ctx, instID, nil); len(doing) != 0 {
+		t.Fatalf("REJECT 后应无 DOING 任务: %d", len(doing))
+	}
+}
+
+// TestExecuteCountersignDisagree issues/79：submitType=20 会签一票否决（对齐 Java CountersignHandler / PHP setMerged）
+func TestExecuteCountersignDisagree(t *testing.T) {
+	f, repo, _ := setupFacade()
+	ctx := context.Background()
+	// 06-countersign-sequential：apply 自动完成 → task1 串行会签 userA（userB 未开始）
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "06-countersign-sequential.json"))})
+	mustOk(t, r0)
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"], "operator": "user1",
+	})
+	mustOk(t, r1)
+	instanceID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	taskA := doingTaskID(t, repo, instanceID, "task1")
+	if taskA == 0 {
+		t.Fatalf("会签节点应有 userA 的 DOING 任务")
+	}
+	repo.AddTaskActor(ctx, taskA, []string{"userA"})
+	// submitType=20：门面自动注入 countersignDisagreeFlag=1 → 引擎一票否决
+	// （会签节点提前流转 end）；flag 落任务/实例变量
+	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{"processTaskId": taskA, "operator": "userA", "submitType": 20}))
+	inst, _ := repo.FindInstanceByID(ctx, instanceID)
+	// 一票否决效果：会签节点被提前流转 end（若否决未生效，串行会签将停在 DOING 等 userB）
+	if inst.State != model.InstanceStateDone {
+		t.Fatalf("会签否决后实例应完成 FINISHED(20)（无否决则停留 DOING）: %d", inst.State)
+	}
+	if v := toIntOfFlag(inst.Variables["countersignDisagreeFlag"]); v != 1 {
+		t.Fatalf("countersignDisagreeFlag=1 应落实例变量: %v", inst.Variables["countersignDisagreeFlag"])
+	}
+	doneA, _ := repo.FindTaskByID(ctx, taskA)
+	if doneA.TaskState != model.TaskStateDone {
+		t.Fatalf("否决任务应已完成: %d", doneA.TaskState)
+	}
+	if v := toIntOfFlag(doneA.Variables["countersignDisagreeFlag"]); v != 1 {
+		t.Fatalf("countersignDisagreeFlag=1 应落任务变量: %v", doneA.Variables)
+	}
+	if doneA.ActorID != "userA" {
+		t.Fatalf("否决人应记录为实际操作人 userA: %s", doneA.ActorID)
+	}
+}
+
+// toIntOfFlag 断言辅助：变量中的数字 flag（int/float64 兼容）
+func toIntOfFlag(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	}
+	return -1
+}
+
 // toStrings 出口字符串数组转换（issues/58 E30：出口统一 []interface{}）
 func toStrings(v []interface{}) []string {
 	out := make([]string, 0, len(v))
