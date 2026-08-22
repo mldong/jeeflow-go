@@ -1715,6 +1715,46 @@ func TestTaskDetailExtIsFirstTaskNode(t *testing.T) {
 	}
 }
 
+// issues/82-8：doneList 行 finishTime 已格式化（yyyy-MM-dd HH:mm:ss 无 T，对齐 Java/Python/Node）
+func TestFacadeDoneListFinishTime(t *testing.T) {
+	f, repo, _ := setupFacade()
+	mustOk(t, f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))}))
+	rStart := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": mustDefineID(t, repo, "simple"), "operator": "zhangsan"})
+	mustOk(t, rStart)
+
+	// startAndExecute 自动完成 apply → 剩 task1（DOING, leader）；执行 task1 → done（finishTime 写入）
+	instID := mustI64(rStart["data"].(map[string]interface{})["processInstanceId"])
+	tasks, _ := repo.FindDoingTasks(context.Background(), instID, nil)
+	var task1ID int64
+	for _, tk := range tasks {
+		if tk.TaskName == "task1" {
+			task1ID = tk.ID
+		}
+	}
+	if task1ID == 0 {
+		t.Fatalf("应有 task1 进行中任务: %+v", tasks)
+	}
+	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{"processTaskId": task1ID, "operator": "leader", "submitType": 1}))
+
+	// doneList：leader 的已办（task1 已完成）→ finishTime 非空且格式化
+	r := f.Flow("processTask/doneList", map[string]interface{}{"operator": "leader"})
+	mustOk(t, r)
+	rows := r["data"].(map[string]interface{})["rows"].([]interface{})
+	if len(rows) == 0 {
+		t.Fatalf("doneList 应有行（task1 已办）")
+	}
+	trow := rows[0].(map[string]interface{})
+	ft, ok := trow["finishTime"].(string)
+	if !ok || ft == "" {
+		t.Fatalf("doneList 行 finishTime 应为非空字符串: %v", trow["finishTime"])
+	}
+	re := regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$`)
+	if !re.MatchString(ft) {
+		t.Fatalf("doneList finishTime 应格式化为 yyyy-MM-dd HH:mm:ss（无 T）: %s", ft)
+	}
+}
+
 // mustDefineID：按 name 取定义 id
 func mustDefineID(t *testing.T, repo *memory.Repository, name string) int64 {
 	t.Helper()
