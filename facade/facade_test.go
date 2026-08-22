@@ -903,6 +903,8 @@ func TestDesignPageTimeFormat(t *testing.T) {
 	f, _, _ := setupFacade()
 	r := f.Flow("processDesign/save", map[string]interface{}{
 		"name": "time-fmt-test", "displayName": "时间格式测试", "operator": "zhangsan",
+		// 82-9：设计页回显字段 remark/icon（对齐 Java 参考实现）
+		"icon": "icon-echo", "remark": "回显验证备注",
 	})
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("design save failed: %v", r)
@@ -928,6 +930,25 @@ func TestDesignPageTimeFormat(t *testing.T) {
 				t.Fatalf("row[%d].%s = %q should match yyyy-MM-dd HH:mm:ss", i, field, v)
 			}
 		}
+	}
+
+	// 82-9：designPage 行回显 remark/icon（设计页回显字段，对齐 Java）
+	var target map[string]interface{}
+	for _, row := range rows {
+		m := row.(map[string]interface{})
+		if m["name"] == "time-fmt-test" {
+			target = m
+			break
+		}
+	}
+	if target == nil {
+		t.Fatalf("designPage 应含 time-fmt-test 行: %v", rows)
+	}
+	if target["remark"] != "回显验证备注" {
+		t.Fatalf("designPage remark 应回显保存值, got %v", target["remark"])
+	}
+	if target["icon"] != "icon-echo" {
+		t.Fatalf("designPage icon 应回显保存值, got %v", target["icon"])
 	}
 }
 
