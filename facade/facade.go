@@ -1284,6 +1284,14 @@ func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 		return nil, errors.New("任务不存在")
 	}
 	actors, _ := f.repo.FindTaskActors(context.Background(), taskID)
+	// issues/82-5：任务级 ext.isFirstTaskNode（前端 detail.vue 双兜底 record.ext?.isFirstTaskNode）
+	// 首个任务节点且 DOING → true，与 instance detail 的 activeTaskList 行语义一致
+	tExt := map[string]interface{}{}
+	for k, v := range task.Variables {
+		tExt[k] = v
+	}
+	doing := task.TaskState == model.TaskStateDoing
+	tExt["isFirstTaskNode"] = false
 	vo := map[string]interface{}{
 		"id": task.ID, "processInstanceId": task.ProcessInstanceID,
 		"taskName": task.TaskName, "displayName": task.DisplayName,
@@ -1291,6 +1299,7 @@ func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 		"taskState": task.TaskState, "operator": task.ActorID,
 		"formKey": task.FormKey, "taskActorIdList": actors,
 		"executable": task.IsAllowed(operator),
+		"ext": tExt,
 	}
 	// taskModel：流程定义中对应节点
 	inst, _ := f.repo.FindInstanceByID(context.Background(), task.ProcessInstanceID)
@@ -1300,6 +1309,7 @@ func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 			graph := map[string]interface{}{}
 			if json.Unmarshal(def.Content, &graph) == nil && len(graph) > 0 {
 				vo["jsonObject"] = graph // issues/05
+				tExt["isFirstTaskNode"] = doing && task.TaskName == firstTaskNodeIDOf(graph)
 			}
 			var flow model.FlowModel
 			if json.Unmarshal(def.Content, &flow) == nil {

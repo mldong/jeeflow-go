@@ -797,6 +797,22 @@ func TestMQueryParams(t *testing.T) {
 		t.Fatalf("m_pd_LIKE_displayName 不应命中: %v", r)
 	}
 
+	// issues/82-6：实例列表按编码搜 m_pd_LIKE_name（pd.name 白名单列）
+	r = f.Flow("processInstance/page", map[string]interface{}{
+		"operator": "zhangsan", "m_pd_LIKE_name": "simple",
+	})
+	rows = r["data"].(map[string]interface{})["rows"].([]interface{})
+	if len(rows) != 1 {
+		t.Fatalf("m_pd_LIKE_name 应命中 simple 实例: %v", r)
+	}
+	r = f.Flow("processInstance/page", map[string]interface{}{
+		"operator": "zhangsan", "m_pd_LIKE_name": "zzz",
+	})
+	rows = r["data"].(map[string]interface{})["rows"].([]interface{})
+	if len(rows) != 0 {
+		t.Fatalf("m_pd_LIKE_name 不应命中: %v", r)
+	}
+
 	// 任务列表：m_t_LIKE_displayName（别名 t → t.display_name）
 	r = f.Flow("processTask/todoList", map[string]interface{}{
 		"operator": "leader", "m_t_LIKE_displayName": "审批",
@@ -1522,4 +1538,133 @@ func listItemByType(t *testing.T, f *facade.Facade, name string) map[string]inte
 	}
 	t.Fatalf("listByType 缺 %s item: %v", name, groups)
 	return nil
+}
+
+// issues/82-2：分页五键整体（pageNum/pageSize/rows/recordCount/totalPage）
+// issues/82-3：列表行 instanceExt 容器（任务行 + 实例行）
+func TestPageEnvelopeAndInstanceExt(t *testing.T) {
+	f, _, _ := setupFacade()
+	if r := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))}); r["code"].(int) != 0 {
+		t.Fatalf("deploy: %v", r)
+	}
+	defineID := mustI64(f.Flow("processDefine/getLastByName", map[string]interface{}{"processDefineName": "simple"})["data"].(map[string]interface{})["id"])
+	if r := f.Flow("processInstance/startAndExecute", map[string]interface{}{"processDefineId": defineID, "operator": "zhangsan"}); r["code"].(int) != 0 {
+		t.Fatalf("start: %v", r)
+	}
+
+	// 任务行：instanceExt 容器 + 分页五键
+	r := f.Flow("processTask/todoList", map[string]interface{}{"operator": "leader"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("todoList: %v", r)
+	}
+	data := r["data"].(map[string]interface{})
+	for _, k := range []string{"pageNum", "pageSize", "rows", "recordCount", "totalPage"} {
+		if _, ok := data[k]; !ok {
+			t.Fatalf("分页五键应含 %s: %v", k, data)
+		}
+	}
+	rows := data["rows"].([]interface{})
+	if len(rows) == 0 {
+		t.Fatalf("todoList 应有行")
+	}
+	trow, _ := rows[0].(map[string]interface{})
+	if _, ok := trow["instanceExt"]; !ok {
+		t.Fatalf("任务行应含 instanceExt 容器: %v", trow)
+	}
+
+	// 实例行：ext（实例变量对象，对齐 Java 契约：实例行无 instanceExt 键）+ 分页五键
+	r = f.Flow("processInstance/page", map[string]interface{}{"operator": "zhangsan"})
+	data = r["data"].(map[string]interface{})
+	for _, k := range []string{"pageNum", "pageSize", "rows", "recordCount", "totalPage"} {
+		if _, ok := data[k]; !ok {
+			t.Fatalf("分页五键应含 %s: %v", k, data)
+		}
+	}
+	irows := data["rows"].([]interface{})
+	if len(irows) == 0 {
+		t.Fatalf("instancePage 应有行")
+	}
+	irow, _ := irows[0].(map[string]interface{})
+	if _, ok := irow["ext"]; !ok {
+		t.Fatalf("实例行应含 ext 容器: %v", irow)
+	}
+}
+
+// issues/82-5：task detail 任务级 ext.isFirstTaskNode（前端 detail.vue 双兜底）
+func TestTaskDetailExtIsFirstTaskNode(t *testing.T) {
+	// 场景 1：startAndExecute 自动完成 apply → 剩 task1（DOING，非首节点）→ false
+	f, repo, _ := setupFacade()
+	if r := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))}); r["code"].(int) != 0 {
+		t.Fatalf("deploy: %v", r)
+	}
+	rStart := f.Flow("processInstance/startAndExecute", map[string]interface{}{"processDefineId": mustDefineID(t, repo, "simple"), "operator": "zhangsan"})
+	if code, _ := rStart["code"].(int); code != 0 {
+		t.Fatalf("startAndExecute: %v", rStart)
+	}
+	instID := mustI64(rStart["data"].(map[string]interface{})["processInstanceId"])
+	tasks, _ := repo.FindDoingTasks(context.Background(), instID, nil)
+	var task1ID int64
+	for _, tk := range tasks {
+		if tk.TaskName == "task1" {
+			task1ID = tk.ID
+		}
+	}
+	if task1ID == 0 {
+		t.Fatalf("应有 task1 进行中任务: %+v", tasks)
+	}
+	r := f.Flow("processTask/detail", map[string]interface{}{"id": task1ID, "operator": "leader"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("taskDetail: %v", r)
+	}
+	ext, ok := r["data"].(map[string]interface{})["ext"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("task detail 应含 ext 容器: %v", r["data"])
+	}
+	if ext["isFirstTaskNode"] != false {
+		t.Fatalf("task1 非首任务节点，ext.isFirstTaskNode 应为 false: %v", ext)
+	}
+
+	// 场景 2：直接启动（不自动完成 apply）→ apply 为首任务节点且 DOING → true
+	repo2 := memory.New()
+	eng := engine.New(repo2, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	f2 := facade.New(eng, repo2, memory.NewExt())
+	if r := f2.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))}); r["code"].(int) != 0 {
+		t.Fatalf("deploy2: %v", r)
+	}
+	def, _ := repo2.FindDefineByName(context.Background(), "simple")
+	inst, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "zhangsan", nil)
+	if err != nil {
+		t.Fatalf("startProcessInstanceByID: %v", err)
+	}
+	tasks2, _ := repo2.FindDoingTasks(context.Background(), inst.ID, nil)
+	var applyID int64
+	for _, tk := range tasks2 {
+		if tk.TaskName == "apply" {
+			applyID = tk.ID
+		}
+	}
+	if applyID == 0 {
+		t.Fatalf("apply 应为进行中任务: %+v", tasks2)
+	}
+	r = f2.Flow("processTask/detail", map[string]interface{}{"id": applyID, "operator": "zhangsan"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("taskDetail2: %v", r)
+	}
+	ext2, ok := r["data"].(map[string]interface{})["ext"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("task detail 应含 ext 容器: %v", r["data"])
+	}
+	if ext2["isFirstTaskNode"] != true {
+		t.Fatalf("apply 为首任务节点且 DOING，ext.isFirstTaskNode 应为 true: %v", ext2)
+	}
+}
+
+// mustDefineID：按 name 取定义 id
+func mustDefineID(t *testing.T, repo *memory.Repository, name string) int64 {
+	t.Helper()
+	def, err := repo.FindDefineByName(context.Background(), name)
+	if err != nil || def == nil {
+		t.Fatalf("define %s not found: %v", name, err)
+	}
+	return def.ID
 }
