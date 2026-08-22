@@ -1372,9 +1372,10 @@ func (f *Facade) candidatePage(args map[string]interface{}) (interface{}, error)
 	}
 	if len(candidates) > 0 {
 		// 候选命中 → 用户信息映射（UserProvider 兜底）
+		// issues/80：行键对齐前端 UserSelect（valueField='id'）——补 id 键，保留 userId 兼容旧消费方
 		rows := []map[string]interface{}{}
 		for _, c := range candidates {
-			rows = append(rows, map[string]interface{}{"userId": c, "realName": c})
+			rows = append(rows, map[string]interface{}{"id": c, "userId": c, "realName": c})
 		}
 		return pageData(1, 10, len(rows), rows), nil
 	}

@@ -503,6 +503,26 @@ func TestCandidatePageDualSource(t *testing.T) {
 			t.Fatalf("candidate missing %s: %v", want, rows)
 		}
 	}
+	// issues/80：行键契约 {id, realName}（对齐前端 UserSelect valueField='id'）
+	ids := make([]string, 0, len(rows))
+	for _, rw := range rows {
+		m, _ := rw.(map[string]interface{})
+		id, ok := m["id"].(string)
+		if !ok || id == "" {
+			t.Fatalf("candidate row 缺 id 键: %v", m)
+		}
+		_, ok = m["realName"].(string)
+		if !ok {
+			t.Fatalf("candidate row 缺 realName 键: %v", m)
+		}
+		if uid, _ := m["userId"].(string); uid != "" && uid != id {
+			t.Fatalf("id 与 userId 应一一对齐（行键归一）: id=%q userId=%q", id, uid)
+		}
+		ids = append(ids, id)
+	}
+	if !containsStr2(ids, "userA") {
+		t.Fatalf("id 列表应含 userA: %v", ids)
+	}
 }
 
 func TestStartAndExecutePreAssign(t *testing.T) {
