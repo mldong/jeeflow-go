@@ -1460,3 +1460,66 @@ func toStrings(v []interface{}) []string {
 	}
 	return out
 }
+
+// issues/81：listByType items 必含 processDefineState（前端发起按钮硬依赖），取值随定义 state 联动
+func TestListByTypeProcessDefineState(t *testing.T) {
+	f, _, _ := setupFacade()
+
+	// design name 与 content 顶层 name 一致（listByType 按 name join 最新 define）
+	r := f.Flow("processDesign/save", map[string]interface{}{
+		"name": "leave81", "displayName": "请假81", "type": "approval", "operator": "user1"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("save failed: %v", r)
+	}
+	designID := mustI64(r["data"].(map[string]interface{})["id"])
+	r = f.Flow("processDesign/updateDefine", map[string]interface{}{
+		"processDesignId": designID, "operator": "user1",
+		"name": "leave81", "displayName": "请假81", "type": "approval",
+		"nodes": []interface{}{}, "edges": []interface{}{}})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("updateDefine failed: %v", r)
+	}
+	// 场景 A：deploy → 定义 state=1 → 可发起
+	r = f.Flow("processDesign/deploy", map[string]interface{}{"id": designID, "operator": "user1"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("deploy failed: %v", r)
+	}
+	defineID := mustI64(r["data"].(map[string]interface{})["processDefineId"])
+
+	itemA := listItemByType(t, f, "leave81")
+	if itemA["processDefineId"] == nil || mustI64(itemA["processDefineId"]) != defineID {
+		t.Fatalf("processDefineId 应回显 %d: %v", defineID, itemA)
+	}
+	if st, ok := itemA["processDefineState"].(int); !ok || st != 1 {
+		t.Fatalf("启用定义 processDefineState 应为 1（前端可发起）: %v", itemA["processDefineState"])
+	}
+
+	// 场景 B：upAndDown 禁用 → 定义 state=0 → 前端置灰
+	r = f.Flow("processDefine/upAndDown", map[string]interface{}{"id": defineID, "opType": 0})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("upAndDown failed: %v", r)
+	}
+	itemB := listItemByType(t, f, "leave81")
+	if st, ok := itemB["processDefineState"].(int); !ok || st != 0 {
+		t.Fatalf("禁用定义 processDefineState 应为 0（前端置灰）: %v", itemB["processDefineState"])
+	}
+}
+
+// listItemByType：listByType 出口里按 design name 取 item（approval 分组）
+func listItemByType(t *testing.T, f *facade.Facade, name string) map[string]interface{} {
+	t.Helper()
+	r := f.Flow("processDesign/listByType", map[string]interface{}{})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("listByType failed: %v", r)
+	}
+	groups, _ := r["data"].(map[string]interface{})
+	approvalAny, _ := groups["approval"].([]interface{})
+	for _, it := range approvalAny {
+		item, _ := it.(map[string]interface{})
+		if item["name"] == name {
+			return item
+		}
+	}
+	t.Fatalf("listByType 缺 %s item: %v", name, groups)
+	return nil
+}
