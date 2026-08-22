@@ -3,6 +3,7 @@ package memory
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -143,9 +144,8 @@ func (r *ExtRepository) SaveSurrogate(ctx context.Context, s *model.ProcessSurro
 	if s.UpdateTime.IsZero() {
 		s.UpdateTime = now
 	}
-	if s.Enabled == 0 {
-		s.Enabled = 1
-	}
+	// 不在仓储层把 enabled=0 改回 1：显式停用是合法值，缺省（未传 enabled）由门面
+	// toIntDef(args["enabled"],1) 兜底（对齐 Java 可空 Integer 的 null 判断，issues/82-7）
 	cp := *s
 	r.surrogates[s.ID] = &cp
 	return nil
@@ -170,12 +170,64 @@ func (r *ExtRepository) RemoveSurrogate(ctx context.Context, id int64) error {
 func (r *ExtRepository) PageSurrogates(ctx context.Context, query spi.PageQuery) ([]*model.ProcessSurrogate, int, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	var list []*model.ProcessSurrogate
+	// 对齐 JDBC PageSurrogates（issues/82-7）：Filters（operator/surrogate/process_name/enabled）
+	// + m_ 条件（matchConditions，列白名单 t.*）+ t.id DESC 排序 + 分页切片
+	var matched []*model.ProcessSurrogate
 	for _, s := range r.surrogates {
+		if !matchSurrogateFilters(s, query.Filters) {
+			continue
+		}
+		if !matchConditions(query.Conditions, surrogateFields(s)) {
+			continue
+		}
 		cp := *s
-		list = append(list, &cp)
+		matched = append(matched, &cp)
 	}
-	return list, len(list), nil
+	sort.Slice(matched, func(i, j int) bool { return matched[i].ID > matched[j].ID })
+	return slicePage(matched, query), len(matched), nil
+}
+
+// matchSurrogateFilters Filters 简单条件（对齐 JDBC operator/surrogate/process_name/enabled 白名单）
+func matchSurrogateFilters(s *model.ProcessSurrogate, filters map[string]interface{}) bool {
+	for col, val := range filters {
+		if val == nil {
+			continue
+		}
+		switch col {
+		case "operator":
+			if !eqValue(s.Operator, val) {
+				return false
+			}
+		case "surrogate":
+			if !eqValue(s.Surrogate, val) {
+				return false
+			}
+		case "process_name":
+			if !eqValue(s.ProcessName, val) {
+				return false
+			}
+		case "enabled":
+			if !eqValue(s.Enabled, val) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// surrogateFields 委托行字段（t.* 键，对齐 JDBC surrogateWhitelist 列名）
+func surrogateFields(s *model.ProcessSurrogate) map[string]interface{} {
+	return map[string]interface{}{
+		"t.id":           s.ID,
+		"t.process_name": s.ProcessName,
+		"t.operator":     s.Operator,
+		"t.surrogate":    s.Surrogate,
+		"t.enabled":      s.Enabled,
+		"t.start_time":   s.StartTime,
+		"t.end_time":     s.EndTime,
+		"t.create_time":  s.CreateTime,
+		"t.update_time":  s.UpdateTime,
+	}
 }
 
 func (r *ExtRepository) GetSurrogate(ctx context.Context, operator, processName string, at time.Time) (*model.ProcessSurrogate, error) {

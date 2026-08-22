@@ -251,6 +251,62 @@ func TestFacadeDesignAndSurrogate(t *testing.T) {
 	}
 }
 
+// TestFacadeSurrogatePageInAndEqConditions issues/82-7：委托分页 m_IN_processName / m_EQ_enabled
+// （对齐 Java 基准 testSurrogatePageInAndEqConditions；内存 ext 仓储须消费 m_ 条件，demo 即用内存）
+func TestFacadeSurrogatePageInAndEqConditions(t *testing.T) {
+	f, _, _ := setupFacade()
+	for i, m := range []map[string]interface{}{
+		{"operator": "zhangsan", "surrogate": "lisi", "processName": "leave", "enabled": 1},
+		{"operator": "zhangsan", "surrogate": "wangwu", "processName": "overtime", "enabled": 1},
+		{"operator": "zhangsan", "surrogate": "zhaoliu", "processName": "sick", "enabled": 0},
+	} {
+		r := f.Flow("processSurrogate/save", m)
+		if code, _ := r["code"].(int); code != 0 {
+			t.Fatalf("surrogate save %d failed: %v", i, r)
+		}
+	}
+	surrogateCount := func(args map[string]interface{}) int {
+		r := f.Flow("processSurrogate/page", args)
+		if code, _ := r["code"].(int); code != 0 {
+			t.Fatalf("surrogate page failed: %v", r)
+		}
+		return len(r["data"].(map[string]interface{})["rows"].([]interface{}))
+	}
+
+	// 无 m_ 过滤：3 条
+	if got := surrogateCount(map[string]interface{}{"operator": "zhangsan"}); got != 3 {
+		t.Fatalf("no-filter count = %d, want 3", got)
+	}
+	// m_IN_processName：命中 2
+	inList := []interface{}{"leave", "overtime"}
+	if got := surrogateCount(map[string]interface{}{"operator": "zhangsan", "m_IN_processName": inList}); got != 2 {
+		t.Fatalf("m_IN count = %d, want 2", got)
+	}
+	// m_EQ_enabled=1：命中 2
+	if got := surrogateCount(map[string]interface{}{"operator": "zhangsan", "m_EQ_enabled": 1}); got != 2 {
+		t.Fatalf("m_EQ count = %d, want 2", got)
+	}
+	// m_IN + m_EQ 组合：sick/overtime 中仅启用 → 1（overtime）
+	combined := map[string]interface{}{
+		"operator": "zhangsan", "m_IN_processName": []interface{}{"sick", "overtime"}, "m_EQ_enabled": 1,
+	}
+	r := f.Flow("processSurrogate/page", combined)
+	rows := r["data"].(map[string]interface{})["rows"].([]interface{})
+	if len(rows) != 1 {
+		t.Fatalf("combined count = %d, want 1", len(rows))
+	}
+	if pn := rows[0].(map[string]interface{})["processName"]; pn != "overtime" {
+		t.Fatalf("combined processName = %v, want overtime", pn)
+	}
+	// 负向：IN 全不命中 / EQ 无匹配 → 0
+	if got := surrogateCount(map[string]interface{}{"operator": "zhangsan", "m_IN_processName": []interface{}{"none1", "none2"}}); got != 0 {
+		t.Fatalf("IN no-hit count = %d, want 0", got)
+	}
+	if got := surrogateCount(map[string]interface{}{"operator": "zhangsan", "m_EQ_enabled": 2}); got != 0 {
+		t.Fatalf("EQ no-match count = %d, want 0", got)
+	}
+}
+
 // TestFacadeSurrogateDetailAndUpdate issues/77：委托编辑链路
 // save（前端空格格式时间窗）→ detail 回显 → update 改字段 → detail 再回显 + 负向 id 不存在
 func TestFacadeSurrogateDetailAndUpdate(t *testing.T) {
