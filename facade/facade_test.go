@@ -700,6 +700,35 @@ func TestFacadeErrors(t *testing.T) {
 	}
 }
 
+// TestFacadeCreateCCInstanceEmptyActors issues/82 负向：抄送空 actors 报错
+// （对齐 Java 基准 testCreateCCInstanceEmptyActors / PHP testCreateCCInstanceEmptyActors）。
+// createCCInstance 空/缺失 actorIds → code 99999999 + "actorIds 缺失"
+func TestFacadeCreateCCInstanceEmptyActors(t *testing.T) {
+	f, _, _ := setupFacade()
+
+	// 空 actorIds list
+	r := f.Flow("processInstance/createCCInstance", map[string]interface{}{
+		"processInstanceId": 123, "operator": "user1", "actorIds": []interface{}{},
+	})
+	if code, _ := r["code"].(int); code != 99999999 {
+		t.Fatalf("empty actorIds should fail, got %v", r)
+	}
+	if msg, _ := r["msg"].(string); !strings.Contains(msg, "actorIds 缺失") {
+		t.Fatalf("empty actorIds msg = %q, want contains 'actorIds 缺失'", msg)
+	}
+
+	// 负向边界：actorIds 键完全缺失同样报错
+	r = f.Flow("processInstance/createCCInstance", map[string]interface{}{
+		"processInstanceId": 123, "operator": "user1",
+	})
+	if code, _ := r["code"].(int); code != 99999999 {
+		t.Fatalf("missing actorIds should fail, got %v", r)
+	}
+	if msg, _ := r["msg"].(string); !strings.Contains(msg, "actorIds 缺失") {
+		t.Fatalf("missing actorIds msg = %q, want contains 'actorIds 缺失'", msg)
+	}
+}
+
 // ═══ highLight 决策分支表达式过滤（issues/06）═══
 
 func TestHighLightFiltersDecisionBranch(t *testing.T) {
