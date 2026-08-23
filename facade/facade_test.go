@@ -307,6 +307,62 @@ func TestFacadeSurrogatePageInAndEqConditions(t *testing.T) {
 	}
 }
 
+// TestFacadeSurrogateEffectiveWindowAndEnabled issues/82-12：委托生效判断——
+// 时间窗 startTime/endTime + enabled 过滤（五语言基准，对齐 Java testSurrogateEffectiveWindowAndEnabled）。
+// 5 条委托各对应一个时间态；每条查询只命中其中一条（processName 精确区分），不依赖返回顺序。
+func TestFacadeSurrogateEffectiveWindowAndEnabled(t *testing.T) {
+	f, _, extRepo := setupFacade()
+	op := "winop"
+	saves := []map[string]interface{}{
+		{"operator": op, "surrogate": "sA", "processName": "winA", "startTime": "2026-08-01 00:00:00", "endTime": "2026-08-31 23:59:59", "enabled": 1}, // 在窗
+		{"operator": op, "surrogate": "sB", "processName": "winB", "startTime": "2026-09-01 00:00:00", "enabled": 1},                                          // 未到
+		{"operator": op, "surrogate": "sC", "processName": "winC", "endTime": "2026-07-31 23:59:59", "enabled": 1},                                              // 已过
+		{"operator": op, "surrogate": "sD", "processName": "winD", "enabled": 0},                                                                                // 无窗停用
+		{"operator": op, "surrogate": "sE", "processName": "winE", "enabled": 1},                                                                                // 无窗启用
+	}
+	for i, m := range saves {
+		r := f.Flow("processSurrogate/save", m)
+		if code, _ := r["code"].(int); code != 0 {
+			t.Fatalf("surrogate save %d failed: %v", i, r)
+		}
+	}
+	ctx := context.Background()
+	at := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	get := func(pn string, at time.Time) *model.ProcessSurrogate {
+		hit, err := extRepo.GetSurrogate(ctx, op, pn, at)
+		if err != nil {
+			t.Fatalf("GetSurrogate(%s): %v", pn, err)
+		}
+		return hit
+	}
+	if h := get("winA", at); h == nil || h.Surrogate != "sA" {
+		t.Fatalf("在窗委托应生效, got %+v", h)
+	}
+	if h := get("winB", at); h != nil {
+		t.Fatalf("未到窗委托不应生效, got %+v", h)
+	}
+	if h := get("winC", at); h != nil {
+		t.Fatalf("已过窗委托不应生效, got %+v", h)
+	}
+	if h := get("winD", at); h != nil {
+		t.Fatalf("enabled=0 不应生效, got %+v", h)
+	}
+	if h := get("winE", at); h == nil || h.Surrogate != "sE" {
+		t.Fatalf("无窗启用委托应生效（NULL=不限）, got %+v", h)
+	}
+	if h := get("winZ", at); h != nil {
+		t.Fatalf("无匹配流程应返回 nil, got %+v", h)
+	}
+	// 换时间验证窗口边界随时间变化：B 在 9 月生效、A 在 9 月失效
+	atSep := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	if h := get("winB", atSep); h == nil || h.Surrogate != "sB" {
+		t.Fatalf("9 月：B 进入窗口应生效, got %+v", h)
+	}
+	if h := get("winA", atSep); h != nil {
+		t.Fatalf("9 月：A 已出窗口不应生效, got %+v", h)
+	}
+}
+
 // TestFacadeSurrogateDetailAndUpdate issues/77：委托编辑链路
 // save（前端空格格式时间窗）→ detail 回显 → update 改字段 → detail 再回显 + 负向 id 不存在
 func TestFacadeSurrogateDetailAndUpdate(t *testing.T) {
