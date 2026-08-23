@@ -1577,11 +1577,29 @@ func TestExecuteReject(t *testing.T) {
 	}
 }
 
-// TestExecuteCountersignDisagree issues/79：submitType=20 会签一票否决（对齐 Java CountersignHandler / PHP setMerged）
-func TestExecuteCountersignDisagree(t *testing.T) {
+// doingTaskIDByActor 会签场景：同节点多个 DOING 任务（每 actor 一个），按 actor 定位
+func doingTaskIDByActor(t *testing.T, repo *memory.Repository, instanceID int64, name, actor string) int64 {
+	t.Helper()
+	doing, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
+	for _, tk := range doing {
+		if tk.TaskName != name {
+			continue
+		}
+		for _, a := range tk.ActorIDs {
+			if a == actor {
+				return tk.ID
+			}
+		}
+	}
+	return 0
+}
+
+// TestExecuteCountersignDisagreeSoft issues/91：未配 ONE_VOTE_VETO 时 submitType=20 为软拒绝
+// （否决者任务正常完成、flag 记录、流程不阻断；06 串行会签继续推进到下一成员）
+func TestExecuteCountersignDisagreeSoft(t *testing.T) {
 	f, repo, _ := setupFacade()
 	ctx := context.Background()
-	// 06-countersign-sequential：apply 自动完成 → task1 串行会签 userA（userB 未开始）
+	// 06-countersign-sequential：apply 自动完成 → task1 串行会签（Go 逐人创建，先 userA）
 	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "06-countersign-sequential.json"))})
 	mustOk(t, r0)
 	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
@@ -1589,18 +1607,61 @@ func TestExecuteCountersignDisagree(t *testing.T) {
 	})
 	mustOk(t, r1)
 	instanceID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
-	taskA := doingTaskID(t, repo, instanceID, "task1")
+	taskA := doingTaskIDByActor(t, repo, instanceID, "task1", "userA")
 	if taskA == 0 {
 		t.Fatalf("会签节点应有 userA 的 DOING 任务")
 	}
 	repo.AddTaskActor(ctx, taskA, []string{"userA"})
-	// submitType=20：门面自动注入 countersignDisagreeFlag=1 → 引擎一票否决
-	// （会签节点提前流转 end）；flag 落任务/实例变量
+	// submitType=20（未配 ONE_VOTE_VETO → 软拒绝）：flag 记录，流程不阻断，串行推进到下一成员
 	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{"processTaskId": taskA, "operator": "userA", "submitType": 20}))
 	inst, _ := repo.FindInstanceByID(ctx, instanceID)
-	// 一票否决效果：会签节点被提前流转 end（若否决未生效，串行会签将停在 DOING 等 userB）
+	if inst.State != model.InstanceStateDoing {
+		t.Fatalf("软拒绝后实例应保持 DOING(10)，继续等 userB: %d", inst.State)
+	}
+	if v := toIntOfFlag(inst.Variables["countersignDisagreeFlag"]); v != 1 {
+		t.Fatalf("countersignDisagreeFlag=1 应落实例变量: %v", inst.Variables["countersignDisagreeFlag"])
+	}
+	doneA, _ := repo.FindTaskByID(ctx, taskA)
+	if doneA.TaskState != model.TaskStateDone {
+		t.Fatalf("软拒绝任务应正常完成: %d", doneA.TaskState)
+	}
+	if v := toIntOfFlag(doneA.Variables["countersignDisagreeFlag"]); v != 1 {
+		t.Fatalf("countersignDisagreeFlag=1 应落任务变量: %v", doneA.Variables)
+	}
+	if doneA.ActorID != "userA" {
+		t.Fatalf("否决人应记录为实际操作人 userA: %s", doneA.ActorID)
+	}
+	// 软拒绝推进串行会签到下一成员：userB 任务应被创建且 DOING
+	if doing := doingTaskIDByActor(t, repo, instanceID, "task1", "userB"); doing == 0 {
+		t.Fatalf("软拒绝后串行会签应推进到 userB（DOING）")
+	}
+}
+
+// TestExecuteCountersignOneVoteVeto issues/91：13（并行 + ONE_VOTE_VETO）→ 任一成员 submitType=20
+// 一票否决 → 会签节点立即推进 end（实例 FINISHED），其余 DOING 会签任务废弃(99)
+func TestExecuteCountersignOneVoteVeto(t *testing.T) {
+	f, repo, _ := setupFacade()
+	ctx := context.Background()
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "13-countersign-one-vote-veto.json"))})
+	mustOk(t, r0)
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"], "operator": "user1",
+	})
+	mustOk(t, r1)
+	instanceID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	// 并行会签全员预创建：userA/userB/userC 三个 DOING 任务
+	taskA := doingTaskIDByActor(t, repo, instanceID, "task1", "userA")
+	taskB := doingTaskIDByActor(t, repo, instanceID, "task1", "userB")
+	taskC := doingTaskIDByActor(t, repo, instanceID, "task1", "userC")
+	if taskA == 0 || taskB == 0 || taskC == 0 {
+		t.Fatalf("并行会签应预创建 userA/userB/userC 三个 DOING 任务: %d %d %d", taskA, taskB, taskC)
+	}
+	repo.AddTaskActor(ctx, taskA, []string{"userA"})
+	// userA 会签不同意（已配 ONE_VOTE_VETO → 一票否决）
+	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{"processTaskId": taskA, "operator": "userA", "submitType": 20}))
+	inst, _ := repo.FindInstanceByID(ctx, instanceID)
 	if inst.State != model.InstanceStateDone {
-		t.Fatalf("会签否决后实例应完成 FINISHED(20)（无否决则停留 DOING）: %d", inst.State)
+		t.Fatalf("一票否决后会签节点应立即推进 end（实例 FINISHED 20）: %d", inst.State)
 	}
 	if v := toIntOfFlag(inst.Variables["countersignDisagreeFlag"]); v != 1 {
 		t.Fatalf("countersignDisagreeFlag=1 应落实例变量: %v", inst.Variables["countersignDisagreeFlag"])
@@ -1609,11 +1670,58 @@ func TestExecuteCountersignDisagree(t *testing.T) {
 	if doneA.TaskState != model.TaskStateDone {
 		t.Fatalf("否决任务应已完成: %d", doneA.TaskState)
 	}
-	if v := toIntOfFlag(doneA.Variables["countersignDisagreeFlag"]); v != 1 {
-		t.Fatalf("countersignDisagreeFlag=1 应落任务变量: %v", doneA.Variables)
-	}
 	if doneA.ActorID != "userA" {
 		t.Fatalf("否决人应记录为实际操作人 userA: %s", doneA.ActorID)
+	}
+	// 否决应废弃其余成员（ABANDON 99）
+	for _, tid := range []int64{taskB, taskC} {
+		tk, _ := repo.FindTaskByID(ctx, tid)
+		if tk == nil || tk.TaskState != model.TaskStateAbandoned {
+			t.Fatalf("否决应废弃其余成员任务为 ABANDON(99): id=%d state=%v", tid, tk)
+		}
+	}
+	if doing, _ := repo.FindDoingTasks(ctx, instanceID, nil); len(doing) != 0 {
+		t.Fatalf("否决后应无 DOING 任务: %d", len(doing))
+	}
+}
+
+// TestExecuteCountersignDisagreeParallelSoft issues/91：05 并行（未配 ONE_VOTE_VETO）submitType=20
+// 软拒绝——否决者任务完成、flag 记录、流程不阻断，其余成员仍 DOING
+func TestExecuteCountersignDisagreeParallelSoft(t *testing.T) {
+	f, repo, _ := setupFacade()
+	ctx := context.Background()
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "05-countersign-parallel.json"))})
+	mustOk(t, r0)
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"], "operator": "user1",
+	})
+	mustOk(t, r1)
+	instanceID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	taskA := doingTaskIDByActor(t, repo, instanceID, "task1", "userA")
+	taskB := doingTaskIDByActor(t, repo, instanceID, "task1", "userB")
+	taskC := doingTaskIDByActor(t, repo, instanceID, "task1", "userC")
+	if taskA == 0 || taskB == 0 || taskC == 0 {
+		t.Fatalf("并行会签应预创建 userA/userB/userC 三个 DOING 任务: %d %d %d", taskA, taskB, taskC)
+	}
+	repo.AddTaskActor(ctx, taskA, []string{"userA"})
+	// userA 会签不同意（未配 ONE_VOTE_VETO → 软拒绝）
+	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{"processTaskId": taskA, "operator": "userA", "submitType": 20}))
+	inst, _ := repo.FindInstanceByID(ctx, instanceID)
+	if inst.State != model.InstanceStateDoing {
+		t.Fatalf("并行软拒绝后实例应保持 DOING(10)，等 userB/userC: %d", inst.State)
+	}
+	if v := toIntOfFlag(inst.Variables["countersignDisagreeFlag"]); v != 1 {
+		t.Fatalf("countersignDisagreeFlag=1 应落实例变量: %v", inst.Variables["countersignDisagreeFlag"])
+	}
+	doneA, _ := repo.FindTaskByID(ctx, taskA)
+	if doneA.TaskState != model.TaskStateDone {
+		t.Fatalf("软拒绝任务应正常完成: %d", doneA.TaskState)
+	}
+	for _, tid := range []int64{taskB, taskC} {
+		tk, _ := repo.FindTaskByID(ctx, tid)
+		if tk == nil || tk.TaskState != model.TaskStateDoing {
+			t.Fatalf("软拒绝不应废弃其余成员，应保持 DOING: id=%d state=%v", tid, tk)
+		}
 	}
 }
 

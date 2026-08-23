@@ -91,9 +91,14 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 			}
 			now := time.Now()
 			ct, _ := stringFromProps(curNode.Properties, "countersignType")
-			// issues/79：会签一票否决（对齐 Java CountersignHandler / PHP setMerged(true)）——
-			// submitType=20 COUNTERSIGN_DISAGREE 时跳过会签"未完成即停留"门控，提前流转后续节点
-			csVeto := ct != "" && toIntOf(vars[KeySubmitType]) == int(model.SubmitTypeCountersignDisagree)
+			csCond, _ := stringFromProps(curNode.Properties, "countersignCompletionCondition")
+			// issues/91：会签一票否决仅当节点配置 ONE_VOTE_VETO（忽略大小写）时生效，
+			// submitType=20 才跳过会签"未完成即停留"门控提前流转；否则为软拒绝——
+			// 否决者任务正常完成、countersignDisagreeFlag=1 已记录为变量（供下游参考），
+			// 流程不阻断（对齐 mldong 内置引擎 / Java CountersignHandler）
+			csVeto := ct != "" &&
+				toIntOf(vars[KeySubmitType]) == int(model.SubmitTypeCountersignDisagree) &&
+				strings.EqualFold(strings.TrimSpace(csCond), "ONE_VOTE_VETO")
 			if ct == "SEQUENTIAL" && !csVeto {
 				doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
 				if len(doing) == 0 {
@@ -120,6 +125,18 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 			if len(doing) > 0 {
 				inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
 				return inst, nil
+			}
+		}
+		// issues/91：会签节点 merged 后（ONE_VOTE_VETO 否决 / 全部完成任一路径），
+		// 废弃该节点剩余 DOING 任务（对齐内置引擎 abandonProcessTask）：
+		// SEQUENTIAL 后续成员任务尚未创建天然 no-op；PARALLEL 全员预创建，否决时废弃其余
+		// （刚完成者已 FINISHED 不会误伤）。逐条持久化并回写聚合副本（E25：防 UpdateInstance 级联回写旧状态）
+		if ct != "" {
+			remaining, _ := e.repo.FindDoingTasks(ctx, inst.ID, []string{curNode.ID})
+			for _, t := range remaining {
+				t.Abandon(now)
+				e.repo.UpdateTask(ctx, t)
+				syncTaskToAggregate(inst, t)
 			}
 		}
 		for _, node := range followEdges(flow, curNode.ID) {
