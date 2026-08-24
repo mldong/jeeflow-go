@@ -5,8 +5,8 @@
 
 [jeeflow](https://jeeflow-doc.mldong.com) 引擎规范的 **Go 语言实现**，零外部依赖，纯 stdlib。
 
-> **v1.1.0**：新增管理扩展（流程设计/历史/委托 + `ProcessExtRepository`）与统一门面
-> `facade.Flow(action, map)`；assignee 变量解析与 `flow.auto`/`flow.admin` 系统代执行对齐 boot2/boot3。
+统一门面 `facade.Flow(action, map)`；支持管理扩展（流程设计/历史/委托）、
+assignee 变量解析与 `flow.auto`/`flow.admin` 系统代执行。
 
 ---
 
@@ -85,11 +85,7 @@ jeeflow-go/
 
 ## 规范
 
-对齐 [jeeflow-doc](https://jeeflow-doc.mldong.com) v1.0，与 Java 版共享同一套流程 JSON 文件驱动测试。
-
-## License
-
-Apache-2.0
+对齐 [jeeflow-doc](https://jeeflow-doc.mldong.com)，与 Java 版共享同一套流程 JSON 文件驱动测试。
 
 ## 文档
 
@@ -100,3 +96,10 @@ Apache-2.0
 | [流程定义](docs/flow-definition.md) | LogicFlow JSON 格式 |
 | [SPI 扩展](docs/spi-guide.md) | 仓储/用户/ID 生成器 |
 | [GoFrame 集成](docs/goframe-demo.md) | REST 演示站 |
+
+## License
+
+Copyright © 2025-2026 mldong
+
+Licensed under the Apache License, Version 2.0.
+See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
