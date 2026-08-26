@@ -13,8 +13,8 @@ RUN CGO_ENABLED=0 go build -o /go-demo ./cmd/demo
 FROM alpine:3.20
 RUN apk --no-cache add ca-certificates tzdata
 COPY --from=builder /go-demo /go-demo
-# 共享 flows 目录（loadFlows 硬编码相对路径候选链，须放到候选位置）
+# 本仓 flows/ 副本（flowsutil.Dir() 从 cwd=/app 向上命中；用户单仓即可构建）
 WORKDIR /app
-COPY jeeflow-java/jeeflow-core/src/test/resources/flows /app/jeeflow-java/jeeflow-core/src/test/resources/flows
+COPY flows /app/flows
 EXPOSE 8081
 CMD ["/go-demo"]

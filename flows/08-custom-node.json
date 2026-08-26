@@ -1,0 +1,87 @@
+{
+  "name": "custom-node",
+  "displayName": "自定义节点流程",
+  "type": "approval",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "snaker:start",
+      "x": 100,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "开始"
+      }
+    },
+    {
+      "id": "apply",
+      "type": "snaker:task",
+      "x": 200,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "apply-form",
+        "assignee": "applicant",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "发起申请"
+      }
+    },
+    {
+      "id": "custom1",
+      "type": "snaker:custom",
+      "x": 300,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "clazz": "com.mldong.jeeflow.test.TestCustomHandler",
+        "methodName": "execute",
+        "args": "param1",
+        "val": "customResult"
+      },
+      "text": {
+        "value": "通知外部系统"
+      }
+    },
+    {
+      "id": "end",
+      "type": "snaker:end",
+      "x": 500,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "结束"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e0",
+      "sourceNodeId": "start",
+      "targetNodeId": "apply",
+      "properties": {}
+    },
+    {
+      "id": "e_apply_1",
+      "sourceNodeId": "apply",
+      "targetNodeId": "custom1",
+      "properties": {}
+    },
+    {
+      "id": "e2",
+      "sourceNodeId": "custom1",
+      "targetNodeId": "end",
+      "properties": {}
+    }
+  ]
+}

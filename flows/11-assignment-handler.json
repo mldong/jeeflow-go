@@ -1,0 +1,134 @@
+{
+  "name": "assignment-handler",
+  "displayName": "参与者解析流程（内置 handler）",
+  "type": "approval",
+  "instanceUrl": "/form/apply",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "snaker:start",
+      "x": 100,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "开始"
+      }
+    },
+    {
+      "id": "task1",
+      "type": "snaker:task",
+      "x": 200,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "field-form",
+        "assignmentHandler": "com.mldong.jeeflow.interceptor.impl.FormFieldAssigneeHandler",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "按表单字段"
+      }
+    },
+    {
+      "id": "task2",
+      "type": "snaker:task",
+      "x": 300,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "operator-form",
+        "assignmentHandler": "com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "发起人审批"
+      }
+    },
+    {
+      "id": "task3",
+      "type": "snaker:task",
+      "x": 400,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "dept-form",
+        "assignmentHandler": "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$DeptLeaderAssignmentHandler",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "部门领导"
+      }
+    },
+    {
+      "id": "task4",
+      "type": "snaker:task",
+      "x": 500,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "role-form",
+        "assignmentHandler": "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskRoleAssigneeHandler",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "按角色"
+      }
+    },
+    {
+      "id": "end",
+      "type": "snaker:end",
+      "x": 600,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "结束"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e0",
+      "sourceNodeId": "start",
+      "targetNodeId": "task1",
+      "properties": {}
+    },
+    {
+      "id": "e1",
+      "sourceNodeId": "task1",
+      "targetNodeId": "task2",
+      "properties": {}
+    },
+    {
+      "id": "e2",
+      "sourceNodeId": "task2",
+      "targetNodeId": "task3",
+      "properties": {}
+    },
+    {
+      "id": "e3",
+      "sourceNodeId": "task3",
+      "targetNodeId": "task4",
+      "properties": {}
+    },
+    {
+      "id": "e4",
+      "sourceNodeId": "task4",
+      "targetNodeId": "end",
+      "properties": {}
+    }
+  ]
+}

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/mldong/jeeflow-go/engine"
+	"github.com/mldong/jeeflow-go/internal/flowsutil"
 	"github.com/mldong/jeeflow-go/memory"
 	"github.com/mldong/jeeflow-go/model"
 	"github.com/mldong/jeeflow-go/spi"
@@ -19,7 +21,7 @@ func setup() (*engine.EngineImpl, *memory.Repository) {
 }
 
 func registerFlow(repo *memory.Repository, filename string) *model.ProcessDefine {
-	data, err := os.ReadFile("../jeeflow-java/jeeflow-core/src/test/resources/flows/" + filename)
+	data, err := os.ReadFile(filepath.Join(flowsutil.Dir(), filename))
 	if err != nil {
 		panic(err.Error())
 	}

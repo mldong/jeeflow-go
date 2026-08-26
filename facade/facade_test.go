@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/mldong/jeeflow-go/engine"
 	"github.com/mldong/jeeflow-go/facade"
+	"github.com/mldong/jeeflow-go/internal/flowsutil"
 	"github.com/mldong/jeeflow-go/memory"
 	"github.com/mldong/jeeflow-go/model"
 	"github.com/mldong/jeeflow-go/spi"
@@ -85,19 +87,11 @@ func setupFacade() (*facade.Facade, *memory.Repository, *memory.ExtRepository) {
 
 func flowContent(t *testing.T, name string) []byte {
 	t.Helper()
-	candidates := []string{
-		"../../jeeflow-java/jeeflow-core/src/test/resources/flows/" + name,
-		"../../../jeeflow-java/jeeflow-core/src/test/resources/flows/" + name,
-		"../../../../jeeflow-java/jeeflow-core/src/test/resources/flows/" + name,
+	data, err := os.ReadFile(filepath.Join(flowsutil.Dir(), name))
+	if err != nil {
+		t.Fatalf("flow json not found: %s", name)
 	}
-	for _, p := range candidates {
-		data, err := os.ReadFile(p)
-		if err == nil {
-			return data
-		}
-	}
-	t.Fatalf("flow json not found: %s", name)
-	return nil
+	return data
 }
 
 func TestFacadeDeployVersion(t *testing.T) {

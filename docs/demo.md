@@ -16,7 +16,7 @@ go build -o demo.exe ./cmd/demo
 # → http://localhost:8081
 ```
 
-> 演示站从 `jeeflow-java` 的共享流程 JSON 加载 14 个示例流程（候选路径链兼容不同启动目录）。对接 jeeflow-ui（:5173）时右上角切到 `🔷 Go :8081`；接口规范见[统一门面接口文档](../../spec/06-facade)。
+> 演示站从本仓 `flows/` 副本加载全部共享流程 JSON（15 个；唯一编辑源在 `jeeflow-java` 仓，`flowsutil` 在维护者机器上执行时精确镜像进本仓，单语言用户下载即用）。对接 jeeflow-ui（:5173）时右上角切到 `🔷 Go :8081`；接口规范见[统一门面接口文档](../../spec/06-facade)。
 
 > v1.5.0 起 `/wf/**` 为**单入口门面转发**（`JeeflowFacade.flow(action, body)`，URL 路径段即 action）——
 > 集成方 controller 一行转发即可复用全部流程能力，参数与返回结构不变。

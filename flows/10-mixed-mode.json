@@ -1,0 +1,223 @@
+{
+  "name": "mixed-mode",
+  "displayName": "混合模式流程",
+  "type": "business",
+  "instanceUrl": "/form/business",
+  "preInterceptors": "",
+  "postInterceptors": "",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "snaker:start",
+      "x": 100,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "开始"
+      }
+    },
+    {
+      "id": "apply",
+      "type": "snaker:task",
+      "x": 250,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "mix-form",
+        "assignee": "applicant",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "发起申请"
+      }
+    },
+    {
+      "id": "fork1",
+      "type": "snaker:fork",
+      "x": 400,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "分支"
+      }
+    },
+    {
+      "id": "task2",
+      "type": "snaker:task",
+      "x": 550,
+      "y": 100,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "check-form",
+        "assignee": "checker",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "财务审核"
+      }
+    },
+    {
+      "id": "task3",
+      "type": "snaker:task",
+      "x": 550,
+      "y": 300,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "review-form",
+        "assignee": "reviewer",
+        "taskType": 1,
+        "performType": 0
+      },
+      "text": {
+        "value": "法务审核"
+      }
+    },
+    {
+      "id": "join1",
+      "type": "snaker:join",
+      "x": 700,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "合并"
+      }
+    },
+    {
+      "id": "decision1",
+      "type": "snaker:decision",
+      "x": 850,
+      "y": 200,
+      "properties": {
+        "width": 80,
+        "height": 50,
+        "expr": "finalAmount > 5000",
+        "handleClass": ""
+      },
+      "text": {
+        "value": "金额>5000?"
+      }
+    },
+    {
+      "id": "task4",
+      "type": "snaker:task",
+      "x": 1000,
+      "y": 100,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "boss-form",
+        "assignee": "boss",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "老板终审"
+      }
+    },
+    {
+      "id": "end",
+      "type": "snaker:end",
+      "x": 1150,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "结束"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "sourceNodeId": "start",
+      "targetNodeId": "apply",
+      "properties": {}
+    },
+    {
+      "id": "e2",
+      "sourceNodeId": "apply",
+      "targetNodeId": "fork1",
+      "properties": {}
+    },
+    {
+      "id": "e3",
+      "sourceNodeId": "fork1",
+      "targetNodeId": "task2",
+      "properties": {},
+      "text": {
+        "value": "财务审核"
+      }
+    },
+    {
+      "id": "e4",
+      "sourceNodeId": "fork1",
+      "targetNodeId": "task3",
+      "properties": {},
+      "text": {
+        "value": "法务审核"
+      }
+    },
+    {
+      "id": "e5",
+      "sourceNodeId": "task2",
+      "targetNodeId": "join1",
+      "properties": {}
+    },
+    {
+      "id": "e6",
+      "sourceNodeId": "task3",
+      "targetNodeId": "join1",
+      "properties": {}
+    },
+    {
+      "id": "e7",
+      "sourceNodeId": "join1",
+      "targetNodeId": "decision1",
+      "properties": {}
+    },
+    {
+      "id": "e8",
+      "sourceNodeId": "decision1",
+      "targetNodeId": "task4",
+      "properties": {
+        "expr": "finalAmount > 5000"
+      },
+      "text": {
+        "value": "金额>5000"
+      }
+    },
+    {
+      "id": "e9",
+      "sourceNodeId": "decision1",
+      "targetNodeId": "end",
+      "properties": {
+        "expr": "finalAmount <= 5000"
+      },
+      "text": {
+        "value": "金额≤5000"
+      }
+    },
+    {
+      "id": "e10",
+      "sourceNodeId": "task4",
+      "targetNodeId": "end",
+      "properties": {}
+    }
+  ]
+}

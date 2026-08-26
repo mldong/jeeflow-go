@@ -12,6 +12,7 @@ import (
 	"github.com/gogf/gf/v2/net/ghttp"
 	"github.com/mldong/jeeflow-go/engine"
 	"github.com/mldong/jeeflow-go/facade"
+	"github.com/mldong/jeeflow-go/internal/flowsutil"
 	"github.com/mldong/jeeflow-go/memory"
 	"github.com/mldong/jeeflow-go/model"
 )
@@ -62,28 +63,11 @@ func (c *Controller) flowAny(r *ghttp.Request) {
 }
 
 func loadFlows(repo *memory.Repository) {
-	// 候选路径链：优先环境变量 JEEFLOW_FLOWS_DIR（容器部署挂载），再兼容不同启动目录
-	candidates := []string{}
-	if dir := os.Getenv("JEEFLOW_FLOWS_DIR"); dir != "" {
-		candidates = append(candidates, dir)
-	}
-	candidates = append(candidates,
-		filepath.Join("..", "jeeflow-java", "jeeflow-core", "src", "test", "resources", "flows"),
-		filepath.Join("..", "..", "..", "jeeflow-java", "jeeflow-core", "src", "test", "resources", "flows"),
-		filepath.Join("jeeflow-java", "jeeflow-core", "src", "test", "resources", "flows"),
-		filepath.Join("jeeflow-hub", "jeeflow-java", "jeeflow-core", "src", "test", "resources", "flows"),
-	)
-	var flowsDir string
-	var entries []os.DirEntry
-	var err error
-	for _, cand := range candidates {
-		if e, e2 := os.ReadDir(cand); e2 == nil {
-			flowsDir, entries, err = cand, e, nil
-			break
-		}
-	}
-	if err != nil || flowsDir == "" {
-		panic("cannot find flows directory")
+	// 流程定义：只读本仓 flows/（flowsutil 已在维护者机器上把 Java 源精确镜像进来）
+	flowsDir := flowsutil.Dir()
+	entries, err := os.ReadDir(flowsDir)
+	if err != nil {
+		panic("cannot find flows directory: " + flowsDir)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	for i, e := range entries {

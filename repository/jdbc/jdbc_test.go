@@ -19,12 +19,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/mldong/jeeflow-go/engine"
+	"github.com/mldong/jeeflow-go/internal/flowsutil"
 	"github.com/mldong/jeeflow-go/model"
 	"github.com/mldong/jeeflow-go/repository/jdbc"
 	"github.com/mldong/jeeflow-go/spi"
@@ -89,22 +91,14 @@ func cleanup(t *testing.T, db *sql.DB) {
 	}
 }
 
-// loadFlow 读取 jeeflow-java 共享测试流程 JSON
+// loadFlow 读取本仓 flows/ 测试流程 JSON（flowsutil 已在维护者机器上镜像 Java 源）
 func loadFlow(t *testing.T, name string) []byte {
 	t.Helper()
-	candidates := []string{
-		"../../../jeeflow-java/jeeflow-core/src/test/resources/flows/" + name,
-		"../../../../jeeflow-java/jeeflow-core/src/test/resources/flows/" + name,
-		"../../../../../jeeflow-java/jeeflow-core/src/test/resources/flows/" + name,
+	data, err := os.ReadFile(filepath.Join(flowsutil.Dir(), name))
+	if err != nil {
+		t.Fatalf("flow json not found: %s", name)
 	}
-	for _, p := range candidates {
-		data, err := os.ReadFile(p)
-		if err == nil {
-			return data
-		}
-	}
-	t.Fatalf("flow json not found: %s", name)
-	return nil
+	return data
 }
 
 func insertDefine(t *testing.T, db *sql.DB, name string, content []byte) {

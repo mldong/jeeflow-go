@@ -1,0 +1,160 @@
+{
+  "name": "fork-join",
+  "displayName": "并行分支合并流程",
+  "type": "approval",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "snaker:start",
+      "x": 100,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "开始"
+      }
+    },
+    {
+      "id": "apply",
+      "type": "snaker:task",
+      "x": 200,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "apply-form",
+        "assignee": "applicant",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "发起申请"
+      }
+    },
+    {
+      "id": "fork1",
+      "type": "snaker:fork",
+      "x": 250,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "分支"
+      }
+    },
+    {
+      "id": "taskA",
+      "type": "snaker:task",
+      "x": 400,
+      "y": 100,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "form-a",
+        "assignee": "userA",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "A审批"
+      }
+    },
+    {
+      "id": "taskB",
+      "type": "snaker:task",
+      "x": 400,
+      "y": 300,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "form-b",
+        "assignee": "userB",
+        "taskType": 1,
+        "performType": 0
+      },
+      "text": {
+        "value": "B审批"
+      }
+    },
+    {
+      "id": "join1",
+      "type": "snaker:join",
+      "x": 550,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "合并"
+      }
+    },
+    {
+      "id": "end",
+      "type": "snaker:end",
+      "x": 700,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "结束"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e0",
+      "sourceNodeId": "start",
+      "targetNodeId": "apply",
+      "properties": {}
+    },
+    {
+      "id": "e_apply_1",
+      "sourceNodeId": "apply",
+      "targetNodeId": "fork1",
+      "properties": {}
+    },
+    {
+      "id": "e2",
+      "sourceNodeId": "fork1",
+      "targetNodeId": "taskA",
+      "properties": {},
+      "text": {
+        "value": "A审批"
+      }
+    },
+    {
+      "id": "e3",
+      "sourceNodeId": "fork1",
+      "targetNodeId": "taskB",
+      "properties": {},
+      "text": {
+        "value": "B审批"
+      }
+    },
+    {
+      "id": "e4",
+      "sourceNodeId": "taskA",
+      "targetNodeId": "join1",
+      "properties": {}
+    },
+    {
+      "id": "e5",
+      "sourceNodeId": "taskB",
+      "targetNodeId": "join1",
+      "properties": {}
+    },
+    {
+      "id": "e6",
+      "sourceNodeId": "join1",
+      "targetNodeId": "end",
+      "properties": {}
+    }
+  ]
+}

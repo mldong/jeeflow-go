@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/mldong/jeeflow-go/engine"
 	"github.com/mldong/jeeflow-go/facade"
+	"github.com/mldong/jeeflow-go/internal/flowsutil"
 	"github.com/mldong/jeeflow-go/memory"
 	"github.com/mldong/jeeflow-go/metadata"
 	"github.com/mldong/jeeflow-go/model"
@@ -21,7 +23,7 @@ import (
 
 // 用 01-simple 流程注入 relTableName（与 Java 集成测试同构）
 func registerPersistFlow(repo *memory.Repository, withRelTable bool) *model.ProcessDefine {
-	data, err := os.ReadFile("../../jeeflow-java/jeeflow-core/src/test/resources/flows/01-simple.json")
+	data, err := os.ReadFile(filepath.Join(flowsutil.Dir(), "01-simple.json"))
 	if err != nil {
 		panic(err.Error())
 	}
@@ -255,7 +257,7 @@ func TestBigintUserColumn(t *testing.T) {
 	eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}})
 
 	// 流程 content 注入 relTableName=biz_settle
-	data, err := os.ReadFile("../../jeeflow-java/jeeflow-core/src/test/resources/flows/01-simple.json")
+	data, err := os.ReadFile(filepath.Join(flowsutil.Dir(), "01-simple.json"))
 	if err != nil {
 		t.Fatalf("read flow failed: %v", err)
 	}
@@ -298,7 +300,7 @@ func TestBigintUserColumn(t *testing.T) {
 
 // registerSyncFlow 注入 SYNC 模式：persistMode + task1 字段权限 + 结束节点改名 finish
 func registerSyncFlow(repo *memory.Repository, tableName string) *model.ProcessDefine {
-	data, err := os.ReadFile("../../jeeflow-java/jeeflow-core/src/test/resources/flows/01-simple.json")
+	data, err := os.ReadFile(filepath.Join(flowsutil.Dir(), "01-simple.json"))
 	if err != nil {
 		panic(err.Error())
 	}
@@ -707,7 +709,7 @@ func TestFacadeListByTypeAndTopLevelJSON(t *testing.T) {
 	}
 	// bizData：未注册 → 报错；注册后回显
 	// 先部署真实流程（01-simple + relTableName）
-	simple, _ := os.ReadFile("../../jeeflow-java/jeeflow-core/src/test/resources/flows/01-simple.json")
+	simple, _ := os.ReadFile(filepath.Join(flowsutil.Dir(), "01-simple.json"))
 	content := strings.ReplaceAll(string(simple), `"type": "approval"`, `"type": "approval", "relTableName": "biz_top"`)
 	r = fac.Flow("processDesign/updateDefine", map[string]interface{}{
 		"processDesignId": int64(2), "operator": "user1", "content": content})

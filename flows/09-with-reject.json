@@ -1,0 +1,110 @@
+{
+  "name": "with-reject",
+  "displayName": "含驳回流程",
+  "type": "approval",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "snaker:start",
+      "x": 100,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "开始"
+      }
+    },
+    {
+      "id": "apply",
+      "type": "snaker:task",
+      "x": 200,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "apply-form",
+        "assignee": "applicant",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "发起申请"
+      }
+    },
+    {
+      "id": "task1",
+      "type": "snaker:task",
+      "x": 300,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "apply-form",
+        "assignee": "leader",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "上级审批"
+      }
+    },
+    {
+      "id": "task2",
+      "type": "snaker:task",
+      "x": 500,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "apply-form",
+        "assignee": "manager",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "经理审批"
+      }
+    },
+    {
+      "id": "end",
+      "type": "snaker:end",
+      "x": 700,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "结束"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e0",
+      "sourceNodeId": "start",
+      "targetNodeId": "apply",
+      "properties": {}
+    },
+    {
+      "id": "e_apply_1",
+      "sourceNodeId": "apply",
+      "targetNodeId": "task1",
+      "properties": {}
+    },
+    {
+      "id": "e2",
+      "sourceNodeId": "task1",
+      "targetNodeId": "task2",
+      "properties": {}
+    },
+    {
+      "id": "e3",
+      "sourceNodeId": "task2",
+      "targetNodeId": "end",
+      "properties": {}
+    }
+  ]
+}

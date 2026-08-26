@@ -1,0 +1,90 @@
+{
+  "name": "candidate-flow",
+  "displayName": "候选人双源流程",
+  "type": "approval",
+  "instanceUrl": "/form/apply",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "snaker:start",
+      "x": 100,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "开始"
+      }
+    },
+    {
+      "id": "apply",
+      "type": "snaker:task",
+      "x": 200,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "apply-form",
+        "assignee": "applicant",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "发起申请"
+      }
+    },
+    {
+      "id": "review",
+      "type": "snaker:task",
+      "x": 320,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "review-form",
+        "assignee": "leader",
+        "candidateUsers": "userA,userB",
+        "candidateGroups": "finance",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "审核（候选：userA/userB + 财务角色）"
+      }
+    },
+    {
+      "id": "end",
+      "type": "snaker:end",
+      "x": 450,
+      "y": 200,
+      "properties": {
+        "width": 50,
+        "height": 50
+      },
+      "text": {
+        "value": "结束"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e0",
+      "sourceNodeId": "start",
+      "targetNodeId": "apply",
+      "properties": {}
+    },
+    {
+      "id": "e1",
+      "sourceNodeId": "apply",
+      "targetNodeId": "review",
+      "properties": {}
+    },
+    {
+      "id": "e2",
+      "sourceNodeId": "review",
+      "targetNodeId": "end",
+      "properties": {}
+    }
+  ]
+}
