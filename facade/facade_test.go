@@ -431,6 +431,82 @@ func TestFacadeSurrogateDetailAndUpdate(t *testing.T) {
 	}
 }
 
+// TestFacadeSurrogateRemoveBatchIDs issues/95：前端「我的委托」行内与批量删除统一发
+// {ids}（行内 = 长度 1 的数组），门面此前只读单数 {id} → 该页删除整体不可用；
+// 单 {id} 形态保留兼容（移动端 workflow.uts 发这个）。
+func TestFacadeSurrogateRemoveBatchIDs(t *testing.T) {
+	f, _, extRepo := setupFacade()
+	save := func(op, agent, name string) int64 {
+		r := f.Flow("processSurrogate/save", map[string]interface{}{
+			"operator": op, "surrogate": agent, "processName": name,
+		})
+		if code, _ := r["code"].(int); code != 0 {
+			t.Fatalf("surrogate save(%s) failed: %v", name, r)
+		}
+		return mustI64(r["data"].(map[string]interface{})["id"])
+	}
+	gone := func(id int64, label string) {
+		s, _ := extRepo.FindSurrogateByID(context.Background(), id)
+		if s != nil {
+			t.Fatalf("%s 应已删除, got %+v", label, s)
+		}
+	}
+
+	a := save("zhangsan", "lisiA", "leaveA")
+	b := save("zhangsan", "lisiB", "leaveB")
+
+	// 批量删除 {ids}
+	r := f.Flow("processSurrogate/remove", map[string]interface{}{"ids": []interface{}{a, b}})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("batch remove failed: %v", r)
+	}
+	gone(a, "批量 a")
+	gone(b, "批量 b")
+
+	// 行内删除：前端同样走 {ids}，长度 1
+	c := save("lisiC", "lisiD", "leaveC")
+	r = f.Flow("processSurrogate/remove", map[string]interface{}{"ids": []interface{}{c}})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("single-element ids remove failed: %v", r)
+	}
+	gone(c, "行内 c")
+
+	// 单 {id} 兼容形态回归
+	d := save("zhangsan", "lisiE", "leaveD")
+	r = f.Flow("processSurrogate/remove", map[string]interface{}{"id": d})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("single id remove failed: %v", r)
+	}
+	gone(d, "单 id d")
+}
+
+// TestFacadeRemoveEmptyIDsRejected issues/95 §5②：{ids}/{id} 缺失或空数组一律报错，
+// 禁止静默成功（Go 此前 {ids} 为空切片会循环 0 次直接回成功）。
+func TestFacadeRemoveEmptyIDsRejected(t *testing.T) {
+	f, _, _ := setupFacade()
+	cases := []struct {
+		action string
+		args   map[string]interface{}
+	}{
+		{"processSurrogate/remove", map[string]interface{}{"ids": []interface{}{}}},
+		{"processSurrogate/remove", map[string]interface{}{"surrogate": "lisi"}},
+		{"processSurrogate/remove", map[string]interface{}{"ids": []interface{}{int64(123), nil}}},
+		{"processDefine/remove", map[string]interface{}{"ids": []interface{}{}}},
+		{"processDesign/remove", map[string]interface{}{"ids": []interface{}{}}},
+		{"processDefine/upAndDown", map[string]interface{}{"ids": []interface{}{}, "opType": 0}},
+	}
+	for _, tc := range cases {
+		r := f.Flow(tc.action, tc.args)
+		code, _ := r["code"].(int)
+		if code != 99999999 {
+			t.Fatalf("%s %v should be 99999999, got %v", tc.action, tc.args, r)
+		}
+		if msg, _ := r["msg"].(string); !strings.Contains(msg, "id 缺失或非法") {
+			t.Fatalf("%s %v msg = %q, want 含「id 缺失或非法」", tc.action, tc.args, msg)
+		}
+	}
+}
+
 func TestFacadeViewEndpoints(t *testing.T) {
 	f, repo, _ := setupFacade()
 	content := string(flowContent(t, "01-simple.json"))

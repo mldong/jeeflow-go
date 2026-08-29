@@ -301,23 +301,16 @@ func (f *Facade) redeploy(args map[string]interface{}) error {
 
 func (f *Facade) removeDefine(args map[string]interface{}) error {
 	// issues/28：兼容 {ids} 批量（boot3 前端 IdsParam 惯例）与单 {id}
-	if ids, ok := asList(args["ids"]); ok {
-		for _, i := range ids {
-			id, err := toInt64(i)
-			if err != nil {
-				return fmt.Errorf("id 缺失或非法: %v", err)
-			}
-			if err := f.repo.RemoveDefine(context.Background(), id); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	id, err := toInt64(args["id"])
+	ids, err := idListArgs(args)
 	if err != nil {
-		return fmt.Errorf("id 缺失或非法: %v", err)
+		return err
 	}
-	return f.repo.RemoveDefine(context.Background(), id)
+	for _, id := range ids {
+		if err := f.repo.RemoveDefine(context.Background(), id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (f *Facade) upAndDown(args map[string]interface{}) error {
@@ -326,23 +319,16 @@ func (f *Facade) upAndDown(args map[string]interface{}) error {
 	if err != nil {
 		return fmt.Errorf("opType/state 缺失或非法: %v", err)
 	}
-	if ids, ok := asList(args["ids"]); ok {
-		for _, i := range ids {
-			id, err := toInt64(i)
-			if err != nil {
-				return fmt.Errorf("id 缺失或非法: %v", err)
-			}
-			if err := f.repo.UpdateDefineState(context.Background(), id, state); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	id, err := toInt64(args["id"])
+	ids, err := idListArgs(args)
 	if err != nil {
-		return fmt.Errorf("id 缺失或非法: %v", err)
+		return err
 	}
-	return f.repo.UpdateDefineState(context.Background(), id, state)
+	for _, id := range ids {
+		if err := f.repo.UpdateDefineState(context.Background(), id, state); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (f *Facade) withdraw(args map[string]interface{}) error {
@@ -534,23 +520,16 @@ func (f *Facade) designSave(args map[string]interface{}) (interface{}, error) {
 
 func (f *Facade) designRemove(args map[string]interface{}) error {
 	// issues/28：兼容 {ids} 批量（boot3 前端 IdsParam 惯例）与单 {id}
-	if ids, ok := asList(args["ids"]); ok {
-		for _, i := range ids {
-			id, err := toInt64(i)
-			if err != nil {
-				return fmt.Errorf("id 缺失或非法: %v", err)
-			}
-			if err := f.ext().RemoveDesign(context.Background(), id); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	id, err := toInt64(args["id"])
+	ids, err := idListArgs(args)
 	if err != nil {
-		return fmt.Errorf("id 缺失或非法: %v", err)
+		return err
 	}
-	return f.ext().RemoveDesign(context.Background(), id)
+	for _, id := range ids {
+		if err := f.ext().RemoveDesign(context.Background(), id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // designListByType 按类型分组列出流程设计（issue 30，对齐 Java issues/28）：不依赖框架字典
@@ -927,11 +906,17 @@ func surrogateRowToMap(s *model.ProcessSurrogate) map[string]interface{} {
 }
 
 func (f *Facade) surrogateRemove(args map[string]interface{}) error {
-	id, err := toInt64(args["id"])
+	// issues/95：前端「我的委托」行内/批量删除统一发 {ids}，与 define/design remove 同惯例
+	ids, err := idListArgs(args)
 	if err != nil {
-		return fmt.Errorf("id 缺失或非法: %v", err)
+		return err
 	}
-	return f.ext().RemoveSurrogate(context.Background(), id)
+	for _, id := range ids {
+		if err := f.ext().RemoveSurrogate(context.Background(), id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ═══ 视图端点（v1.2.0） ═══
@@ -2034,6 +2019,30 @@ func parseVarMap(s string) map[string]interface{} {
 	}
 	_ = json.Unmarshal([]byte(s), &m)
 	return m
+}
+
+// idListArgs 删除/启停类 action 的批量主键：mldong IdsParam 惯例下 {ids} 数组优先，
+// 兼容单 {id}；两者皆缺失、空数组或含非法值一律报错（issues/95，对齐 Java idListArgs）。
+func idListArgs(args map[string]interface{}) ([]int64, error) {
+	if raw, ok := asList(args["ids"]); ok {
+		if len(raw) == 0 {
+			return nil, fmt.Errorf("id 缺失或非法")
+		}
+		out := make([]int64, 0, len(raw))
+		for _, v := range raw {
+			id, err := toInt64(v)
+			if err != nil {
+				return nil, fmt.Errorf("id 缺失或非法: %v", err)
+			}
+			out = append(out, id)
+		}
+		return out, nil
+	}
+	id, err := toInt64(args["id"])
+	if err != nil {
+		return nil, fmt.Errorf("id 缺失或非法: %v", err)
+	}
+	return []int64{id}, nil
 }
 
 // asList 宽松取列表（{ids: [...]} 或单值）
