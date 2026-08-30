@@ -507,6 +507,231 @@ func TestFacadeRemoveEmptyIDsRejected(t *testing.T) {
 	}
 }
 
+// ─── issues/96 §4B：门面「入口批量参数形态」矩阵（4 action × 4 形态）──────────
+//
+// 为什么要这一组：issues/95 的缺陷（引擎只认单数 {id}，前端 IdsParam 一律发 {ids}）
+// 之所以六语言测试全绿仍漏检，根因是既有用例「按实现形状写、不按契约形状写」（issues/96 §1）。
+// 本矩阵把每个删除/启停 action 的四种入口形态钉全，让同类回归下次红在 CI：
+//
+//	① {ids:[a,b]}         两条真实 id   → code=0，且事后回查两条都取不到（upAndDown：state 已改）
+//	② {id:c}              单数旧形态     → code=0，且该条取不到（回归保护，防修坏）
+//	③ {ids:[]}            空数组         → 99999999 + msg 含「id 缺失或非法」（禁止静默成功）
+//	④ {ids:[""]} / 含 null 非法元素      → 99999999 + msg 含「id 缺失或非法」
+//
+// 与 issues/95 随批两用例的分工（避免重复断言）：
+//
+//	action                    ①              ②              ③                      ④
+//	processSurrogate/remove   既有 BatchIDs    既有 BatchIDs    既有 EmptyIDsRejected   既有(null) + 新增("")
+//	processDesign/remove      新增             新增             既有 EmptyIDsRejected   新增
+//	processDefine/remove      新增             新增             既有 EmptyIDsRejected   新增
+//	processDefine/upAndDown   新增             新增             既有 EmptyIDsRejected   新增
+//
+// ⚠️ upAndDown 的关键坑：facade.go 的 upAndDown 先校验 opType/state、后走 idListArgs，
+// 负向态若不带合法 state，报错会来自 state 缺失而不是 ids —— 那样「msg 含 id 缺失或非法」
+// 就成了恒真断言。故本矩阵每一态（含负向）都带合法 opType/state，并用 exclude 参数反向
+// 断言 msg 不含「opType」，自证报错确实来自 ids 校验。
+
+// mustIDsRejected 断言 ids 入口形态被拒：code=99999999 且 msg 含「id 缺失或非法」
+// （Go 侧允许带诊断后缀，故用 contains 而非相等）。exclude 非空时再断 msg 不含该子串，
+// 用于自证报错来自 ids 校验本身，而非同请求里更早的其它参数校验。
+func mustIDsRejected(t *testing.T, f *facade.Facade, action string, args map[string]interface{}, exclude string) {
+	t.Helper()
+	r := f.Flow(action, args)
+	if code, _ := r["code"].(int); code != 99999999 {
+		t.Fatalf("%s %v 应报错 99999999（禁止静默成功）, got %v", action, args, r)
+	}
+	msg, _ := r["msg"].(string)
+	if !strings.Contains(msg, "id 缺失或非法") {
+		t.Fatalf("%s %v msg = %q, want 含「id 缺失或非法」", action, args, msg)
+	}
+	if exclude != "" && strings.Contains(msg, exclude) {
+		t.Fatalf("%s %v msg = %q 含「%s」→ 报错来自其它参数校验，ids 断言恒真", action, args, msg, exclude)
+	}
+}
+
+// mustRowGone 删除后按门面详情 action 回查单条已取不到（契约级回查，不下探仓储）
+func mustRowGone(t *testing.T, f *facade.Facade, detailAction string, id int64, label string) {
+	t.Helper()
+	r := f.Flow(detailAction, map[string]interface{}{"id": id})
+	if code, _ := r["code"].(int); code != 99999999 {
+		t.Fatalf("%s(%d) 事后回查 %s 应取不到, got %v", detailAction, id, label, r)
+	}
+}
+
+// mustRowAlive 负向报错后回查数据仍在：报错不得有副作用（不得部分生效 / 不得误删）
+func mustRowAlive(t *testing.T, f *facade.Facade, detailAction string, id int64, label string) {
+	t.Helper()
+	r := f.Flow(detailAction, map[string]interface{}{"id": id})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("%s(%d) %s 应仍可取到（负向报错不应有副作用）, got %v", detailAction, id, label, r)
+	}
+}
+
+// mustDeployDefine 造「设计稿 + 已发布定义」：processDesign/save → updateDefine（内容快照，
+// name 由内容同步）→ deploy → processDefine/getLastByName 取 define id。
+// 载荷形态照抄 TestDesignDeployRedeployIsDeployed，未自创。defineName 须与流程 JSON 顶层 name 一致。
+func mustDeployDefine(t *testing.T, f *facade.Facade, flowFile, defineName, displayName string) int64 {
+	t.Helper()
+	r := f.Flow("processDesign/save", map[string]interface{}{
+		"name": defineName, "displayName": displayName, "operator": "matrix",
+	})
+	mustOk(t, r)
+	designID := mustI64(r["data"].(map[string]interface{})["id"])
+	mustOk(t, f.Flow("processDesign/updateDefine", map[string]interface{}{
+		"processDesignId": designID, "content": string(flowContent(t, flowFile)), "operator": "matrix",
+	}))
+	mustOk(t, f.Flow("processDesign/deploy", map[string]interface{}{"id": designID, "operator": "matrix"}))
+	r = f.Flow("processDefine/getLastByName", map[string]interface{}{"processDefineName": defineName})
+	mustOk(t, r)
+	return mustI64(r["data"].(map[string]interface{})["id"])
+}
+
+// mustDefineState 走门面取定义 state（停用/启用是否真的落库）
+func mustDefineState(t *testing.T, f *facade.Facade, id int64, label string) int {
+	t.Helper()
+	r := f.Flow("processDefine/detail", map[string]interface{}{"id": id})
+	mustOk(t, r)
+	return int(mustI64(r["data"].(map[string]interface{})["state"]))
+}
+
+// TestFacadeIdsMatrixDefineRemove processDefine/remove 的四态矩阵（前端定义列表勾选删除走 {ids}）
+func TestFacadeIdsMatrixDefineRemove(t *testing.T) {
+	f, _, _ := setupFacade()
+
+	// ① {ids:[a,b]}：两条真实定义批量删除 → 事后两条都取不到
+	defA := mustDeployDefine(t, f, "01-simple.json", "simple", "矩阵定义A")
+	defB := mustDeployDefine(t, f, "02-multi-task.json", "multi-task", "矩阵定义B")
+	mustOk(t, f.Flow("processDefine/remove", map[string]interface{}{"ids": []interface{}{defA, defB}}))
+	mustRowGone(t, f, "processDefine/detail", defA, "批量 defA")
+	mustRowGone(t, f, "processDefine/detail", defB, "批量 defB")
+
+	// ② {id:c}：单数旧形态回归保护
+	defC := mustDeployDefine(t, f, "03-decision-expr.json", "decision-expr", "矩阵定义C")
+	mustOk(t, f.Flow("processDefine/remove", map[string]interface{}{"id": defC}))
+	mustRowGone(t, f, "processDefine/detail", defC, "单 id defC")
+
+	// ③ {ids:[]}：空数组禁止静默成功，且已存在的定义不受影响
+	defD := mustDeployDefine(t, f, "01-simple.json", "simple", "矩阵定义D")
+	mustIDsRejected(t, f, "processDefine/remove", map[string]interface{}{"ids": []interface{}{}}, "")
+	mustRowAlive(t, f, "processDefine/detail", defD, "空数组后 defD")
+
+	// ④ {ids:[""]} / {ids:[id,nil]}：非法元素整批报错，未部分生效
+	mustIDsRejected(t, f, "processDefine/remove", map[string]interface{}{"ids": []interface{}{""}}, "")
+	mustIDsRejected(t, f, "processDefine/remove", map[string]interface{}{"ids": []interface{}{defD, nil}}, "")
+	mustRowAlive(t, f, "processDefine/detail", defD, "非法元素后 defD")
+}
+
+// TestFacadeIdsMatrixDesignRemove processDesign/remove 的四态矩阵（设计器列表勾选删除走 {ids}）
+func TestFacadeIdsMatrixDesignRemove(t *testing.T) {
+	f, _, _ := setupFacade()
+	content := string(flowContent(t, "01-simple.json"))
+	saveDesign := func(displayName string) int64 {
+		r := f.Flow("processDesign/save", map[string]interface{}{
+			"name": "matrix", "displayName": displayName, "content": content, "operator": "matrix",
+		})
+		mustOk(t, r)
+		return mustI64(r["data"].(map[string]interface{})["id"])
+	}
+
+	// ① {ids:[a,b]}
+	designA, designB := saveDesign("矩阵设计A"), saveDesign("矩阵设计B")
+	mustOk(t, f.Flow("processDesign/remove", map[string]interface{}{"ids": []interface{}{designA, designB}}))
+	mustRowGone(t, f, "processDesign/detail", designA, "批量 designA")
+	mustRowGone(t, f, "processDesign/detail", designB, "批量 designB")
+
+	// ② {id:c}
+	designC := saveDesign("矩阵设计C")
+	mustOk(t, f.Flow("processDesign/remove", map[string]interface{}{"id": designC}))
+	mustRowGone(t, f, "processDesign/detail", designC, "单 id designC")
+
+	// ③ {ids:[]}
+	designD := saveDesign("矩阵设计D")
+	mustIDsRejected(t, f, "processDesign/remove", map[string]interface{}{"ids": []interface{}{}}, "")
+	mustRowAlive(t, f, "processDesign/detail", designD, "空数组后 designD")
+
+	// ④ {ids:[""]} / {ids:[id,nil]}
+	mustIDsRejected(t, f, "processDesign/remove", map[string]interface{}{"ids": []interface{}{""}}, "")
+	mustIDsRejected(t, f, "processDesign/remove", map[string]interface{}{"ids": []interface{}{designD, nil}}, "")
+	mustRowAlive(t, f, "processDesign/detail", designD, "非法元素后 designD")
+}
+
+// TestFacadeIdsMatrixDefineUpAndDown processDefine/upAndDown 的四态矩阵。
+// 与 remove 的差别：memory 仓储 UpdateDefineState 对不存在的 id 静默 no-op（对齐 JDBC 的
+// 「影响 0 行不报错」），所以 code=0 毫无信息量——正向态必须回查 state 真的被改写。
+// 每一态都带合法 opType/state，负向态额外断 msg 不含「opType」，排除「恒真」。
+func TestFacadeIdsMatrixDefineUpAndDown(t *testing.T) {
+	f, _, _ := setupFacade()
+	defA := mustDeployDefine(t, f, "01-simple.json", "simple", "启停矩阵A")
+	defB := mustDeployDefine(t, f, "02-multi-task.json", "multi-task", "启停矩阵B")
+	defC := mustDeployDefine(t, f, "03-decision-expr.json", "decision-expr", "启停矩阵C")
+	for _, id := range []int64{defA, defB, defC} {
+		if got := mustDefineState(t, f, id, "建数后"); got != 1 {
+			t.Fatalf("deploy 后 state = %d, want 1（前置不成立，矩阵断言会失真）", got)
+		}
+	}
+
+	// ① {ids:[a,b], opType:0}：批量停用 → 两条 state 都真的变 0
+	mustOk(t, f.Flow("processDefine/upAndDown", map[string]interface{}{"ids": []interface{}{defA, defB}, "opType": 0}))
+	if got := mustDefineState(t, f, defA, "批量停用 defA"); got != 0 {
+		t.Fatalf("defA state = %d, want 0（批量停用未落库）", got)
+	}
+	if got := mustDefineState(t, f, defB, "批量停用 defB"); got != 0 {
+		t.Fatalf("defB state = %d, want 0（批量停用未落库）", got)
+	}
+
+	// ①' {ids:[a,b], opType:1}：批量启用回 1（两个方向都要生效，防「state 被忽略」）
+	mustOk(t, f.Flow("processDefine/upAndDown", map[string]interface{}{"ids": []interface{}{defA, defB}, "opType": 1}))
+	if got := mustDefineState(t, f, defA, "批量启用 defA"); got != 1 {
+		t.Fatalf("defA state = %d, want 1", got)
+	}
+
+	// ② {id:c, state:0}：单数旧形态 + state 别名（opType/state 二选一）仍生效
+	mustOk(t, f.Flow("processDefine/upAndDown", map[string]interface{}{"id": defC, "state": 0}))
+	if got := mustDefineState(t, f, defC, "单 id defC"); got != 0 {
+		t.Fatalf("defC state = %d, want 0（单 id + state 别名未落库）", got)
+	}
+
+	// ③ {ids:[], opType:0}：空数组报错，且报错来自 ids 校验（不带 opType 的那态见 ③'）
+	mustIDsRejected(t, f, "processDefine/upAndDown", map[string]interface{}{"ids": []interface{}{}, "opType": 0}, "opType")
+	if got := mustDefineState(t, f, defA, "空数组后 defA"); got != 1 {
+		t.Fatalf("defA state = %d, want 1（报错不应改状态）", got)
+	}
+
+	// ③' 不带 state：报错来自 state 校验而非 ids —— 记录本矩阵为何必须带 state（防恒真）
+	r := f.Flow("processDefine/upAndDown", map[string]interface{}{"ids": []interface{}{}})
+	if code, _ := r["code"].(int); code != 99999999 {
+		t.Fatalf("缺 state 也应报错, got %v", r)
+	}
+	if msg, _ := r["msg"].(string); !strings.Contains(msg, "opType/state 缺失或非法") || strings.Contains(msg, "id 缺失或非法") {
+		t.Fatalf("缺 state 时 msg 应只报 state 缺失（说明矩阵必须带合法 state 才测得到 ids）, got %q", msg)
+	}
+
+	// ④ {ids:[""], opType:0} / {ids:[id,nil], opType:0}：非法元素整批报错，状态不被改
+	mustIDsRejected(t, f, "processDefine/upAndDown", map[string]interface{}{"ids": []interface{}{""}, "opType": 0}, "opType")
+	mustIDsRejected(t, f, "processDefine/upAndDown", map[string]interface{}{"ids": []interface{}{defA, nil}, "opType": 0}, "opType")
+	if got := mustDefineState(t, f, defA, "非法元素后 defA"); got != 1 {
+		t.Fatalf("defA state = %d, want 1（非法元素批次不应有部分生效）", got)
+	}
+}
+
+// TestFacadeIdsMatrixSurrogateRemove processSurrogate/remove 形态④的空串变体。
+// 该 action 的其余格已由 issues/95 随批两用例覆盖（见本段开头矩阵表）：
+// ①② 在 TestFacadeSurrogateRemoveBatchIDs，③ 与「含 null」形态④ 在
+// TestFacadeRemoveEmptyIDsRejected，此处只补 {ids:[""]}（前端多选组件偶发提交空串，
+// PHP 侧正是这一格出现「空串静默成功」假绿，见 issues/96 §4A）。
+func TestFacadeIdsMatrixSurrogateRemove(t *testing.T) {
+	f, _, _ := setupFacade()
+	r := f.Flow("processSurrogate/save", map[string]interface{}{
+		"operator": "matrixop", "surrogate": "matrixagent", "processName": "matrixFlow",
+		"startTime": "2026-08-01 00:00:00", "endTime": "2026-08-31 23:59:59", "enabled": 1,
+	})
+	mustOk(t, r)
+	surrogateID := mustI64(r["data"].(map[string]interface{})["id"])
+
+	mustIDsRejected(t, f, "processSurrogate/remove", map[string]interface{}{"ids": []interface{}{""}}, "")
+	mustRowAlive(t, f, "processSurrogate/detail", surrogateID, "空串元素后委托")
+}
+
 func TestFacadeViewEndpoints(t *testing.T) {
 	f, repo, _ := setupFacade()
 	content := string(flowContent(t, "01-simple.json"))
