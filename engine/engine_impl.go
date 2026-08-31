@@ -258,7 +258,10 @@ func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, opera
 	}
 	args = filterFieldByPerm(args, findNode(&flow, task.TaskName))
 
-	vars := mergeVars(args, inst.Variables)
+	// issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
+	// 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
+	baseVars := inst.Variables
+	vars := mergeVars(args, baseVars)
 	for k, v := range task.Variables {
 		vars[k] = v
 	}
@@ -273,7 +276,8 @@ func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, opera
 	syncTaskToAggregate(inst, task)
 	e.fireEvent(ProcessEvent{Type: EventTaskComplete, InstanceID: inst.ID, TaskID: task.ID, NodeID: task.TaskName, Operator: operator})
 
-	inst.Variables = vars
+	// issues/97：实例变量写回排除操作人 u_*，保留 start 注入的发起人 u_*（u_realName 恒为发起人）
+	inst.Variables = mergeExecIntoInstance(baseVars, vars)
 	e.repo.UpdateInstance(ctx, inst)
 	return task, inst, &flow, vars, nil
 }
@@ -428,7 +432,8 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 		} else {
 			inst.Finish(time.Now())
 		}
-		inst.Variables = vars
+		// issues/97：结束节点写回同样排除操作人 u_*（保留发起人 u_*，与 prepareExecuteTask 一致）
+		inst.Variables = mergeExecIntoInstance(inst.Variables, vars)
 		e.repo.UpdateInstance(ctx, inst)
 		e.fireEvent(ProcessEvent{Type: EventProcessFinish, InstanceID: inst.ID, Operator: operator})
 		return nil
@@ -721,6 +726,24 @@ func mergeVars(args map[string]interface{}, base map[string]interface{}) map[str
 		out[k] = v
 	}
 	for k, v := range args {
+		out[k] = v
+	}
+	return out
+}
+
+// mergeExecIntoInstance 实例变量写回合并（issues/97 对齐 Java）：以 base（start 注入的
+// 发起人 u_*）为底，并入执行上下文中**非 u_*** 键（f_ 表单字段 / submitType 等流转数据）。
+// addUserInfo 生成的操作人 u_* 只属于当次执行上下文与任务行 ext，不整体写回实例——
+// 实例 u_realName 语义是「发起人」（与 autoGenTitle 一致），不随审批节点漂移。
+func mergeExecIntoInstance(base, exec map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{})
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range exec {
+		if strings.HasPrefix(k, "u_") {
+			continue
+		}
 		out[k] = v
 	}
 	return out

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mldong/jeeflow-go/engine"
@@ -134,6 +135,58 @@ func Test02MultiTask(t *testing.T) {
 	inst, _ = eng.ExecuteProcessTask(context.Background(), doing[0].ID, "userC", nil)
 	if inst.State != model.InstanceStateDone {
 		t.Fatalf("expected done, got %d", inst.State)
+	}
+}
+
+// Test02B_InitiatorURealNameStable issues/97 对齐 Java：execute 只把表单字段并入实例，
+// 不覆盖实例级 u_*——实例 u_realName 恒为发起人（start 注入），操作人 u_* 只留在任务行 ext。
+func Test02B_InitiatorURealNameStable(t *testing.T) {
+	eng, repo := setup()
+	def := registerFlow(repo, "02-multi-task.json")
+	// 发起人 alice 发起并自动完成 apply
+	inst := startAndExecute(eng, repo, def.ID, "alice", nil)
+	if inst.Variables[engine.KeyRealName] != "用户alice" {
+		t.Fatalf("start: 实例 u_realName 应为发起人 alice，got %v", inst.Variables[engine.KeyRealName])
+	}
+	// 第一审批节点 bob 办理
+	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(doing) != 1 || doing[0].TaskName != "task1" {
+		t.Fatal("expected task1")
+	}
+	repo.AddTaskActor(context.Background(), doing[0].ID, []string{"bob"})
+	doing[0].ActorIDs = append(doing[0].ActorIDs, "bob")
+	doneTaskID := doing[0].ID
+	inst, _ = eng.ExecuteProcessTask(context.Background(), doneTaskID, "bob", nil)
+
+	// 核心断言：实例 u_realName 恒为发起人 alice，不被操作人 bob 覆盖
+	if got := inst.Variables[engine.KeyRealName]; got != "用户alice" {
+		t.Fatalf("issues/97: 实例 u_realName 应恒为发起人 alice，实际漂移为 %v", got)
+	}
+	if got := inst.Variables[engine.KeyUserID]; got != "alice" {
+		t.Fatalf("issues/97: 实例 u_userId 应恒为发起人 alice，实际为 %v", got)
+	}
+	// autoGenTitle 前缀（发起人）与实例 u_realName 一致
+	if title, _ := inst.Variables[engine.KeyAutoGenTitle].(string); !strings.HasPrefix(title, "用户alice的") {
+		t.Fatalf("issues/97: autoGenTitle 前缀应为发起人，got %v", title)
+	}
+	// 任务行 ext（facade 操作人来源）保留操作人 bob 的 u_*
+	doneTask, _ := repo.FindTaskByID(context.Background(), doneTaskID)
+	if doneTask == nil {
+		t.Fatal("completed task1 not found")
+	}
+	if got := doneTask.Variables[engine.KeyRealName]; got != "用户bob" {
+		t.Fatalf("issues/97: 任务行 u_realName 应为操作人 bob，got %v", got)
+	}
+	// 深层节点再办一次（userB 办 task2），实例 u_realName 仍为 alice
+	doing, _ = repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(doing) != 1 || doing[0].TaskName != "task2" {
+		t.Fatalf("expected task2, got %v", len(doing))
+	}
+	repo.AddTaskActor(context.Background(), doing[0].ID, []string{"userB"})
+	doing[0].ActorIDs = append(doing[0].ActorIDs, "userB")
+	inst, _ = eng.ExecuteProcessTask(context.Background(), doing[0].ID, "userB", nil)
+	if got := inst.Variables[engine.KeyRealName]; got != "用户alice" {
+		t.Fatalf("issues/97: 深层节点后实例 u_realName 应仍为 alice，实际 %v", got)
 	}
 }
 
