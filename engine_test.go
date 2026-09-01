@@ -376,6 +376,89 @@ func Test10InterceptorAndEvents(t *testing.T) {
 	}
 }
 
+// Test14TaskCreateEvent TASK_CREATE fire 契约（对齐 Java CreateTaskHandler / Rust engine.rs）：
+// 任务落库**之后**逐个 fire，事件带 TaskID/NodeID/Operator，监听器可按 TaskID 反查任务 actor。
+// 覆盖：① 普通任务 ② 并行会签多任务逐个 ③ fire 时机（落库后，反查非空）。
+func Test14TaskCreateEvent(t *testing.T) {
+	ctx := context.Background()
+
+	// ① 普通任务：01-simple.json startAndExecute → apply 完成 → task1 创建
+	t.Run("normal", func(t *testing.T) {
+		eng, repo := setup()
+		def := registerFlow(repo, "01-simple.json")
+		var creates []engine.ProcessEvent
+		eng.SetExtensions(&engine.Extensions{
+			Listeners: []engine.ProcessEventListener{
+				func(evt engine.ProcessEvent) {
+					if evt.Type == engine.EventTaskCreate {
+						creates = append(creates, evt)
+					}
+				},
+			},
+		})
+		inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
+		// start(apply) + task1 = 2 个任务创建事件
+		if len(creates) != 2 {
+			t.Fatalf("want 2 TASK_CREATE (apply+task1), got %d", len(creates))
+		}
+		// 落库后反查：每个事件 TaskID 必须可查到（fire 在 SaveTask 之后）、
+		// NodeID/Operator 非空、任务 actor 非空（监听器按 TaskID 反查 actor 的前提）
+		for _, c := range creates {
+			task, _ := repo.FindTaskByID(ctx, c.TaskID)
+			if task == nil {
+				t.Fatalf("TASK_CREATE TaskID=%d 落库后反查为空（fire 时机过早）", c.TaskID)
+			}
+			if c.InstanceID != inst.ID || c.NodeID == "" || c.Operator == "" {
+				t.Fatalf("event 字段不全: %+v", c)
+			}
+			if len(task.ActorIDs) == 0 || task.ActorIDs[0] == "" {
+				t.Fatalf("task actor 应非空: task=%+v", task.ActorIDs)
+			}
+		}
+		_ = inst
+	})
+
+	// ② 并行会签：userA/userB/userC 三人逐任务 fire（会签多任务逐个）
+	t.Run("countersign-parallel", func(t *testing.T) {
+		eng, repo := setup()
+		def := registerFlow(repo, "05-countersign-parallel.json")
+		var creates []engine.ProcessEvent
+		eng.SetExtensions(&engine.Extensions{
+			Listeners: []engine.ProcessEventListener{
+				func(evt engine.ProcessEvent) {
+					if evt.Type == engine.EventTaskCreate {
+						creates = append(creates, evt)
+					}
+				},
+			},
+		})
+		startAndExecute(eng, repo, def.ID, "applicant", nil)
+		// apply(1) + 会签 task1 三人(3) = 4 个任务创建事件
+		if len(creates) != 4 {
+			t.Fatalf("want 4 TASK_CREATE (apply+3会签), got %d", len(creates))
+		}
+		// 会签三任务 NodeID 相同、TaskID 互不相同、逐个落库可反查
+		var csIDs []int64
+		for _, c := range creates[1:] {
+			if c.NodeID == "" {
+				t.Fatalf("会签事件 NodeID 空: %+v", c)
+			}
+			task, _ := repo.FindTaskByID(ctx, c.TaskID)
+			if task == nil {
+				t.Fatalf("会签 TASK_CREATE TaskID=%d 反查为空", c.TaskID)
+			}
+			csIDs = append(csIDs, c.TaskID)
+		}
+		seen := map[int64]bool{}
+		for _, id := range csIDs {
+			if seen[id] {
+				t.Fatalf("会签 TaskID 重复: %v", csIDs)
+			}
+			seen[id] = true
+		}
+	})
+}
+
 type testInterceptor struct {
 	pre   func(node *model.FlowNode, inst *model.ProcessInstance) bool
 	post  func(node *model.FlowNode, inst *model.ProcessInstance)

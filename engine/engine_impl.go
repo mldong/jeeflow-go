@@ -106,14 +106,16 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 					if actors != nil && lc+1 < len(actors) {
 						// 聚合根：创建串行会签下一步任务
 						nt := inst.CreateTask(e.nextID(), curNode.ID, curNode.Text.Value, actors[lc+1], operator, formKeyOf(curNode), now, 1)
-					nt.Variables = map[string]interface{}{
-						prefixKey("nrOfInstances", curNode.ID): len(actors),
-						prefixKey("loopCounter", curNode.ID):   lc + 1,
-						prefixKey("operatorList", curNode.ID):  actors,
-					}
-					e.repo.SaveTask(ctx, nt)
-					inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
-					return inst, nil
+						nt.Variables = map[string]interface{}{
+							prefixKey("nrOfInstances", curNode.ID): len(actors),
+							prefixKey("loopCounter", curNode.ID):   lc + 1,
+							prefixKey("operatorList", curNode.ID):  actors,
+						}
+						e.repo.SaveTask(ctx, nt)
+						// TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
+						e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: curNode.ID, Operator: operator})
+						inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
+						return inst, nil
 				}
 			} else {
 				inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
@@ -339,7 +341,9 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, node *model.FlowN
 		switch ct {
 		case "PARALLEL", "":
 			for _, actor := range actors {
-				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1))
+				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1)
+				e.repo.SaveTask(ctx, nt)
+				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
 		case "SEQUENTIAL":
 			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, 1)
@@ -349,9 +353,12 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, node *model.FlowN
 				prefixKey("operatorList", node.ID):  actors,
 			}
 			e.repo.SaveTask(ctx, nt)
+			e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 		default:
 			for _, actor := range actors {
-				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1))
+				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1)
+				e.repo.SaveTask(ctx, nt)
+				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
 		}
 		return nil
@@ -360,7 +367,9 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, node *model.FlowN
 	if len(actors) > 1 {
 		nt.ActorIDs = actors
 	}
-	return e.repo.SaveTask(ctx, nt)
+	e.repo.SaveTask(ctx, nt)
+	e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
+	return nil
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -519,7 +528,10 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 		switch ct {
 		case "PARALLEL":
 			for _, actor := range actors {
-				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1))
+				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1)
+				e.repo.SaveTask(ctx, nt)
+				// TASK_CREATE：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
+				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
 		case "SEQUENTIAL":
 			// 顺序会签任务也是会签任务（issues/57 E29 修正：仅普通分支默认 0）
@@ -530,9 +542,12 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 				prefixKey("operatorList", node.ID):  actors,
 			}
 			e.repo.SaveTask(ctx, nt)
+			e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 		default:
 			for _, actor := range actors {
-				e.repo.SaveTask(ctx, inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1))
+				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1)
+				e.repo.SaveTask(ctx, nt)
+				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
 		}
 		return nil
@@ -542,7 +557,9 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 	if len(actors) > 1 {
 		nt.ActorIDs = actors
 	}
-	return e.repo.SaveTask(ctx, nt)
+	e.repo.SaveTask(ctx, nt)
+	e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
+	return nil
 }
 
 func formKeyOf(node *model.FlowNode) string {
