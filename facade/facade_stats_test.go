@@ -3,7 +3,7 @@ package facade_test
 // stats 三 action 契约对齐测试（issues/103 验收修复 A–E + 基线对齐）
 //
 // 数据集与 jeeflow-java JeeflowStatsTest 完全同构（Go↔Java 交叉核对同批）：
-// 历史数据固定 2026-08-01/02（UTC 构造，与 parseSurrogateTime 的 UTC 语义一致、
+// 历史数据固定 2026-08-01/02（Local 构造，与 parseSurrogateTime 的 wall-clock 语义一致、
 // 与真实 today 隔离）；I106 为服务器当日（time.Now()，E 自证：todayNew 计它）。
 //
 // A：trend/group 的 data 本体是裸数组（非 {series}/{rows} 包装）
@@ -102,12 +102,12 @@ func seedStats(t *testing.T, repo *memory.Repository) {
 	repo.AddDefine(&model.ProcessDefine{ID: 1, Name: "leave", DisplayName: "请假流程", Type: "approval", State: 1})
 	repo.AddDefine(&model.ProcessDefine{ID: 2, Name: "expense", DisplayName: "报销流程", Type: "finance", State: 1})
 
-	d1a := time.Date(2026, 8, 1, 10, 0, 0, 0, time.UTC)
-	d1b := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
-	d2a := time.Date(2026, 8, 2, 9, 0, 0, 0, time.UTC)
-	d2b := time.Date(2026, 8, 2, 11, 0, 0, 0, time.UTC)
-	d2c := time.Date(2026, 8, 2, 15, 0, 0, 0, time.UTC)
-	d2d := time.Date(2026, 8, 2, 16, 0, 0, 0, time.UTC)
+	d1a := time.Date(2026, 8, 1, 10, 0, 0, 0, time.Local)
+	d1b := time.Date(2026, 8, 1, 12, 0, 0, 0, time.Local)
+	d2a := time.Date(2026, 8, 2, 9, 0, 0, 0, time.Local)
+	d2b := time.Date(2026, 8, 2, 11, 0, 0, 0, time.Local)
+	d2c := time.Date(2026, 8, 2, 15, 0, 0, 0, time.Local)
+	d2d := time.Date(2026, 8, 2, 16, 0, 0, 0, time.Local)
 	must(repo.SaveInstance(ctx, &model.ProcessInstance{ID: 100, DefineID: 1, State: model.InstanceStateDoing, Operator: "u1", CreateTime: d1a}))
 	must(repo.SaveInstance(ctx, &model.ProcessInstance{ID: 101, DefineID: 1, State: model.InstanceStateDone, Operator: "u1", CreateTime: d1b}))
 	must(repo.SaveInstance(ctx, &model.ProcessInstance{ID: 102, DefineID: 2, State: model.InstanceStateDone, Operator: "u2", CreateTime: d2a}))

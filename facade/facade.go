@@ -900,8 +900,10 @@ func parseSurrogateTime(v interface{}) *time.Time {
 		return nil
 	}
 	str = strings.TrimSpace(str)
+	// 按本地时区解析（wall-clock，对齐其余五语言的 naive 语义与 MySQL DATETIME 列），
+	// time.Parse 的 UTC 语义会使时间范围与库内时间错位 8 小时（两线一致性 issues/103）
 	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02T15:04:05"} {
-		if t, perr := time.Parse(layout, str); perr == nil {
+		if t, perr := time.ParseInLocation(layout, str, time.Local); perr == nil {
 			return &t
 		}
 	}
