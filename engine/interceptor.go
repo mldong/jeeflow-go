@@ -45,6 +45,7 @@ const (
 	EventProcessReject                    // 流程拒绝
 	EventTaskCreate                       // 任务创建
 	EventTaskComplete                     // 任务完成
+	EventCCCreate                         // 抄送知会（issues/102）
 )
 
 // ProcessEvent 流程事件
@@ -54,6 +55,9 @@ type ProcessEvent struct {
 	TaskID     int64
 	NodeID     string
 	Operator   string
+	// CcActorID 抄送人 id（仅 CC_CREATE 事件非空，直传事件体，监听器免反查 cc 表——
+	// 对齐 Java ProcessEvent.ccActorId / PHP ccActorId / issues/102 语义铁律 2）
+	CcActorID string
 }
 
 // ProcessEventListener 事件监听器
@@ -152,4 +156,11 @@ func (e *EngineImpl) fireEvent(evt ProcessEvent) {
 	for _, l := range e.ext.Listeners {
 		l(evt)
 	}
+}
+
+// FireEvent 公开事件发布入口（facade 层事件源调用，issues/102 CC_CREATE）：
+// Go 栈的 cc 实例创建在 facade（CreateCcInstance），fire 通道在引擎侧私有，
+// 故 facade 经此入口发布事件——纯增量：未装配 Extensions/监听器时零副作用。
+func (e *EngineImpl) FireEvent(evt ProcessEvent) {
+	e.fireEvent(evt)
 }

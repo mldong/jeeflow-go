@@ -218,6 +218,13 @@ func (f *Facade) startAndExecute(args map[string]interface{}) (interface{}, erro
 			if err := f.repo.CreateCcInstance(context.Background(), inst.ID, operator, actors...); err != nil {
 				return nil, err
 			}
+			// issues/102：cc 实例落库后逐抄送人 fire CC_CREATE（ccActorId 直传，对齐
+			// PHP/Java；接收人过滤归集成层监听器）。无监听器时 FireEvent 零副作用。
+			for _, actor := range actors {
+				f.engine.FireEvent(engine.ProcessEvent{
+					Type: engine.EventCCCreate, InstanceID: inst.ID, CcActorID: actor,
+				})
+			}
 		}
 	}
 	// startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
@@ -1231,7 +1238,16 @@ func (f *Facade) createCCInstance(args map[string]interface{}) error {
 	if len(actors) == 0 {
 		return errors.New("actorIds 缺失")
 	}
-	return f.repo.CreateCcInstance(context.Background(), instanceID, operator, actors...)
+	if err := f.repo.CreateCcInstance(context.Background(), instanceID, operator, actors...); err != nil {
+		return err
+	}
+	// issues/102：手动补抄送同样逐抄送人 fire CC_CREATE（与发起路径同粒度，对齐 PHP/Java）
+	for _, actor := range actors {
+		f.engine.FireEvent(engine.ProcessEvent{
+			Type: engine.EventCCCreate, InstanceID: instanceID, CcActorID: actor,
+		})
+	}
+	return nil
 }
 
 func (f *Facade) updateCCStatus(args map[string]interface{}) error {

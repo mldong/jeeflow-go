@@ -2273,3 +2273,101 @@ func mustDefineID(t *testing.T, repo *memory.Repository, name string) int64 {
 	}
 	return def.ID
 }
+
+// ═══ issues/102 抄送知会 CC_CREATE 事件（facade 层 fire）═══
+// 语义对齐 PHP(381bed0)/Java(fa18804)：cc 实例落库后**逐抄送人** fire CC_CREATE，
+// ccActorId 直传事件体（监听器免反查 cc 表）；接收人过滤归集成层监听器。
+// T0 断言（对齐 Java CcCreateEventTest 双用例）：
+//   ① 逐抄送人 fire：带抄送人发起 → 每个抄送人一条 CC_CREATE（顺序/InstanceID/CcActorID 逐项），
+//      手动 createCCInstance 同样逐抄送人 fire；
+//   ② 纯增量：未装配监听器时 cc 实例照常落库、FireEvent 零副作用、不抛错。
+
+func TestCCCreateEventPerActor(t *testing.T) {
+	repo := memory.New()
+	extRepo := memory.NewExt()
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	f := facade.New(eng, repo, extRepo)
+
+	var ccEvents []engine.ProcessEvent
+	eng.SetExtensions(&engine.Extensions{
+		Listeners: []engine.ProcessEventListener{
+			func(evt engine.ProcessEvent) {
+				if evt.Type == engine.EventCCCreate {
+					ccEvents = append(ccEvents, evt)
+				}
+			},
+		},
+	})
+
+	// deploy + startAndExecute with 2 cc actors → 2 CC_CREATE（逐抄送人，顺序保持）
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
+	mustOk(t, r0)
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"],
+		"operator":        "user1", "f_ccActors": "cc_a, cc_b",
+	})
+	mustOk(t, r1)
+	instID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+
+	if len(ccEvents) != 2 {
+		t.Fatalf("want 2 CC_CREATE (per actor), got %d: %+v", len(ccEvents), ccEvents)
+	}
+	want := []string{"cc_a", "cc_b"}
+	for i, evt := range ccEvents {
+		if evt.InstanceID != instID {
+			t.Fatalf("CC_CREATE[%d] InstanceID=%d want %d", i, evt.InstanceID, instID)
+		}
+		if evt.CcActorID != want[i] {
+			t.Fatalf("CC_CREATE[%d] CcActorID=%q want %q", i, evt.CcActorID, want[i])
+		}
+	}
+	// cc 实例落库与事件一一对应（每个抄送人一条 cc 行）
+	for _, a := range want {
+		rows, total, _ := repo.PageCcInstances(context.Background(), spi.PageQuery{PageNum: 1, PageSize: 10}, a)
+		if total < 1 || len(rows) == 0 {
+			t.Fatalf("抄送人 %s 应落 cc 实例: total=%d", a, total)
+		}
+	}
+
+	// 手动 createCCInstance 同样逐抄送人 fire（+2 条）
+	r2 := f.Flow("processInstance/createCCInstance", map[string]interface{}{
+		"processInstanceId": r1["data"].(map[string]interface{})["processInstanceId"],
+		"operator":          "user1", "actorIds": "cc_c, cc_d",
+	})
+	mustOk(t, r2)
+	if len(ccEvents) != 4 {
+		t.Fatalf("manual createCCInstance 后 want 4 CC_CREATE, got %d: %+v", len(ccEvents), ccEvents)
+	}
+	for i, a := range []string{"cc_c", "cc_d"} {
+		if ccEvents[2+i].CcActorID != a {
+			t.Fatalf("manual CC_CREATE[%d] CcActorID=%q want %q", i, ccEvents[2+i].CcActorID, a)
+		}
+	}
+}
+
+// TestCCCreateEventNoListenerPureIncremental 纯增量：无监听器装配时
+// cc 实例照常落库、FireEvent 零副作用、不抛错（与上一版逐字节同行为，T0 断言）。
+func TestCCCreateEventNoListenerPureIncremental(t *testing.T) {
+	repo := memory.New()
+	extRepo := memory.NewExt()
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	// 注意：不 SetExtensions —— 未装配任何监听器
+	f := facade.New(eng, repo, extRepo)
+
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
+	mustOk(t, r0)
+	// 带抄送人发起：无监听器 → 不 panic（FireEvent 对 ext==nil 直接 return）
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"],
+		"operator":        "user1", "f_ccActors": "cc_only",
+	})
+	mustOk(t, r1)
+	// cc 实例照常落库（纯增量：cc 落库路径与上一版一致，不受 fire 影响）
+	instID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	rows, total, _ := repo.PageCcInstances(context.Background(), spi.PageQuery{PageNum: 1, PageSize: 10}, "cc_only")
+	if total < 1 || len(rows) == 0 {
+		t.Fatalf("无监听器时 cc 实例仍应落库: total=%d", total)
+	}
+	// 直接 FireEvent：无监听器零副作用、不抛错
+	eng.FireEvent(engine.ProcessEvent{Type: engine.EventCCCreate, InstanceID: instID, CcActorID: "cc_only"})
+}
