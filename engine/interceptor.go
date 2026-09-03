@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"log"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -150,11 +151,21 @@ func (e *EngineImpl) firePostInterceptors(node *model.FlowNode, inst *model.Proc
 	return nil
 }
 
-// fireEvent 发布事件
+// fireEvent 发布事件。
+// 兜底语义（issues/104 P2 统一口径）：单监听器 panic 只记录不传播——
+// 不得影响引擎主流程，也不得中断后续监听器（对齐 PHP per-listener catch）。
 func (e *EngineImpl) fireEvent(evt ProcessEvent) {
 	if e.ext == nil { return }
 	for _, l := range e.ext.Listeners {
-		l(evt)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[jeeflow] process event listener panic: type=%v instance=%d err=%v",
+						evt.Type, evt.InstanceID, r)
+				}
+			}()
+			l(evt)
+		}()
 	}
 }
 
