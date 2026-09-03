@@ -2126,7 +2126,12 @@ func (f *Facade) statsOverview(args map[string]interface{}) (interface{}, error)
 	start := parseSurrogateTime(args["start"])
 	end := parseSurrogateTime(args["end"])
 
-	allInst, err := f.repo.QueryInstancesForStats(ctx, defaultStateIn, "create_time", start, end)
+	// B：stateIn 入参（int[]，缺省 defaultStateIn），作用于六个状态计数
+	stateIn := parseStateIn(args["stateIn"])
+	if stateIn == nil {
+		stateIn = defaultStateIn
+	}
+	allInst, err := f.repo.QueryInstancesForStats(ctx, stateIn, "create_time", start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -2144,7 +2149,8 @@ func (f *Facade) statsOverview(args map[string]interface{}) (interface{}, error)
 	now := time.Now()
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	todayEnd := todayStart.AddDate(0, 0, 1)
-	todayInst, err := f.repo.QueryInstancesForStats(ctx, defaultStateIn, "create_time", &todayStart, &todayEnd)
+	// E：todayNew 恒按服务器当日、不过滤 state / 不受 stateIn 影响（对齐内置线 countTodayNew）
+	todayInst, err := f.repo.QueryInstancesForStats(ctx, nil, "create_time", &todayStart, &todayEnd)
 	if err != nil {
 		return nil, err
 	}
@@ -2197,12 +2203,17 @@ func (f *Facade) statsTrend(args map[string]interface{}) (interface{}, error) {
 	ctx := context.Background()
 	start := parseSurrogateTime(args["start"])
 	end := parseSurrogateTime(args["end"])
-	granularity := toStr(args["granularity"], "day")
+	granularity := toStr(args["granularity"], "")
+	// C：start/end/granularity 均必填（对齐内置线 20010012 缺参语义），不静默回退默认桶
+	if start == nil || end == nil || granularity == "" {
+		return nil, fmt.Errorf("trend 缺少必填参数：start/end/granularity")
+	}
 	if !validGranularity[granularity] {
 		return nil, fmt.Errorf("granularity 参数非法，允许值：hour/day/week/month")
 	}
 
-	insts, err := f.repo.QueryInstancesForStats(ctx, defaultStateIn, "create_time", start, end)
+	// 实例侧无 state 过滤（对齐内置线 countInstanceStartedByBucket）
+	insts, err := f.repo.QueryInstancesForStats(ctx, nil, "create_time", start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -2244,10 +2255,8 @@ func (f *Facade) statsTrend(args map[string]interface{}) (interface{}, error) {
 			"finished": bc.finished,
 		})
 	}
-	return map[string]interface{}{
-		"granularity": granularity,
-		"series":      series,
-	}, nil
+	// A：data 本体为裸数组（去掉 {granularity, series} 包装，对齐契约 spec 06 §4.2 / 内置线）
+	return series, nil
 }
 
 // statsGroup 分组统计
@@ -2272,7 +2281,7 @@ func (f *Facade) statsGroup(args map[string]interface{}) (interface{}, error) {
 		rows = rawRows
 
 	case "state":
-		insts, err := f.repo.QueryInstancesForStats(ctx, defaultStateIn, "create_time", start, end)
+		insts, err := f.repo.QueryInstancesForStats(ctx, nil, "create_time", start, end)
 		if err != nil {
 			return nil, err
 		}
@@ -2300,7 +2309,7 @@ func (f *Facade) statsGroup(args map[string]interface{}) (interface{}, error) {
 		}
 
 	case "category":
-		insts, err := f.repo.QueryInstancesForStats(ctx, defaultStateIn, "create_time", start, end)
+		insts, err := f.repo.QueryInstancesForStats(ctx, nil, "create_time", start, end)
 		if err != nil {
 			return nil, err
 		}
@@ -2375,7 +2384,7 @@ func (f *Facade) statsGroup(args map[string]interface{}) (interface{}, error) {
 		}
 
 	case "applicant":
-		insts, err := f.repo.QueryInstancesForStats(ctx, defaultStateIn, "create_time", start, end)
+		insts, err := f.repo.QueryInstancesForStats(ctx, nil, "create_time", start, end)
 		if err != nil {
 			return nil, err
 		}
@@ -2513,13 +2522,43 @@ func (f *Facade) statsGroup(args map[string]interface{}) (interface{}, error) {
 		}
 	}
 
-	return map[string]interface{}{
-		"dimension": dimension,
-		"rows":      rows,
-	}, nil
+	// A：data 本体为裸数组（去掉 {dimension, rows} 包装，对齐契约 spec 06 §4.2 / 内置线）
+	return rows, nil
 }
 
 // ── 统计 helper ──
+
+// parseStateIn 解析 stateIn 入参（int 切片；兼容 JSON []interface{} 数字 / []int / 数字字符串）
+func parseStateIn(v interface{}) []int {
+	switch t := v.(type) {
+	case []int:
+		if len(t) == 0 {
+			return nil
+		}
+		return t
+	case []interface{}:
+		out := make([]int, 0, len(t))
+		for _, e := range t {
+			switch n := e.(type) {
+			case int:
+				out = append(out, n)
+			case int64:
+				out = append(out, int(n))
+			case float64:
+				out = append(out, int(n))
+			case string:
+				if i, err := strconv.Atoi(strings.TrimSpace(n)); err == nil {
+					out = append(out, i)
+				}
+			}
+		}
+		if len(out) == 0 {
+			return nil
+		}
+		return out
+	}
+	return nil
+}
 
 // statsEnumerateBuckets 枚举连续时间桶标签列表
 func statsEnumerateBuckets(start, end *time.Time, granularity string) []string {

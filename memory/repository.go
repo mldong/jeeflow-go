@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -904,15 +905,10 @@ func (r *Repository) StatsStuckApproverGroup(_ context.Context, limit int) ([]ma
 		if int(task.TaskState) != int(model.TaskStateDoing) {
 			continue
 		}
-		actors := r.actors[task.ID]
-		if len(actors) == 0 {
-			if task.ActorID != "" {
-				grouped[task.ActorID]++
-			}
-			continue
-		}
+		// 对齐 jdbc/内置线：仅走 actor 表（memory 的 r.actors 即 wf_process_task_actor 的内存态），
+		// 不回退 operator——在办任务 operator 无值，必须走 actor 表（issues/103）
 		seen := make(map[string]bool)
-		for _, a := range actors {
+		for _, a := range r.actors[task.ID] {
 			if a != "" && !seen[a] {
 				seen[a] = true
 				grouped[a]++
@@ -944,8 +940,18 @@ func (r *Repository) StatsStuckApproverGroup(_ context.Context, limit int) ([]ma
 func (r *Repository) StatsDefineGroup(_ context.Context, start, end *time.Time, limit int) ([]map[string]interface{}, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	grouped := make(map[int64]int)
+	// D 对齐内置线 mapper：count 全实例（无 state 过滤）、inner join define、
+	// avg 仅对 state=20 且有 finish 的实例聚合（MAX(task.finish_time) - create_time）
+	type defAgg struct {
+		count    int
+		totalDur int64
+		durCount int
+	}
+	grouped := make(map[int64]*defAgg)
 	for _, inst := range r.instances {
+		if r.defines[inst.DefineID] == nil {
+			continue // inner join 语义：define 缺失的实例不计
+		}
 		if start != nil && inst.CreateTime.Before(*start) {
 			continue
 		}
@@ -955,7 +961,28 @@ func (r *Repository) StatsDefineGroup(_ context.Context, start, end *time.Time, 
 				continue
 			}
 		}
-		grouped[inst.DefineID]++
+		agg := grouped[inst.DefineID]
+		if agg == nil {
+			agg = &defAgg{}
+			grouped[inst.DefineID] = agg
+		}
+		agg.count++
+		if int(inst.State) == int(model.InstanceStateDone) && !inst.CreateTime.IsZero() {
+			var maxFt *time.Time
+			for _, t := range r.tasks {
+				if t.ProcessInstanceID != inst.ID || t.FinishTime == nil {
+					continue
+				}
+				if maxFt == nil || t.FinishTime.After(*maxFt) {
+					ft := *t.FinishTime
+					maxFt = &ft
+				}
+			}
+			if maxFt != nil {
+				agg.totalDur += int64(maxFt.Sub(inst.CreateTime).Seconds())
+				agg.durCount++
+			}
+		}
 	}
 	type kv struct {
 		DefineID int64
@@ -963,7 +990,7 @@ func (r *Repository) StatsDefineGroup(_ context.Context, start, end *time.Time, 
 	}
 	var items []kv
 	for k, v := range grouped {
-		items = append(items, kv{k, v})
+		items = append(items, kv{k, v.count})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].Count > items[j].Count })
 	if limit > 0 && len(items) > limit {
@@ -972,17 +999,16 @@ func (r *Repository) StatsDefineGroup(_ context.Context, start, end *time.Time, 
 	var result []map[string]interface{}
 	for _, item := range items {
 		def := r.defines[item.DefineID]
-		name := fmt.Sprintf("%d", item.DefineID)
-		displayName := ""
-		if def != nil {
-			name = def.Name
-			displayName = def.DisplayName
+		agg := grouped[item.DefineID]
+		var avg interface{}
+		if agg.durCount > 0 {
+			avg = int(math.Round(float64(agg.totalDur) / float64(agg.durCount)))
 		}
 		result = append(result, map[string]interface{}{
-			"key":         name,
-			"label":       displayName,
-			"count":       item.Count,
-			"avgDurationSeconds": nil,
+			"key":                def.Name,
+			"label":              def.DisplayName,
+			"count":              item.Count,
+			"avgDurationSeconds": avg,
 		})
 	}
 	return result, nil

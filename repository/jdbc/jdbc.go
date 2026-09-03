@@ -1138,22 +1138,29 @@ func (r *Repository) StatsStuckApproverGroup(ctx context.Context, limit int) ([]
 }
 
 func (r *Repository) StatsDefineGroup(ctx context.Context, start, end *time.Time, limit int) ([]map[string]interface{}, error) {
-	sql := `SELECT d.name AS k, d.display_name AS lbl, COUNT(*) AS cnt
+	// D 对齐内置线 mapper：count 全实例（无 state 过滤）、inner join define、
+	// avg 仅对 state=20 且有 finish 的实例聚合（MAX(task.finish_time) - create_time）
+	query := `SELECT d.name AS k, d.display_name AS lbl, COUNT(*) AS cnt,
+	ROUND(AVG(CASE WHEN i.state = 20 AND sub.maxft IS NOT NULL
+		THEN TIMESTAMPDIFF(SECOND, i.create_time, sub.maxft) END)) AS avg_dur
 	FROM wf_process_instance i
 	JOIN wf_process_define d ON d.id = i.process_define_id
+	LEFT JOIN (SELECT process_instance_id, MAX(finish_time) AS maxft
+		FROM wf_process_task GROUP BY process_instance_id) sub
+		ON sub.process_instance_id = i.id
 	WHERE 1=1`
 	var args []interface{}
 	if start != nil {
-		sql += " AND i.create_time >= ?"
+		query += " AND i.create_time >= ?"
 		args = append(args, *start)
 	}
 	if end != nil {
-		sql += " AND i.create_time < DATE_ADD(?, INTERVAL 1 SECOND)"
+		query += " AND i.create_time < DATE_ADD(?, INTERVAL 1 SECOND)"
 		args = append(args, *end)
 	}
-	sql += " GROUP BY d.id, d.name, d.display_name ORDER BY cnt DESC LIMIT ?"
+	query += " GROUP BY d.id, d.name, d.display_name ORDER BY cnt DESC LIMIT ?"
 	args = append(args, limit)
-	rows, err := r.conn(ctx).QueryContext(ctx, sql, args...)
+	rows, err := r.conn(ctx).QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1162,10 +1169,15 @@ func (r *Repository) StatsDefineGroup(ctx context.Context, start, end *time.Time
 	for rows.Next() {
 		var k, lbl string
 		var cnt int
-		if err := rows.Scan(&nullStrScan{&k}, &nullStrScan{&lbl}, &cnt); err != nil {
+		var avgDur sql.NullFloat64
+		if err := rows.Scan(&nullStrScan{&k}, &nullStrScan{&lbl}, &cnt, &avgDur); err != nil {
 			return nil, err
 		}
-		result = append(result, map[string]interface{}{"key": k, "label": lbl, "count": cnt, "avgDurationSeconds": nil})
+		var avg interface{}
+		if avgDur.Valid {
+			avg = int(avgDur.Float64)
+		}
+		result = append(result, map[string]interface{}{"key": k, "label": lbl, "count": cnt, "avgDurationSeconds": avg})
 	}
 	return result, rows.Err()
 }
