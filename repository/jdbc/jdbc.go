@@ -951,3 +951,252 @@ func normPage(query spi.PageQuery) (int, int) {
 	}
 	return pageNum, pageSize
 }
+
+// ─── 统计（v1.8.25，issues/103，对齐 Java stats SPI 9 方法）──
+
+func (r *Repository) QueryInstancesForStats(ctx context.Context, stateIn []int, timeField string, start, end *time.Time) ([]model.InstanceStatsRow, error) {
+	col := "t.create_time"
+	if timeField == "updateTime" {
+		col = "t.update_time"
+	}
+	sql := "SELECT t.id, t.state, t.create_time, t.process_define_id, t.operator FROM wf_process_instance t WHERE 1=1"
+	var args []interface{}
+	if len(stateIn) > 0 {
+		ph := make([]string, len(stateIn))
+		for i, s := range stateIn {
+			ph[i] = "?"
+			args = append(args, s)
+		}
+		sql += " AND t.state IN (" + strings.Join(ph, ",") + ")"
+	}
+	if start != nil {
+		sql += " AND " + col + " >= ?"
+		args = append(args, *start)
+	}
+	if end != nil {
+		sql += " AND " + col + " < DATE_ADD(?, INTERVAL 1 SECOND)"
+		args = append(args, *end)
+	}
+	rows, err := r.conn(ctx).QueryContext(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []model.InstanceStatsRow
+	for rows.Next() {
+		var row model.InstanceStatsRow
+		if err := rows.Scan(&row.ID, &row.State, &row.CreateTime, &row.DefineID, &nullStrScan{&row.Operator}); err != nil {
+			return nil, err
+		}
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+func (r *Repository) QueryTasksForStats(ctx context.Context, state *int, start, end *time.Time) ([]model.TaskStatsRow, error) {
+	sql := "SELECT t.id, t.process_instance_id, t.task_state, t.perform_type, t.operator, t.display_name, t.create_time, t.finish_time, t.expire_time FROM wf_process_task t WHERE 1=1"
+	var args []interface{}
+	if state != nil {
+		sql += " AND t.task_state = ?"
+		args = append(args, *state)
+	}
+	if start != nil {
+		sql += " AND t.finish_time >= ?"
+		args = append(args, *start)
+	}
+	if end != nil {
+		sql += " AND t.finish_time < DATE_ADD(?, INTERVAL 1 SECOND)"
+		args = append(args, *end)
+	}
+	rows, err := r.conn(ctx).QueryContext(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []model.TaskStatsRow
+	for rows.Next() {
+		var row model.TaskStatsRow
+		var operator string
+		if err := rows.Scan(&row.ID, &row.ProcessInstanceID, &row.TaskState, &row.PerformType,
+			&nullStrScan{&operator}, &nullStrScan{&row.DisplayName},
+			&nullTimePtrScan{&row.CreateTime}, &nullTimePtrScan{&row.FinishTime},
+			&nullTimePtrScan{&row.ExpireTime}); err != nil {
+			return nil, err
+		}
+		row.Operator = operator
+		result = append(result, row)
+	}
+	return result, rows.Err()
+}
+
+func (r *Repository) StatsAvgCompletedDurationSeconds(ctx context.Context, start, end *time.Time) (int, error) {
+	sql := `SELECT COALESCE(ROUND(AVG(
+		TIMESTAMPDIFF(SECOND, i.create_time, (
+			SELECT MAX(t.finish_time) FROM wf_process_task t WHERE t.process_instance_id = i.id AND t.finish_time IS NOT NULL
+		))
+	)), 0) AS avg_sec
+	FROM wf_process_instance i
+	WHERE i.state = 20`
+	var args []interface{}
+	if start != nil {
+		sql += " AND i.create_time >= ?"
+		args = append(args, *start)
+	}
+	if end != nil {
+		sql += " AND i.create_time < DATE_ADD(?, INTERVAL 1 SECOND)"
+		args = append(args, *end)
+	}
+	var avgSec float64
+	if err := r.conn(ctx).QueryRowContext(ctx, sql, args...).Scan(&avgSec); err != nil {
+		return 0, err
+	}
+	return int(avgSec), nil
+}
+
+func (r *Repository) StatsPendingAndOverdueCount(ctx context.Context) (pending int, overdue int, err error) {
+	query := `SELECT
+		COUNT(*) AS pending,
+		SUM(CASE WHEN t.expire_time IS NOT NULL AND t.expire_time < NOW() THEN 1 ELSE 0 END) AS overdue
+	FROM wf_process_task t WHERE t.task_state = 10`
+	var overduePtr sql.NullInt64
+	if err := r.conn(ctx).QueryRowContext(ctx, query).Scan(&pending, &overduePtr); err != nil {
+		return 0, 0, err
+	}
+	if overduePtr.Valid {
+		overdue = int(overduePtr.Int64)
+	}
+	return pending, overdue, nil
+}
+
+func (r *Repository) StatsCompletedTaskAggregate(ctx context.Context) (total, countersign, onTime, onTimeDenom int, err error) {
+	query := `SELECT
+		COUNT(*) AS total,
+		SUM(CASE WHEN t.perform_type = 1 THEN 1 ELSE 0 END) AS countersign,
+		SUM(CASE WHEN t.expire_time IS NOT NULL THEN 1 ELSE 0 END) AS on_time_denom,
+		SUM(CASE WHEN t.expire_time IS NOT NULL AND t.finish_time IS NOT NULL AND t.finish_time <= t.expire_time THEN 1 ELSE 0 END) AS on_time
+	FROM wf_process_task t WHERE t.task_state = 20`
+	var countersignPtr, onTimePtr sql.NullInt64
+	if err := r.conn(ctx).QueryRowContext(ctx, query).Scan(&total, &countersignPtr, &onTimeDenom, &onTimePtr); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	if countersignPtr.Valid {
+		countersign = int(countersignPtr.Int64)
+	}
+	if onTimePtr.Valid {
+		onTime = int(onTimePtr.Int64)
+	}
+	return total, countersign, onTime, onTimeDenom, nil
+}
+
+func (r *Repository) StatsStuckNodeGroup(ctx context.Context, limit int) ([]map[string]interface{}, error) {
+	sql := `SELECT t.display_name AS k, COUNT(*) AS cnt
+	FROM wf_process_task t
+	WHERE t.task_state = 10 AND t.display_name IS NOT NULL AND t.display_name <> ''
+	GROUP BY t.display_name
+	ORDER BY cnt DESC
+	LIMIT ?`
+	rows, err := r.conn(ctx).QueryContext(ctx, sql, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []map[string]interface{}
+	for rows.Next() {
+		var k string
+		var cnt int
+		if err := rows.Scan(&nullStrScan{&k}, &cnt); err != nil {
+			return nil, err
+		}
+		result = append(result, map[string]interface{}{"key": k, "count": cnt})
+	}
+	return result, rows.Err()
+}
+
+func (r *Repository) StatsStuckApproverGroup(ctx context.Context, limit int) ([]map[string]interface{}, error) {
+	sql := `SELECT pta.actor_id AS k, COUNT(DISTINCT t.id) AS cnt
+	FROM wf_process_task t
+	JOIN wf_process_task_actor pta ON pta.task_id = t.id
+	WHERE t.task_state = 10
+	GROUP BY pta.actor_id
+	ORDER BY cnt DESC
+	LIMIT ?`
+	rows, err := r.conn(ctx).QueryContext(ctx, sql, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []map[string]interface{}
+	for rows.Next() {
+		var k string
+		var cnt int
+		if err := rows.Scan(&nullStrScan{&k}, &cnt); err != nil {
+			return nil, err
+		}
+		result = append(result, map[string]interface{}{"key": k, "count": cnt})
+	}
+	return result, rows.Err()
+}
+
+func (r *Repository) StatsDefineGroup(ctx context.Context, start, end *time.Time, limit int) ([]map[string]interface{}, error) {
+	sql := `SELECT d.name AS k, d.display_name AS lbl, COUNT(*) AS cnt
+	FROM wf_process_instance i
+	JOIN wf_process_define d ON d.id = i.process_define_id
+	WHERE 1=1`
+	var args []interface{}
+	if start != nil {
+		sql += " AND i.create_time >= ?"
+		args = append(args, *start)
+	}
+	if end != nil {
+		sql += " AND i.create_time < DATE_ADD(?, INTERVAL 1 SECOND)"
+		args = append(args, *end)
+	}
+	sql += " GROUP BY d.id, d.name, d.display_name ORDER BY cnt DESC LIMIT ?"
+	args = append(args, limit)
+	rows, err := r.conn(ctx).QueryContext(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []map[string]interface{}
+	for rows.Next() {
+		var k, lbl string
+		var cnt int
+		if err := rows.Scan(&nullStrScan{&k}, &nullStrScan{&lbl}, &cnt); err != nil {
+			return nil, err
+		}
+		result = append(result, map[string]interface{}{"key": k, "label": lbl, "count": cnt, "avgDurationSeconds": nil})
+	}
+	return result, rows.Err()
+}
+
+func (r *Repository) StatsCompletedInstanceDurations(ctx context.Context, start, end *time.Time) ([]int, error) {
+	sql := `SELECT TIMESTAMPDIFF(SECOND, i.create_time, (
+		SELECT MAX(t.finish_time) FROM wf_process_task t WHERE t.process_instance_id = i.id AND t.finish_time IS NOT NULL
+	)) AS dur
+	FROM wf_process_instance i
+	WHERE i.state = 20`
+	var args []interface{}
+	if start != nil {
+		sql += " AND i.create_time >= ?"
+		args = append(args, *start)
+	}
+	if end != nil {
+		sql += " AND i.create_time < DATE_ADD(?, INTERVAL 1 SECOND)"
+		args = append(args, *end)
+	}
+	rows, err := r.conn(ctx).QueryContext(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var durations []int
+	for rows.Next() {
+		var dur int
+		if err := rows.Scan(&dur); err != nil {
+			return nil, err
+		}
+		durations = append(durations, dur)
+	}
+	return durations, rows.Err()
+}

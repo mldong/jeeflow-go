@@ -2,6 +2,7 @@ package spi
 
 import (
 	"context"
+	"time"
 
 	"github.com/mldong/jeeflow-go/model"
 )
@@ -49,6 +50,27 @@ type ProcessRepository interface {
 	PageTodoTasks(ctx context.Context, query PageQuery, actorID string) ([]*model.TaskRow, int, error)
 	// PageDoneTasks 我的已办分页（operator 过滤，非进行中任务）
 	PageDoneTasks(ctx context.Context, query PageQuery, operator string) ([]*model.TaskRow, int, error)
+
+	// ── 统计（v1.8.25，issues/103，对齐 Java stats SPI 9 方法）──
+
+	// QueryInstancesForStats 查询实例列表（轻量级，不加载关联任务）。stateIn/timeField+start/end 均可空
+	QueryInstancesForStats(ctx context.Context, stateIn []int, timeField string, start, end *time.Time) ([]model.InstanceStatsRow, error)
+	// QueryTasksForStats 查询任务列表。state/start/end 均可空
+	QueryTasksForStats(ctx context.Context, state *int, start, end *time.Time) ([]model.TaskStatsRow, error)
+	// StatsAvgCompletedDurationSeconds 已完成实例平均耗时（秒）
+	StatsAvgCompletedDurationSeconds(ctx context.Context, start, end *time.Time) (int, error)
+	// StatsPendingAndOverdueCount 待办数 + 逾期数
+	StatsPendingAndOverdueCount(ctx context.Context) (pending int, overdue int, err error)
+	// StatsCompletedTaskAggregate 已完成任务聚合：total, countersign, onTime, onTimeDenom
+	StatsCompletedTaskAggregate(ctx context.Context) (total, countersign, onTime, onTimeDenom int, err error)
+	// StatsStuckNodeGroup 卡滞节点分组
+	StatsStuckNodeGroup(ctx context.Context, limit int) ([]map[string]interface{}, error)
+	// StatsStuckApproverGroup 卡滞审批人分组
+	StatsStuckApproverGroup(ctx context.Context, limit int) ([]map[string]interface{}, error)
+	// StatsDefineGroup 流程定义分组
+	StatsDefineGroup(ctx context.Context, start, end *time.Time, limit int) ([]map[string]interface{}, error)
+	// StatsCompletedInstanceDurations 已完成实例耗时列表（秒）
+	StatsCompletedInstanceDurations(ctx context.Context, start, end *time.Time) ([]int, error)
 }
 
 // UserProvider 用户信息提供者

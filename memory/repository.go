@@ -3,9 +3,11 @@ package memory
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/mldong/jeeflow-go/model"
 	"github.com/mldong/jeeflow-go/spi"
@@ -698,4 +700,324 @@ func slicePage[T any](rows []*T, query spi.PageQuery) []*T {
 		end = len(rows)
 	}
 	return rows[start:end]
+}
+
+// 编译期断言：实现 spi.ProcessRepository
+var _ spi.ProcessRepository = (*Repository)(nil)
+
+// ─── 统计（v1.8.25，issues/103，对齐 Java stats SPI 9 方法）──
+
+func (r *Repository) QueryInstancesForStats(_ context.Context, stateIn []int, timeField string, start, end *time.Time) ([]model.InstanceStatsRow, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	stateSet := make(map[int]bool, len(stateIn))
+	for _, s := range stateIn {
+		stateSet[s] = true
+	}
+	var result []model.InstanceStatsRow
+	for _, inst := range r.instances {
+		if len(stateSet) > 0 && !stateSet[int(inst.State)] {
+			continue
+		}
+		var t time.Time
+		switch timeField {
+		case "createTime":
+			t = inst.CreateTime
+		default:
+			t = inst.CreateTime
+		}
+		if start != nil && t.Before(*start) {
+			continue
+		}
+		if end != nil {
+			endPlus1 := end.Add(time.Second)
+			if !t.Before(endPlus1) {
+				continue
+			}
+		}
+		result = append(result, model.InstanceStatsRow{
+			ID:         inst.ID,
+			State:      int(inst.State),
+			CreateTime: inst.CreateTime,
+			DefineID:   inst.DefineID,
+			Operator:   inst.Operator,
+		})
+	}
+	return result, nil
+}
+
+func (r *Repository) QueryTasksForStats(_ context.Context, state *int, start, end *time.Time) ([]model.TaskStatsRow, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var result []model.TaskStatsRow
+	for _, task := range r.tasks {
+		if state != nil && int(task.TaskState) != *state {
+			continue
+		}
+		if start != nil || end != nil {
+			t := task.FinishTime
+			if t == nil {
+				t = &task.CreateTime
+			}
+			if start != nil && t.Before(*start) {
+				continue
+			}
+			if end != nil {
+				endPlus1 := end.Add(time.Second)
+				if !t.Before(endPlus1) {
+					continue
+				}
+			}
+		}
+		row := model.TaskStatsRow{
+			ID:                task.ID,
+			ProcessInstanceID: task.ProcessInstanceID,
+			TaskState:         int(task.TaskState),
+			PerformType:       task.PerformType,
+			Operator:          task.ActorID,
+			DisplayName:       task.DisplayName,
+			CreateTime:        &task.CreateTime,
+			FinishTime:        task.FinishTime,
+			ExpireTime:        task.ExpireTime,
+		}
+		result = append(result, row)
+	}
+	return result, nil
+}
+
+func (r *Repository) StatsAvgCompletedDurationSeconds(_ context.Context, start, end *time.Time) (int, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var totalSec int64
+	var count int
+	for _, inst := range r.instances {
+		if int(inst.State) != int(model.InstanceStateDone) {
+			continue
+		}
+		if start != nil && inst.CreateTime.Before(*start) {
+			continue
+		}
+		if end != nil {
+			endPlus1 := end.Add(time.Second)
+			if !inst.CreateTime.Before(endPlus1) {
+				continue
+			}
+		}
+		var maxFinish time.Time
+		for _, task := range r.tasks {
+			if task.ProcessInstanceID != inst.ID {
+				continue
+			}
+			if task.FinishTime != nil && task.FinishTime.After(maxFinish) {
+				maxFinish = *task.FinishTime
+			}
+		}
+		if maxFinish.IsZero() {
+			continue
+		}
+		totalSec += int64(maxFinish.Sub(inst.CreateTime).Seconds())
+		count++
+	}
+	if count == 0 {
+		return 0, nil
+	}
+	return int(totalSec / int64(count)), nil
+}
+
+func (r *Repository) StatsPendingAndOverdueCount(_ context.Context) (pending int, overdue int, err error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	now := time.Now()
+	for _, task := range r.tasks {
+		if int(task.TaskState) != int(model.TaskStateDoing) {
+			continue
+		}
+		pending++
+		if task.ExpireTime != nil && task.ExpireTime.Before(now) {
+			overdue++
+		}
+	}
+	return pending, overdue, nil
+}
+
+func (r *Repository) StatsCompletedTaskAggregate(_ context.Context) (total, countersign, onTime, onTimeDenom int, err error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, task := range r.tasks {
+		if int(task.TaskState) != int(model.TaskStateDone) {
+			continue
+		}
+		total++
+		if task.PerformType == int(model.PerformTypeCountersign) {
+			countersign++
+		}
+		if task.ExpireTime != nil {
+			onTimeDenom++
+			if task.FinishTime != nil && !task.FinishTime.After(*task.ExpireTime) {
+				onTime++
+			}
+		}
+	}
+	return total, countersign, onTime, onTimeDenom, nil
+}
+
+func (r *Repository) StatsStuckNodeGroup(_ context.Context, limit int) ([]map[string]interface{}, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	grouped := make(map[string]int)
+	for _, task := range r.tasks {
+		if int(task.TaskState) != int(model.TaskStateDoing) {
+			continue
+		}
+		if task.DisplayName == "" {
+			continue
+		}
+		grouped[task.DisplayName]++
+	}
+	type kv struct {
+		Key   string
+		Count int
+	}
+	var items []kv
+	for k, v := range grouped {
+		items = append(items, kv{k, v})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Count > items[j].Count })
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	var result []map[string]interface{}
+	for _, item := range items {
+		result = append(result, map[string]interface{}{
+			"key":   item.Key,
+			"count": item.Count,
+		})
+	}
+	return result, nil
+}
+
+func (r *Repository) StatsStuckApproverGroup(_ context.Context, limit int) ([]map[string]interface{}, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	grouped := make(map[string]int)
+	for _, task := range r.tasks {
+		if int(task.TaskState) != int(model.TaskStateDoing) {
+			continue
+		}
+		actors := r.actors[task.ID]
+		if len(actors) == 0 {
+			if task.ActorID != "" {
+				grouped[task.ActorID]++
+			}
+			continue
+		}
+		seen := make(map[string]bool)
+		for _, a := range actors {
+			if a != "" && !seen[a] {
+				seen[a] = true
+				grouped[a]++
+			}
+		}
+	}
+	type kv struct {
+		Key   string
+		Count int
+	}
+	var items []kv
+	for k, v := range grouped {
+		items = append(items, kv{k, v})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Count > items[j].Count })
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	var result []map[string]interface{}
+	for _, item := range items {
+		result = append(result, map[string]interface{}{
+			"key":   item.Key,
+			"count": item.Count,
+		})
+	}
+	return result, nil
+}
+
+func (r *Repository) StatsDefineGroup(_ context.Context, start, end *time.Time, limit int) ([]map[string]interface{}, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	grouped := make(map[int64]int)
+	for _, inst := range r.instances {
+		if start != nil && inst.CreateTime.Before(*start) {
+			continue
+		}
+		if end != nil {
+			endPlus1 := end.Add(time.Second)
+			if !inst.CreateTime.Before(endPlus1) {
+				continue
+			}
+		}
+		grouped[inst.DefineID]++
+	}
+	type kv struct {
+		DefineID int64
+		Count    int
+	}
+	var items []kv
+	for k, v := range grouped {
+		items = append(items, kv{k, v})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Count > items[j].Count })
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	var result []map[string]interface{}
+	for _, item := range items {
+		def := r.defines[item.DefineID]
+		name := fmt.Sprintf("%d", item.DefineID)
+		displayName := ""
+		if def != nil {
+			name = def.Name
+			displayName = def.DisplayName
+		}
+		result = append(result, map[string]interface{}{
+			"key":         name,
+			"label":       displayName,
+			"count":       item.Count,
+			"avgDurationSeconds": nil,
+		})
+	}
+	return result, nil
+}
+
+func (r *Repository) StatsCompletedInstanceDurations(_ context.Context, start, end *time.Time) ([]int, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var durations []int
+	for _, inst := range r.instances {
+		if int(inst.State) != int(model.InstanceStateDone) {
+			continue
+		}
+		if start != nil && inst.CreateTime.Before(*start) {
+			continue
+		}
+		if end != nil {
+			endPlus1 := end.Add(time.Second)
+			if !inst.CreateTime.Before(endPlus1) {
+				continue
+			}
+		}
+		var maxFinish time.Time
+		for _, task := range r.tasks {
+			if task.ProcessInstanceID != inst.ID {
+				continue
+			}
+			if task.FinishTime != nil && task.FinishTime.After(maxFinish) {
+				maxFinish = *task.FinishTime
+			}
+		}
+		if maxFinish.IsZero() {
+			continue
+		}
+		durations = append(durations, int(maxFinish.Sub(inst.CreateTime).Seconds()))
+	}
+	return durations, nil
 }

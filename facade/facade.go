@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -169,6 +170,12 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 		err = f.taskAddActor(args)
 	case "processTask/latest":
 		data, err = f.taskLatest(args)
+	case "processInstance/stats/overview":
+		data, err = f.statsOverview(args)
+	case "processInstance/stats/trend":
+		data, err = f.statsTrend(args)
+	case "processInstance/stats/group":
+		data, err = f.statsGroup(args)
 	default:
 		return errorResult("未知 action: " + action)
 	}
@@ -2096,4 +2103,498 @@ func firstNonNil(vals ...interface{}) interface{} {
 		}
 	}
 	return nil
+}
+
+// ═══════════════════════════════════════
+// 统计 3 动作（v1.8.25，issues/103）
+// ═══════════════════════════════════════
+
+var (
+	defaultStateIn    = []int{10, 20, 30, 40, 45, 50}
+	defaultStatsLimit = 10
+	validGranularity  = map[string]bool{"hour": true, "day": true, "week": true, "month": true}
+	validDimension    = map[string]bool{
+		"state": true, "define": true, "category": true,
+		"approver": true, "applicant": true, "node": true,
+		"stuckNode": true, "stuckApprover": true, "durationBucket": true,
+	}
+)
+
+// statsOverview 总览统计
+func (f *Facade) statsOverview(args map[string]interface{}) (interface{}, error) {
+	ctx := context.Background()
+	start := parseSurrogateTime(args["start"])
+	end := parseSurrogateTime(args["end"])
+
+	allInst, err := f.repo.QueryInstancesForStats(ctx, defaultStateIn, "create_time", start, end)
+	if err != nil {
+		return nil, err
+	}
+	instByState := map[int]int{}
+	for _, r := range allInst {
+		instByState[r.State]++
+	}
+	total := len(allInst)
+	inProgress := instByState[int(model.InstanceStateDoing)]
+	completed := instByState[int(model.InstanceStateDone)]
+	withdrawn := instByState[int(model.InstanceStateWithdraw)]
+	rejected := instByState[int(model.InstanceStateReject)]
+	suspended := instByState[int(model.InstanceStatePending)]
+
+	now := time.Now()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	todayEnd := todayStart.AddDate(0, 0, 1)
+	todayInst, err := f.repo.QueryInstancesForStats(ctx, defaultStateIn, "create_time", &todayStart, &todayEnd)
+	if err != nil {
+		return nil, err
+	}
+	todayNew := len(todayInst)
+
+	pending, overdue, err := f.repo.StatsPendingAndOverdueCount(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	taskTotal, countersign, onTime, onTimeDenom, err := f.repo.StatsCompletedTaskAggregate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	countersignRate := 0.0
+	if taskTotal > 0 {
+		countersignRate = statsRound4(float64(countersign) / float64(taskTotal))
+	}
+	onTimeRate := 0.0
+	if onTimeDenom > 0 {
+		onTimeRate = statsRound4(float64(onTime) / float64(onTimeDenom))
+	}
+
+	avgDurationSeconds, err := f.repo.StatsAvgCompletedDurationSeconds(ctx, start, end)
+	if err != nil {
+		return nil, err
+	}
+
+	rejectRate := statsRound4(float64(rejected) / float64(max(1, completed+rejected)))
+
+	return map[string]interface{}{
+		"total":              total,
+		"inProgress":         inProgress,
+		"completed":          completed,
+		"rejected":           rejected,
+		"withdrawn":          withdrawn,
+		"suspended":          suspended,
+		"todayNew":           todayNew,
+		"avgDurationSeconds": avgDurationSeconds,
+		"rejectRate":         rejectRate,
+		"pendingTaskCount":   pending,
+		"overdueTaskCount":   overdue,
+		"countersignRate":    countersignRate,
+		"onTimeRate":         onTimeRate,
+	}, nil
+}
+
+// statsTrend 趋势统计
+func (f *Facade) statsTrend(args map[string]interface{}) (interface{}, error) {
+	ctx := context.Background()
+	start := parseSurrogateTime(args["start"])
+	end := parseSurrogateTime(args["end"])
+	granularity := toStr(args["granularity"], "day")
+	if !validGranularity[granularity] {
+		return nil, fmt.Errorf("granularity 参数非法，允许值：hour/day/week/month")
+	}
+
+	insts, err := f.repo.QueryInstancesForStats(ctx, defaultStateIn, "create_time", start, end)
+	if err != nil {
+		return nil, err
+	}
+
+	doneState := int(model.TaskStateDone)
+	finishedTasks, err := f.repo.QueryTasksForStats(ctx, &doneState, start, end)
+	if err != nil {
+		return nil, err
+	}
+
+	buckets := statsEnumerateBuckets(start, end, granularity)
+	type bucketCounts struct{ started, finished int }
+	bucketMap := map[string]*bucketCounts{}
+	for _, b := range buckets {
+		bucketMap[b] = &bucketCounts{}
+	}
+	for _, row := range insts {
+		bk := statsBucketKey(row.CreateTime, granularity)
+		if bc, ok := bucketMap[bk]; ok {
+			bc.started++
+		}
+	}
+	for _, row := range finishedTasks {
+		if row.FinishTime == nil {
+			continue
+		}
+		bk := statsBucketKey(*row.FinishTime, granularity)
+		if bc, ok := bucketMap[bk]; ok {
+			bc.finished++
+		}
+	}
+
+	series := make([]map[string]interface{}, 0, len(buckets))
+	for _, b := range buckets {
+		bc := bucketMap[b]
+		series = append(series, map[string]interface{}{
+			"bucket":   b,
+			"started":  bc.started,
+			"finished": bc.finished,
+		})
+	}
+	return map[string]interface{}{
+		"granularity": granularity,
+		"series":      series,
+	}, nil
+}
+
+// statsGroup 分组统计
+func (f *Facade) statsGroup(args map[string]interface{}) (interface{}, error) {
+	ctx := context.Background()
+	start := parseSurrogateTime(args["start"])
+	end := parseSurrogateTime(args["end"])
+	dimension := toStr(args["dimension"], "define")
+	limit := toIntDef(args["limit"], defaultStatsLimit)
+	if !validDimension[dimension] {
+		return nil, fmt.Errorf("dimension 参数非法，允许值：state/define/category/approver/applicant/node/stuckNode/stuckApprover/durationBucket")
+	}
+
+	var rows []map[string]interface{}
+
+	switch dimension {
+	case "define":
+		rawRows, err := f.repo.StatsDefineGroup(ctx, start, end, limit)
+		if err != nil {
+			return nil, err
+		}
+		rows = rawRows
+
+	case "state":
+		insts, err := f.repo.QueryInstancesForStats(ctx, defaultStateIn, "create_time", start, end)
+		if err != nil {
+			return nil, err
+		}
+		grouped := map[int]int{}
+		for _, r := range insts {
+			grouped[r.State]++
+		}
+		type kv struct {
+			key   string
+			count int
+		}
+		entries := make([]kv, 0, len(grouped))
+		for k, v := range grouped {
+			entries = append(entries, kv{strconv.Itoa(k), v})
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].count > entries[j].count })
+		if len(entries) > limit {
+			entries = entries[:limit]
+		}
+		rows = make([]map[string]interface{}, 0, len(entries))
+		for _, e := range entries {
+			rows = append(rows, map[string]interface{}{
+				"key": e.key, "label": nil, "count": e.count, "avgDurationSeconds": nil,
+			})
+		}
+
+	case "category":
+		insts, err := f.repo.QueryInstancesForStats(ctx, defaultStateIn, "create_time", start, end)
+		if err != nil {
+			return nil, err
+		}
+		defineTypes := map[int64]string{}
+		for _, r := range insts {
+			if _, ok := defineTypes[r.DefineID]; !ok {
+				def, err := f.repo.FindDefineByID(ctx, r.DefineID)
+				if err != nil {
+					return nil, err
+				}
+				if def != nil {
+					defineTypes[r.DefineID] = def.Type
+				} else {
+					defineTypes[r.DefineID] = ""
+				}
+			}
+		}
+		grouped := map[string]int{}
+		for _, r := range insts {
+			tp := defineTypes[r.DefineID]
+			grouped[tp]++
+		}
+		type kv struct {
+			key   string
+			count int
+		}
+		entries := make([]kv, 0, len(grouped))
+		for k, v := range grouped {
+			entries = append(entries, kv{k, v})
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].count > entries[j].count })
+		if len(entries) > limit {
+			entries = entries[:limit]
+		}
+		rows = make([]map[string]interface{}, 0, len(entries))
+		for _, e := range entries {
+			rows = append(rows, map[string]interface{}{
+				"key": e.key, "label": nil, "count": e.count, "avgDurationSeconds": nil,
+			})
+		}
+
+	case "approver":
+		doneState := int(model.TaskStateDone)
+		tasks, err := f.repo.QueryTasksForStats(ctx, &doneState, start, end)
+		if err != nil {
+			return nil, err
+		}
+		grouped := map[string]int{}
+		for _, r := range tasks {
+			if r.Operator == "" {
+				continue
+			}
+			grouped[r.Operator]++
+		}
+		type kv struct {
+			key   string
+			count int
+		}
+		entries := make([]kv, 0, len(grouped))
+		for k, v := range grouped {
+			entries = append(entries, kv{k, v})
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].count > entries[j].count })
+		if len(entries) > limit {
+			entries = entries[:limit]
+		}
+		rows = make([]map[string]interface{}, 0, len(entries))
+		for _, e := range entries {
+			rows = append(rows, map[string]interface{}{
+				"key": e.key, "label": nil, "count": e.count, "avgDurationSeconds": nil,
+			})
+		}
+
+	case "applicant":
+		insts, err := f.repo.QueryInstancesForStats(ctx, defaultStateIn, "create_time", start, end)
+		if err != nil {
+			return nil, err
+		}
+		grouped := map[string]int{}
+		for _, r := range insts {
+			if r.Operator == "" {
+				continue
+			}
+			grouped[r.Operator]++
+		}
+		type kv struct {
+			key   string
+			count int
+		}
+		entries := make([]kv, 0, len(grouped))
+		for k, v := range grouped {
+			entries = append(entries, kv{k, v})
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].count > entries[j].count })
+		if len(entries) > limit {
+			entries = entries[:limit]
+		}
+		rows = make([]map[string]interface{}, 0, len(entries))
+		for _, e := range entries {
+			rows = append(rows, map[string]interface{}{
+				"key": e.key, "label": nil, "count": e.count, "avgDurationSeconds": nil,
+			})
+		}
+
+	case "node":
+		doneState := int(model.TaskStateDone)
+		tasks, err := f.repo.QueryTasksForStats(ctx, &doneState, start, end)
+		if err != nil {
+			return nil, err
+		}
+		type nodeAgg struct {
+			count    int
+			totalDur int64
+		}
+		grouped := map[string]*nodeAgg{}
+		for _, r := range tasks {
+			if r.DisplayName == "" {
+				continue
+			}
+			var dur int64
+			if r.FinishTime != nil && r.CreateTime != nil {
+				dur = int64(r.FinishTime.Sub(*r.CreateTime).Seconds())
+			}
+			agg := grouped[r.DisplayName]
+			if agg == nil {
+				agg = &nodeAgg{}
+				grouped[r.DisplayName] = agg
+			}
+			agg.count++
+			agg.totalDur += dur
+		}
+		type kv struct {
+			key   string
+			agg   *nodeAgg
+		}
+		entries := make([]kv, 0, len(grouped))
+		for k, v := range grouped {
+			entries = append(entries, kv{k, v})
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].agg.count > entries[j].agg.count })
+		if len(entries) > limit {
+			entries = entries[:limit]
+		}
+		rows = make([]map[string]interface{}, 0, len(entries))
+		for _, e := range entries {
+			var avg interface{}
+			if e.agg.count > 0 {
+				avg = int(math.Round(float64(e.agg.totalDur) / float64(e.agg.count)))
+			}
+			rows = append(rows, map[string]interface{}{
+				"key": e.key, "label": nil, "count": e.agg.count, "avgDurationSeconds": avg,
+			})
+		}
+
+	case "stuckNode":
+		rawRows, err := f.repo.StatsStuckNodeGroup(ctx, limit)
+		if err != nil {
+			return nil, err
+		}
+		rows = rawRows
+		for _, m := range rows {
+			if _, ok := m["label"]; !ok {
+				m["label"] = nil
+			}
+			if _, ok := m["avgDurationSeconds"]; !ok {
+				m["avgDurationSeconds"] = nil
+			}
+		}
+
+	case "stuckApprover":
+		rawRows, err := f.repo.StatsStuckApproverGroup(ctx, limit)
+		if err != nil {
+			return nil, err
+		}
+		rows = rawRows
+		for _, m := range rows {
+			if _, ok := m["label"]; !ok {
+				m["label"] = nil
+			}
+			if _, ok := m["avgDurationSeconds"]; !ok {
+				m["avgDurationSeconds"] = nil
+			}
+		}
+
+	case "durationBucket":
+		durations, err := f.repo.StatsCompletedInstanceDurations(ctx, start, end)
+		if err != nil {
+			return nil, err
+		}
+		var sameDay, d1to3, d3to7, over7d int
+		for _, dur := range durations {
+			switch {
+			case dur < 86400:
+				sameDay++
+			case dur < 259200:
+				d1to3++
+			case dur < 604800:
+				d3to7++
+			default:
+				over7d++
+			}
+		}
+		keys := []string{"sameDay", "1to3d", "3to7d", "over7d"}
+		counts := []int{sameDay, d1to3, d3to7, over7d}
+		rows = make([]map[string]interface{}, len(keys))
+		for i := range keys {
+			rows[i] = map[string]interface{}{
+				"key": keys[i], "label": nil, "count": counts[i], "avgDurationSeconds": nil,
+			}
+		}
+	}
+
+	return map[string]interface{}{
+		"dimension": dimension,
+		"rows":      rows,
+	}, nil
+}
+
+// ── 统计 helper ──
+
+// statsEnumerateBuckets 枚举连续时间桶标签列表
+func statsEnumerateBuckets(start, end *time.Time, granularity string) []string {
+	now := time.Now()
+	s := now.AddDate(0, 0, -30)
+	e := now
+	if start != nil {
+		s = *start
+	}
+	if end != nil {
+		e = *end
+	}
+
+	var buckets []string
+	switch granularity {
+	case "hour":
+		cursor := time.Date(s.Year(), s.Month(), s.Day(), s.Hour(), 0, 0, 0, s.Location())
+		for !cursor.After(e) {
+			buckets = append(buckets, cursor.Format("2006-01-02 15:00"))
+			cursor = cursor.Add(time.Hour)
+		}
+	case "day":
+		sd := time.Date(s.Year(), s.Month(), s.Day(), 0, 0, 0, 0, s.Location())
+		ed := time.Date(e.Year(), e.Month(), e.Day(), 0, 0, 0, 0, e.Location())
+		for !sd.After(ed) {
+			buckets = append(buckets, sd.Format("2006-01-02"))
+			sd = sd.AddDate(0, 0, 1)
+		}
+	case "week":
+		sd := time.Date(s.Year(), s.Month(), s.Day(), 0, 0, 0, 0, s.Location())
+		weekday := sd.Weekday()
+		offset := int(weekday) - 1
+		if offset < 0 {
+			offset = 6
+		}
+		sd = sd.AddDate(0, 0, -offset)
+		ed := time.Date(e.Year(), e.Month(), e.Day(), 0, 0, 0, 0, e.Location())
+		for !sd.After(ed) {
+			buckets = append(buckets, statsWeekKey(sd))
+			sd = sd.AddDate(0, 0, 7)
+		}
+	case "month":
+		sd := time.Date(s.Year(), s.Month(), 1, 0, 0, 0, 0, s.Location())
+		ed := time.Date(e.Year(), e.Month(), 1, 0, 0, 0, 0, e.Location())
+		for !sd.After(ed) {
+			buckets = append(buckets, sd.Format("2006-01"))
+			sd = sd.AddDate(0, 1, 0)
+		}
+	}
+	return buckets
+}
+
+// statsBucketKey 把 time.Time 按 granularity 转成桶标签
+func statsBucketKey(t time.Time, granularity string) string {
+	switch granularity {
+	case "hour":
+		return t.Format("2006-01-02 15:00")
+	case "day":
+		return t.Format("2006-01-02")
+	case "week":
+		return statsWeekKey(t)
+	case "month":
+		return t.Format("2006-01")
+	default:
+		return ""
+	}
+}
+
+// statsWeekKey ISO 周标签：YYYY-Www
+func statsWeekKey(t time.Time) string {
+	year, week := t.ISOWeek()
+	return fmt.Sprintf("%d-W%02d", year, week)
+}
+
+// statsRound4 四舍五入到 4 位小数
+func statsRound4(v float64) float64 {
+	return math.Round(v*10000) / 10000
 }

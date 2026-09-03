@@ -262,3 +262,27 @@ type TaskRow struct {
 	InstanceVariable         string                 `json:"instanceVariable"`
 	InstanceCreateTime       time.Time              `json:"instanceCreateTime"`
 }
+
+// ─── 统计 DTO（v1.8.25，issues/103，对齐 Java InstanceStatsRow/TaskStatsRow） ─
+
+// InstanceStatsRow 实例统计行（轻量级，不加载关联任务）
+type InstanceStatsRow struct {
+	ID         int64
+	State      int
+	CreateTime time.Time
+	DefineID   int64
+	Operator   string
+}
+
+// TaskStatsRow 任务统计行
+type TaskStatsRow struct {
+	ID                int64
+	ProcessInstanceID int64
+	TaskState         int
+	PerformType       int
+	Operator          string
+	DisplayName       string
+	CreateTime        *time.Time
+	FinishTime        *time.Time
+	ExpireTime        *time.Time
+}
