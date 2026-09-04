@@ -985,7 +985,7 @@ func (r *Repository) QueryInstancesForStats(ctx context.Context, stateIn []int, 
 	var result []model.InstanceStatsRow
 	for rows.Next() {
 		var row model.InstanceStatsRow
-		if err := rows.Scan(&row.ID, &row.State, &row.CreateTime, &row.DefineID, &nullStrScan{&row.Operator}); err != nil {
+		if err := rows.Scan(&row.ID, &row.State, &nullTimeScan{&row.CreateTime}, &row.DefineID, &nullStrScan{&row.Operator}); err != nil {
 			return nil, err
 		}
 		result = append(result, row)
@@ -1115,7 +1115,7 @@ func (r *Repository) StatsStuckNodeGroup(ctx context.Context, limit int) ([]map[
 func (r *Repository) StatsStuckApproverGroup(ctx context.Context, limit int) ([]map[string]interface{}, error) {
 	sql := `SELECT pta.actor_id AS k, COUNT(DISTINCT t.id) AS cnt
 	FROM wf_process_task t
-	JOIN wf_process_task_actor pta ON pta.task_id = t.id
+	JOIN wf_process_task_actor pta ON pta.process_task_id = t.id
 	WHERE t.task_state = 10
 	GROUP BY pta.actor_id
 	ORDER BY cnt DESC
