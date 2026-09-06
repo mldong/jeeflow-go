@@ -46,6 +46,8 @@ func (c *Controller) rebuild() {
 	c.facade = facade.New(eng, repo, ext).
 		SetUserSearch(demoUserSearch).
 		SetOrgUserProvider(demoOrgProvider{})
+	// T003：业务数据种子（引擎真实启动 16 进行中 + 9 已完成 + 8 委托），启动与 /api/reset 共用
+	seedBusiness(c.facade)
 }
 
 // flowAny 门面通配转发：POST /wf/{action}（action 多段，如 processDefine/page），
