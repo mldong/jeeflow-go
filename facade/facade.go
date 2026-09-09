@@ -355,7 +355,8 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 		return errors.New("流程实例不存在")
 	}
 	// 撤回：废弃全部 doing 任务 + 实例状态（v1.0.1：updateInstance 级联落库）
-	// 注意：FindInstanceByID 不加载 Tasks（空），必须按实例查 doing 任务废弃
+	// 注意：FindInstanceByID 现水合 Tasks（issues/110），此处仍按实例单独查 doing 任务废弃，
+	// 且必须把聚合副本重置为仅被废弃项（见下方 inst.Tasks = doing），防级联回写多余任务
 	operator := toStr(args["operator"], "user1")
 	now := time.Now()
 	doing, err := f.repo.FindDoingTasks(context.Background(), instanceID, nil)

@@ -26,6 +26,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/mldong/jeeflow-go/engine"
+	"github.com/mldong/jeeflow-go/facade"
 	"github.com/mldong/jeeflow-go/internal/flowsutil"
 	"github.com/mldong/jeeflow-go/model"
 	"github.com/mldong/jeeflow-go/repository/jdbc"
@@ -249,6 +250,60 @@ func TestFlowSimpleEndToEnd(t *testing.T) {
 	}
 	if len(allTasks[0].ActorIDs) == 0 {
 		t.Fatalf("actor relation not persisted: %+v", allTasks[0])
+	}
+}
+
+// ─── issues/110：SQL 仓 FindInstanceByID 水合任务 → detail 任务列表非空 ─────────
+//
+// 修复前：JDBC FindInstanceByID 只查 wf_process_instance 单表，Tasks 零值，
+// 门面 processInstance/detail 的 tasks/activeTaskList 恒为空数组（L2-12 门禁真根因）。
+// 对齐 Java findTasksByInstanceId / PHP PdoProcessRepository / C# issues/89 聚合水合。
+func TestFindInstanceByIDHydratesTasks(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	cleanup(t, db)
+	defer cleanup(t, db)
+
+	content := loadFlow(t, "01-simple.json")
+	insertDefine(t, db, "go-simple", content)
+
+	ctx := context.Background()
+	repo := jdbc.New(db)
+	eng := newEngine(t, repo)
+
+	inst, err := eng.StartProcessInstanceByID(ctx, defineID, "zhangsan", map[string]interface{}{"BUSINESS_NO": "BIZ-GO-110"})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// ① 仓储层：FindInstanceByID 水合任务 + ActorIDs
+	loaded, err := repo.FindInstanceByID(ctx, inst.ID)
+	if err != nil || loaded == nil {
+		t.Fatalf("find instance by id: %v", err)
+	}
+	if len(loaded.Tasks) == 0 {
+		t.Fatalf("FindInstanceByID tasks empty (issues/110), want non-empty")
+	}
+	for _, tk := range loaded.Tasks {
+		if len(tk.ActorIDs) == 0 {
+			t.Fatalf("hydrated task missing actorIds: %+v", tk)
+		}
+	}
+
+	// ② 门面层：detail 的 tasks / activeTaskList 非空
+	f := facade.New(eng, repo, nil)
+	r := f.Flow("processInstance/detail", map[string]interface{}{"id": inst.ID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("detail code = %v, want 0: %v", r["code"], r["msg"])
+	}
+	data, _ := r["data"].(map[string]interface{})
+	tasks, _ := data["tasks"].([]interface{})
+	if len(tasks) == 0 {
+		t.Fatalf("detail tasks empty (issues/110): %v", data["tasks"])
+	}
+	active, _ := data["activeTaskList"].([]interface{})
+	if len(active) == 0 {
+		t.Fatalf("detail activeTaskList empty (issues/110): %v", data["activeTaskList"])
 	}
 }
 

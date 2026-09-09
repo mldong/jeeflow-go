@@ -361,6 +361,15 @@ func (r *Repository) FindInstanceByID(ctx context.Context, id int64) (*model.Pro
 	if len(variable) > 0 {
 		_ = json.Unmarshal(variable, &inst.Variables)
 	}
+	// issues/110：聚合水合——二次查 wf_process_task 装任务副本（含 ActorIDs），
+	// 对齐 Java findTasksByInstanceId / PHP PdoProcessRepository / C# issues/89；
+	// 否则门面 detail 的 tasks/activeTaskList 恒空。
+	// 复用 FindHistoryTasks（ORDER BY id ASC + 批查 actor，同连接/事务内经 ctx 复用）
+	tasks, err := r.FindHistoryTasks(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	inst.Tasks = tasks
 	return inst, nil
 }
 
