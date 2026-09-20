@@ -107,7 +107,7 @@ func seedBusiness(f *facade.Facade) {
 			continue
 		}
 		if state := seedAdvance(f, iid); state != 20 {
-			log.Printf("[seed] FIN define=%d op=%d iid=%d 终态=%d（期望 20）", row.defineID, row.operator, iid, state)
+			log.Printf("[seed] FIN define=%d op=%s iid=%d 终态=%d（期望 20）", row.defineID, row.operator, iid, state)
 		}
 		if len(row.cc) > 0 {
 			f.Flow("processInstance/createCCInstance", map[string]interface{}{
