@@ -354,19 +354,21 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 	if err != nil || inst == nil {
 		return errors.New("流程实例不存在")
 	}
-	// 撤回：废弃全部 doing 任务 + 实例状态（v1.0.1：updateInstance 级联落库）
-	// 注意：FindInstanceByID 现水合 Tasks（issues/110），此处仍按实例单独查 doing 任务废弃，
-	// 且必须把聚合副本重置为仅被废弃项（见下方 inst.Tasks = doing），防级联回写多余任务
+	// 撤回：全部 doing 任务置 Withdraw(30) + 实例置 30（v1.0.1：updateInstance 级联落库）
+	// 注意：FindInstanceByID 现水合 Tasks（issues/110），此处仍按实例单独查 doing 任务撤回，
+	// 且必须把聚合副本重置为仅被撤回项（见下方 inst.Tasks = doing），防级联回写多余任务
 	operator := toStr(args["operator"], "user1")
 	now := time.Now()
 	doing, err := f.repo.FindDoingTasks(context.Background(), instanceID, nil)
 	if err != nil {
 		return err
 	}
-	// issues/53 E25 补正：废弃副本必须同步回聚合（UpdateInstance 级联会用聚合内
-	// 旧任务副本覆盖已废弃状态——先 updateTask 再 updateInstance 会被覆盖回 DOING）
+	// issues/53 E25 补正：改状态后的副本必须同步回聚合（UpdateInstance 级联会用聚合内
+	// 旧任务副本覆盖已撤回状态——先 updateTask 再 updateInstance 会被覆盖回 DOING）
+	// issues/113：撤回写 30（WITHDRAW），不用 Abandon(99)——99 是与废弃共用的码，
+	// 混用会让"发起人撤回"和"引擎废弃"在任务表里塌成同一个值
 	for _, t := range doing {
-		t.Abandon(now)
+		t.Withdraw(now)
 	}
 	inst.Withdraw(now) // 撤回状态 Withdraw(30) 而非 Reject(45)
 	inst.UpdateUser = operator

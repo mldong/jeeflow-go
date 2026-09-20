@@ -439,6 +439,67 @@ func TestUpdateInstanceCascadesTasks(t *testing.T) {
 	}
 }
 
+// TestWithdrawPersistsTaskState30 issues/113：门面撤回须把全部进行中任务以 30（WITHDRAW）**落库**。
+// 改前 Go 撤回路径写 Abandon(99)，而既有断言只验"doing 清空"——30/99 两种码值都满足，SQL 层无人验。
+func TestWithdrawPersistsTaskState30(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	cleanup(t, db)
+	defer cleanup(t, db)
+
+	content := loadFlow(t, "01-simple.json")
+	insertDefine(t, db, "go-simple", content)
+
+	ctx := context.Background()
+	repo := jdbc.New(db)
+	eng := newEngine(t, repo)
+	f := facade.New(eng, repo, nil)
+
+	inst, err := eng.StartProcessInstanceByID(ctx, defineID, "zhangsan", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if doing, _ := repo.FindDoingTasks(ctx, inst.ID, nil); len(doing) == 0 {
+		t.Fatalf("撤回前应有 doing 任务")
+	}
+
+	r := f.Flow("processInstance/withdraw", map[string]interface{}{"id": inst.ID, "operator": "zhangsan"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("withdraw: %v", r)
+	}
+
+	// 直查库表：绕开内存对象别名，确证落库值
+	rows, err := db.QueryContext(ctx, ph("SELECT task_state FROM wf_process_task WHERE process_instance_id = ?"), inst.ID)
+	if err != nil {
+		t.Fatalf("query task_state: %v", err)
+	}
+	defer rows.Close()
+	states := []int{}
+	for rows.Next() {
+		var s int
+		if err := rows.Scan(&s); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		states = append(states, s)
+	}
+	if len(states) == 0 {
+		t.Fatalf("撤回后库里无任务行")
+	}
+	for _, s := range states {
+		if s != int(model.TaskStateWithdraw) {
+			t.Fatalf("撤回后库内任务态 = %d, want 30（WITHDRAW；99 是废弃码，两码不得混用）", s)
+		}
+	}
+
+	if got, _ := repo.FindDoingTasks(ctx, inst.ID, nil); len(got) != 0 {
+		t.Fatalf("撤回后仍有 %d 条 doing 任务", len(got))
+	}
+	loaded, _ := repo.FindInstanceByID(ctx, inst.ID)
+	if loaded == nil || loaded.State != model.InstanceStateWithdraw {
+		t.Fatalf("实例态应=Withdraw(30): %+v", loaded)
+	}
+}
+
 // ─── 事务（spec §7.4）：绑定连接 + 回滚 ───────────────────────────────────────
 
 func TestWithTx(t *testing.T) {

@@ -167,18 +167,33 @@ func TestFacadeInstanceTaskAndWithdraw(t *testing.T) {
 		t.Fatalf("instance state = %d, want done", inst.State)
 	}
 
-	// withdraw：新流程实例撤回（级联废弃 doing）
+	// withdraw：新流程实例撤回（级联撤回 doing → 任务态 30）
 	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{
 		"processDefineId": defineID, "operator": "zhangsan",
 	})
 	instanceID2 := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
+	before, _ := repo.FindDoingTasks(context.Background(), instanceID2, nil)
+	if len(before) == 0 {
+		t.Fatalf("撤回前应有 doing 任务")
+	}
 	r = f.Flow("processInstance/withdraw", map[string]interface{}{"id": instanceID2, "operator": "zhangsan"})
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("withdraw failed: %v", r)
 	}
 	after, _ := repo.FindDoingTasks(context.Background(), instanceID2, nil)
 	if len(after) != 0 {
-		t.Fatalf("withdraw should abandon doing tasks, got %+v", after)
+		t.Fatalf("withdraw should withdraw doing tasks, got %+v", after)
+	}
+	// issues/113：撤回任务必须落 30（WITHDRAW），不能落 99（ABANDONED）——
+	// "doing 清空"这条断言两种码值都满足，抓不到该缺陷
+	for _, bt := range before {
+		stored, err := repo.FindTaskByID(context.Background(), bt.ID)
+		if err != nil || stored == nil {
+			t.Fatalf("撤回后任务应仍可读到: %v", err)
+		}
+		if stored.TaskState != model.TaskStateWithdraw {
+			t.Fatalf("撤回任务态 = %d, want %d（WITHDRAW）", stored.TaskState, model.TaskStateWithdraw)
+		}
 	}
 }
 
@@ -1688,6 +1703,24 @@ func TestE2EFeedbackRegression(t *testing.T) {
 	doingAfter, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
 	if len(doingAfter) != 0 {
 		t.Fatalf("撤回后无 doing: %d", len(doingAfter))
+	}
+	// issues/113：会签实例整单撤回时，全部 doing 会签任务同样落 30（WITHDRAW），
+	// 不能落 99——99 留给一票否决的废弃路径（两码不得混用）
+	r5 := f.Flow("processInstance/withdraw", map[string]interface{}{"id": csID, "operator": "user1"})
+	if code, _ := r5["code"].(int); code != 0 {
+		t.Fatalf("撤回会签实例: %v", r5)
+	}
+	for _, ct := range cs {
+		stored, err := repo.FindTaskByID(context.Background(), ct.ID)
+		if err != nil || stored == nil {
+			t.Fatalf("撤回后会签任务应仍可读到: %v", err)
+		}
+		if stored.TaskState != model.TaskStateWithdraw {
+			t.Fatalf("撤回会签任务态 = %d, want %d（WITHDRAW）", stored.TaskState, model.TaskStateWithdraw)
+		}
+	}
+	if got, _ := repo.FindDoingTasks(context.Background(), csID, nil); len(got) != 0 {
+		t.Fatalf("会签实例撤回后仍剩 %d 条 doing 任务", len(got))
 	}
 }
 

@@ -140,6 +140,12 @@ func (t *ProcessTask) Abandon(now time.Time) {
 	t.UpdateTime = now
 }
 
+// Withdraw 随实例撤回任务（区别于 Abandon：撤回是发起人主动收回，废弃是引擎清理）
+func (t *ProcessTask) Withdraw(now time.Time) {
+	t.TaskState = TaskStateWithdraw
+	t.UpdateTime = now
+}
+
 // IsDoing 是否进行中
 func (t *ProcessTask) IsDoing() bool { return t.TaskState == TaskStateDoing }
 
