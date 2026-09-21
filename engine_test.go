@@ -680,3 +680,260 @@ func Test13FormFieldAssigneeFPrefix(t *testing.T) {
 		t.Fatalf("② f_ priority actors: %v", doing2[0].ActorIDs)
 	}
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// issues/121 P1 · 建单不变量：引擎每次新建任务行必写 task_parent_id（发起那条＝0）
+// 与行变量 isFirstTaskNode。夹具一律 ≥3 个任务节点——两步流里"上一节点"与"首任务节点"同格，
+// 断言恒真、抓不到东西（规范「引擎操作 04」测试纪律）。
+// ═════════════════════════════════════════════════════════════════════════════
+
+// doingByName 取实例下名为 name 的**进行中**任务（一律从仓储读回，不用聚合根内存对象）
+func doingByName(t *testing.T, repo *memory.Repository, instanceID int64, name string) *model.ProcessTask {
+	t.Helper()
+	doing, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
+	for _, tk := range doing {
+		if tk.TaskName == name {
+			return tk
+		}
+	}
+	t.Fatalf("应有进行中的 %s 任务（doing 列表里没有）", name)
+	return nil
+}
+
+// rowOf 读回落库行（历史行/存量行都从这里取，保证断言打在持久值上）
+func rowOf(t *testing.T, repo *memory.Repository, taskID int64) *model.ProcessTask {
+	t.Helper()
+	tk, err := repo.FindTaskByID(context.Background(), taskID)
+	if err != nil || tk == nil {
+		t.Fatalf("任务行读不回: id=%d err=%v", taskID, err)
+	}
+	return tk
+}
+
+// wantParent 断言落库的血缘指针：nil＝死列没写（本案要消灭的形状），0＝发起那条的正确值
+func wantParent(t *testing.T, tk *model.ProcessTask, want int64) {
+	t.Helper()
+	if tk.ParentTaskID == nil {
+		t.Fatalf("%s 行 task_parent_id 未写（nil）——建单不变量 ① 破了", tk.TaskName)
+	}
+	if *tk.ParentTaskID != want {
+		t.Fatalf("%s 行 parent 应为 %d，实际 %d", tk.TaskName, want, *tk.ParentTaskID)
+	}
+}
+
+// wantFirstFlag 断言行变量里的首任务节点标记（**缺键即红**——落库是本案的产物，不只是值对不对）
+func wantFirstFlag(t *testing.T, tk *model.ProcessTask, want bool) {
+	t.Helper()
+	v, ok := tk.Variables[model.IsFirstTaskNodeKey]
+	if !ok {
+		t.Fatalf("%s 行变量缺 %s 键——建单不变量 ② 破了（variables=%v）",
+			tk.TaskName, model.IsFirstTaskNodeKey, tk.Variables)
+	}
+	b, ok := v.(bool)
+	if !ok || b != want {
+		t.Fatalf("%s 行 isFirstTaskNode 应为 %v，实际 %v(%T)", tk.TaskName, want, v, v)
+	}
+}
+
+// approve 以 actor 办结该任务（参与者先补齐，对齐其他用例姿势）
+func approve(t *testing.T, eng *engine.EngineImpl, repo *memory.Repository, tk *model.ProcessTask, actor string) {
+	t.Helper()
+	repo.AddTaskActor(context.Background(), tk.ID, []string{actor})
+	tk.ActorIDs = append(tk.ActorIDs, actor)
+	if _, err := eng.ExecuteProcessTask(context.Background(), tk.ID, actor, nil); err != nil {
+		t.Fatalf("execute %s(%d): %v", tk.TaskName, tk.ID, err)
+	}
+}
+
+// Test150CreateWritesLineageChain 链式四节点（apply→task1→task2→task3）逐条断言血缘指针相接、
+// 首节点标记只有 apply 为 true，并验「标记随已办结历史行存活」——本案必须落库（而非门面现算）的唯一理由。
+func Test150CreateWritesLineageChain(t *testing.T) {
+	eng, repo := setup()
+	def := registerFlow(repo, "02-multi-task.json")
+	inst, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "applicant", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	apply := doingByName(t, repo, inst.ID, "apply")
+	// 发起 execution 没有当前任务 ⇒ parent 落 0（不是 nil/NULL）；apply 是 start 直接后继 ⇒ true
+	wantParent(t, apply, 0)
+	wantFirstFlag(t, apply, true)
+	approve(t, eng, repo, apply, "applicant")
+
+	task1 := doingByName(t, repo, inst.ID, "task1")
+	wantParent(t, task1, apply.ID) // task1 的 parent ＝刚办结的 apply
+	wantFirstFlag(t, task1, false) // 非首节点必须 false（否则"parent=0 当首节点"这类假判据蒙不过去）
+	approve(t, eng, repo, task1, "leader")
+
+	task2 := doingByName(t, repo, inst.ID, "task2")
+	wantParent(t, task2, task1.ID) // 链式血缘：task2.parent == task1.id
+	wantFirstFlag(t, task2, false)
+	approve(t, eng, repo, task2, "manager")
+
+	task3 := doingByName(t, repo, inst.ID, "task3")
+	wantParent(t, task3, task2.ID)
+	wantFirstFlag(t, task3, false)
+
+	// 行级标记不得升格为实例变量（P1 承诺"行为零变化"；Java 侧 task 变量根本不并入实例）
+	if instNow, _ := repo.FindInstanceByID(context.Background(), inst.ID); instNow == nil {
+		t.Fatalf("实例读不回")
+	} else if _, leaked := instNow.Variables[model.IsFirstTaskNodeKey]; leaked {
+		t.Fatalf("isFirstTaskNode 漏进实例变量（应只活在任务行上）: %v", instNow.Variables)
+	}
+
+	// 本案真正要的那格：血缘版回退读的是**已办结的历史行**，标记必须随行存活
+	// （门面出口现算版带 doing 判定，历史行上恒 false ⇒ 首节点回退会被错判成普通回退）
+	hisApply := rowOf(t, repo, apply.ID)
+	if hisApply.TaskState != model.TaskStateDone {
+		t.Fatalf("apply 应已办结，实际 state=%d", hisApply.TaskState)
+	}
+	wantFirstFlag(t, hisApply, true)
+	wantParent(t, hisApply, 0) // 历史行的血缘指针不被后续建单路径覆写
+}
+
+// Test151CreateWritesLineageParallelCountersign 会签（PARALLEL）：三人各一行，parent 全部指向刚办结的
+// apply（"谁造了它们"），非首节点 ⇒ 三行标记一律 false。
+func Test151CreateWritesLineageParallelCountersign(t *testing.T) {
+	eng, repo := setup()
+	def := registerFlow(repo, "05-countersign-parallel.json")
+	inst, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "applicant", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	apply := doingByName(t, repo, inst.ID, "apply")
+	wantParent(t, apply, 0)
+	wantFirstFlag(t, apply, true)
+	approve(t, eng, repo, apply, "applicant")
+
+	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(doing) != 3 {
+		t.Fatalf("并行会签应有 3 条成员任务，实际 %d", len(doing))
+	}
+	for _, tk := range doing {
+		if tk.TaskName != "task1" {
+			t.Fatalf("会签行应在 task1 节点，实际 %s", tk.TaskName)
+		}
+		wantParent(t, tk, apply.ID)
+		wantFirstFlag(t, tk, false)
+	}
+	for _, a := range []string{"userA", "userB", "userC"} {
+		d, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
+		if len(d) == 0 {
+			t.Fatalf("会签成员未办完就没有待办了（%s 之前）", a)
+		}
+		approve(t, eng, repo, d[0], a)
+	}
+	if inst, _ = repo.FindInstanceByID(context.Background(), inst.ID); inst.State != model.InstanceStateDone {
+		t.Fatalf("expected done, got %d", inst.State)
+	}
+}
+
+// Test152CreateWritesLineageSequentialCountersign 串行会签（SEQUENTIAL）"下一位成员"那条建单路径
+// （ExecuteProcessTask 内联建单，不走 createTask）：第二位的 parent＝刚办结的第一位，
+// 簿记变量并入后标记仍在（整体覆写变量的话这格会红）。
+func Test152CreateWritesLineageSequentialCountersign(t *testing.T) {
+	eng, repo := setup()
+	def := registerFlow(repo, "08-countersign-sequential-approve.json")
+	inst, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "applicant", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	apply := doingByName(t, repo, inst.ID, "apply")
+	wantParent(t, apply, 0)
+	wantFirstFlag(t, apply, true)
+	approve(t, eng, repo, apply, "applicant")
+
+	first := doingByName(t, repo, inst.ID, "task1") // 首位成员 userA
+	wantParent(t, first, apply.ID)
+	wantFirstFlag(t, first, false)
+	approve(t, eng, repo, first, "userA")
+
+	next := doingByName(t, repo, inst.ID, "task1") // 串行会签"下一位成员"＝另一条新建行
+	if next.ID == first.ID {
+		t.Fatalf("串行会签下一位应是新建行，不应复用第一位的行")
+	}
+	wantParent(t, next, first.ID) // parent＝刚办结的那一位，不是 apply
+	wantFirstFlag(t, next, false)
+	if _, ok := next.Variables["loopCounter_task1"]; !ok {
+		t.Fatalf("串行会签簿记变量丢了: %v", next.Variables)
+	}
+	approve(t, eng, repo, next, "userB")
+
+	// 会签整体办结后进入 approve 节点：parent＝刚办结的最后一位成员
+	after := doingByName(t, repo, inst.ID, "approve")
+	wantParent(t, after, next.ID)
+	wantFirstFlag(t, after, false)
+}
+
+// Test153CreateWritesLineageOnRollback 驳回/回退建新任务那条（ExecuteAndJumpTask 空 target＝ROLLBACK）：
+// 仍是拓扑版落点，parent 记"谁造了它"＝被回退的当前任务；新行落在首节点上 ⇒ 标记 true，
+// 与 parent!=0 同时成立 ⇒ 证明标记是真判据、不是从 parent==0 推出来的。
+func Test153CreateWritesLineageOnRollback(t *testing.T) {
+	eng, repo := setup()
+	def := registerFlow(repo, "09-with-reject.json")
+	inst, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "applicant", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	apply := doingByName(t, repo, inst.ID, "apply")
+	wantParent(t, apply, 0)
+	wantFirstFlag(t, apply, true)
+	approve(t, eng, repo, apply, "applicant")
+
+	task1 := doingByName(t, repo, inst.ID, "task1")
+	wantParent(t, task1, apply.ID)
+	wantFirstFlag(t, task1, false)
+
+	// 在 task1 上办"退回上一步"⇒ 在 apply 节点新建一行
+	if _, err := eng.ExecuteAndJumpTask(context.Background(), task1.ID, "leader",
+		map[string]interface{}{"submitType": int(model.SubmitTypeRollback)}, ""); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	back := doingByName(t, repo, inst.ID, "apply")
+	if back.ID == apply.ID {
+		t.Fatalf("回退应新建行，不应复活原 apply 行")
+	}
+	wantParent(t, back, task1.ID) // 拓扑版：parent＝被回退的那条（P2 换血缘版再随复活行拷贝）
+	wantFirstFlag(t, back, true)  // apply 是 start 直接后继
+}
+
+// customFirstFlow 自定义节点作为 start 直接后继的流（Go 的 TypeCustom 建单复用 createTask，
+// 与 Java 的 createHistoryTask 形状不同——见收口说明，这里验的就是 Go 那条自定义节点建单路径）
+const customFirstFlow = `{
+  "name": "custom-first",
+  "displayName": "自定义节点首行建单不变量",
+  "type": "approval",
+  "nodes": [
+    {"id": "start", "type": "snaker:start", "properties": {}, "text": {"value": "开始"}},
+    {"id": "cust1", "type": "snaker:custom", "properties": {"assignee": "ext-sys"}, "text": {"value": "通知外部系统"}},
+    {"id": "task1", "type": "snaker:task", "properties": {"assignee": "leader", "performType": 0}, "text": {"value": "审批"}},
+    {"id": "end", "type": "snaker:end", "properties": {}, "text": {"value": "结束"}}
+  ],
+  "edges": [
+    {"id": "e0", "sourceNodeId": "start", "targetNodeId": "cust1", "properties": {}},
+    {"id": "e1", "sourceNodeId": "cust1", "targetNodeId": "task1", "properties": {}},
+    {"id": "e2", "sourceNodeId": "task1", "targetNodeId": "end", "properties": {}}
+  ]
+}`
+
+// Test154CreateWritesLineageCustomNode 自定义节点建单同样兑现两条不变量：它是 start 直接后继 ⇒
+// 首节点标记 true（Java 的历史行在 Go 里是这条 DOING 行），且发起路径 parent 落 0。
+func Test154CreateWritesLineageCustomNode(t *testing.T) {
+	eng, repo := setup()
+	def := &model.ProcessDefine{Name: "custom-first", DisplayName: "custom-first", Type: "test",
+		State: 1, Content: []byte(customFirstFlow)}
+	repo.AddDefine(def)
+	inst, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "applicant", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	cust := doingByName(t, repo, inst.ID, "cust1")
+	wantParent(t, cust, 0)
+	wantFirstFlag(t, cust, true)
+	approve(t, eng, repo, cust, "ext-sys")
+
+	task1 := doingByName(t, repo, inst.ID, "task1")
+	wantParent(t, task1, cust.ID)
+	wantFirstFlag(t, task1, false)
+}

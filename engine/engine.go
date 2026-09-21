@@ -32,4 +32,7 @@ const (
 	// v1.0.1：系统代执行 / 超级管理员（对齐 boot3 FlowConst）
 	KeyAutoExecute = "flow.auto"
 	KeyAdminID     = "flow.admin"
+	// issues/121 P1：行级首任务节点标记（引擎建单时落库，对齐 Java FlowConst.IS_FIRST_TASK_NODE）
+	// 值与 model.IsFirstTaskNodeKey 同——建单写入在 model.CreateTask（唯一工厂），此处供引擎/门面读出口引用
+	KeyIsFirstTaskNode = model.IsFirstTaskNodeKey
 )

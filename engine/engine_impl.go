@@ -76,7 +76,8 @@ func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int6
 	}
 	for _, node := range followEdges(&flow, startNode.ID) {
 		// issues/60：executeNode 错误（拦截器解析等）必须传播，不静默吞掉
-		if err := e.executeNode(ctx, &flow, inst, node, operator, vars); err != nil {
+		// 建单不变量（issues/121 P1）：发起 execution 没有"刚办结的当前任务" ⇒ parent 传 0（落库 0）
+		if err := e.executeNode(ctx, &flow, inst, node, operator, vars, 0); err != nil {
 			return nil, err
 		}
 	}
@@ -116,12 +117,16 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 				actors, lc := getCsState(vars, curNode.ID)
 				if actors != nil && lc+1 < len(actors) {
 					// 聚合根：创建串行会签下一步任务
-					nt := inst.CreateTask(e.nextID(), curNode.ID, curNode.Text.Value, actors[lc+1], operator, formKeyOf(curNode), now, 1)
-					nt.Variables = map[string]interface{}{
+					// 建单不变量（issues/121 P1，对齐 Java CountersignHandler）：串行会签的下一位成员，
+					// parent＝刚办结的那一位（execution 当前任务）；首节点标记沿用现成判据按**当前节点**算
+					nt := inst.CreateTask(e.nextID(), curNode.ID, curNode.Text.Value, actors[lc+1], operator, formKeyOf(curNode), now,
+						task.ID, e.isFirstTaskNode(flow, curNode), 1)
+					// 会签簿记并入既有变量（CreateTask 已写入 isFirstTaskNode，整体覆写会把标记丢掉）
+					putTaskVars(nt, map[string]interface{}{
 						prefixKey("nrOfInstances", curNode.ID): len(actors),
 						prefixKey("loopCounter", curNode.ID):   lc + 1,
 						prefixKey("operatorList", curNode.ID):  actors,
-					}
+					})
 					// issues/116：顺序会签推进的新任务同样在建单期并入生效委托代理人
 					e.saveNewTask(ctx, nt, e.surrogateProcessName(flow, inst))
 					// TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
@@ -156,7 +161,8 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 		for _, node := range followEdges(flow, curNode.ID) {
 			// 统一走 executeNode：结束节点也经节点执行链（拦截器/事件完整触发），
 			// executeNode 内部 TypeEnd 分支完成聚合根 Finish + 事件发布
-			e.executeNode(ctx, flow, inst, node, operator, vars)
+			// 建单不变量（issues/121 P1）：新任务的 parent＝本次刚办结的当前任务
+			e.executeNode(ctx, flow, inst, node, operator, vars, task.ID)
 		}
 	}
 	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
@@ -203,7 +209,10 @@ func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, opera
 		if prevName != "" {
 			if prev := findNode(flow, prevName); prev != nil {
 				actors := e.resolveActorsForRollback(prev, inst, operator, task)
-				e.createTaskWithActors(ctx, flow, prev, inst, operator, vars, actors)
+				// 建单不变量（issues/121 P1）：回退新建的任务同样必写 parent。
+				// 本路径**仍是拓扑版落点**（P2 才换血缘版）：parent 先记"谁造了它"＝被回退的当前任务；
+				// 届时按契约第 8 条改为随复活行拷贝（＝上一步的上一步）。
+				e.createTaskWithActors(ctx, flow, prev, inst, operator, vars, actors, task.ID)
 			}
 		}
 	} else {
@@ -219,7 +228,8 @@ func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, opera
 			}
 			target.Properties["assignee"] = inst.Operator
 		}
-		if err := e.executeNode(ctx, flow, inst, target, operator, vars); err != nil {
+		// 建单不变量（issues/121 P1）：JUMP 新建任务的 parent＝本次刚办结的当前任务
+		if err := e.executeNode(ctx, flow, inst, target, operator, vars, task.ID); err != nil {
 			return nil, err
 		}
 	}
@@ -230,7 +240,7 @@ func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, opera
 // ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）──────────────
 
 func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	_, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args)
+	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args)
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +252,8 @@ func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID i
 					node.Properties = map[string]interface{}{}
 				}
 				node.Properties["assignee"] = inst.Operator
-				if err := e.executeNode(ctx, flow, inst, node, operator, vars); err != nil {
+				// 建单不变量（issues/121 P1）：退回发起人新建的任务 parent＝本次刚办结的当前任务
+				if err := e.executeNode(ctx, flow, inst, node, operator, vars, task.ID); err != nil {
 					return nil, err
 				}
 				break
@@ -343,7 +354,9 @@ func (e *EngineImpl) resolveActorsForRollback(node *model.FlowNode, inst *model.
 }
 
 // createTaskWithActors 以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）
-func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowModel, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}, actors []string) error {
+//
+// parentTaskID：建单不变量 ①——产生这些任务的那个"刚办结的任务"id（发起路径为 0），见 model.CreateTask
+func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowModel, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}, actors []string, parentTaskID int64) error {
 	if len(actors) == 0 {
 		return nil
 	}
@@ -351,33 +364,36 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 	now := time.Now()
 	form := formKeyOf(node)
 	pn := e.surrogateProcessName(flow, inst)
+	// 建单不变量 ②：判据沿用现成的 isFirstTaskNode（start 直接后继），同一次建单只算一次
+	isFirst := e.isFirstTaskNode(flow, node)
 	if IsCountersign(node.Properties["performType"]) && ct != "" {
 		switch ct {
 		case "PARALLEL", "":
 			for _, actor := range actors {
-				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1)
+				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
 				e.saveNewTask(ctx, nt, pn)
 				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
 		case "SEQUENTIAL":
-			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, 1)
-			nt.Variables = map[string]interface{}{
+			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, parentTaskID, isFirst, 1)
+			// 会签簿记并入既有变量（整体覆写会丢掉 CreateTask 写好的 isFirstTaskNode 标记）
+			putTaskVars(nt, map[string]interface{}{
 				prefixKey("nrOfInstances", node.ID): len(actors),
 				prefixKey("loopCounter", node.ID):   0,
 				prefixKey("operatorList", node.ID):  actors,
-			}
+			})
 			e.saveNewTask(ctx, nt, pn)
 			e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 		default:
 			for _, actor := range actors {
-				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1)
+				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
 				e.saveNewTask(ctx, nt, pn)
 				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
 		}
 		return nil
 	}
-	nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now)
+	nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, parentTaskID, isFirst)
 	if len(actors) > 1 {
 		nt.ActorIDs = actors
 	}
@@ -406,11 +422,13 @@ func (e *EngineImpl) loadAndCheck(ctx context.Context, taskID int64, operator st
 	return task, inst, nil
 }
 
-func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}) error {
+// executeNode 节点执行链。parentTaskID ＝本次 execution 刚办结的当前任务 id
+// （建单不变量 ①，逐层透传给 decision/fork/join 落到的任务节点；发起路径传 0）
+func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}, parentTaskID int64) error {
 	// 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
 	// 任务完成的拦截器由 ExecuteProcessTask 显式触发，1.8.0 SYNC 同步演进）
 	if node.Type == model.TypeTask || node.Type == model.TypeCustom {
-		return e.createTask(ctx, flow, node, inst, operator, vars)
+		return e.createTask(ctx, flow, node, inst, operator, vars, parentTaskID)
 	}
 	// issues/60：声明未解析 → 显式报错（不静默跳过）
 	proceed, err := e.firePreInterceptors(node, inst)
@@ -427,11 +445,11 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 
 	switch node.Type {
 	case model.TypeDecision:
-		return e.evaluateDecision(ctx, flow, inst, node, operator, vars)
+		return e.evaluateDecision(ctx, flow, inst, node, operator, vars, parentTaskID)
 	case model.TypeFork:
 		for _, n := range followEdges(flow, node.ID) {
 			// issues/60：错误传播（拦截器解析等）
-			if err := e.executeNode(ctx, flow, inst, n, operator, vars); err != nil {
+			if err := e.executeNode(ctx, flow, inst, n, operator, vars, parentTaskID); err != nil {
 				return err
 			}
 		}
@@ -441,7 +459,7 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 		if len(doing) == 0 {
 			for _, n := range followEdges(flow, node.ID) {
 				// issues/60：错误传播（拦截器解析等）
-				if err := e.executeNode(ctx, flow, inst, n, operator, vars); err != nil {
+				if err := e.executeNode(ctx, flow, inst, n, operator, vars, parentTaskID); err != nil {
 					return err
 				}
 			}
@@ -464,7 +482,7 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 	return nil
 }
 
-func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}) error {
+func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}, parentTaskID int64) error {
 	// 自定义决策处理器（Registry 优先）
 	if e.registry != nil {
 		handlerName, _ := node.Properties["decisionHandler"].(string)
@@ -478,7 +496,7 @@ func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel
 					for _, edge := range flow.Edges {
 						if edge.ID == branchID {
 							if target := findNode(flow, edge.TargetNodeID); target != nil {
-								return e.executeNode(ctx, flow, inst, target, operator, vars)
+								return e.executeNode(ctx, flow, inst, target, operator, vars, parentTaskID)
 							}
 						}
 					}
@@ -494,7 +512,7 @@ func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel
 			for _, edge := range flow.Edges {
 				if edge.ID == branchID {
 					if target := findNode(flow, edge.TargetNodeID); target != nil {
-						return e.executeNode(ctx, flow, inst, target, operator, vars)
+						return e.executeNode(ctx, flow, inst, target, operator, vars, parentTaskID)
 					}
 				}
 			}
@@ -508,7 +526,7 @@ func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel
 		expr, _ := edge.Properties["expr"].(string)
 		if expr == "" {
 			if target := findNode(flow, edge.TargetNodeID); target != nil {
-				return e.executeNode(ctx, flow, inst, target, operator, vars)
+				return e.executeNode(ctx, flow, inst, target, operator, vars, parentTaskID)
 			}
 			return nil
 		}
@@ -519,7 +537,7 @@ func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel
 			}
 			if isTruthy(result) {
 				if target := findNode(flow, edge.TargetNodeID); target != nil {
-					return e.executeNode(ctx, flow, inst, target, operator, vars)
+					return e.executeNode(ctx, flow, inst, target, operator, vars, parentTaskID)
 				}
 				return nil
 			}
@@ -528,7 +546,7 @@ func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel
 	return nil
 }
 
-func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}) error {
+func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}, parentTaskID int64) error {
 	actors := e.resolveActors(node, inst, operator, vars)
 	if len(actors) == 0 {
 		return nil
@@ -537,30 +555,33 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 	now := time.Now()
 	form := formKeyOf(node)
 	pn := e.surrogateProcessName(flow, inst)
+	// 建单不变量 ②（issues/121 P1）：判据沿用现成的 isFirstTaskNode（start 直接后继），一次算好复用
+	isFirst := e.isFirstTaskNode(flow, node)
 
 	// issue 42：performType 字符串兼容（'1'/'ALL'/'COUNTERSIGN' → 会签，对齐 Java codeOf）
 	if IsCountersign(node.Properties["performType"]) && ct != "" {
 		switch ct {
 		case "PARALLEL":
 			for _, actor := range actors {
-				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1)
+				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
 				e.saveNewTask(ctx, nt, pn)
 				// TASK_CREATE：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
 				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
 		case "SEQUENTIAL":
 			// 顺序会签任务也是会签任务（issues/57 E29 修正：仅普通分支默认 0）
-			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, 1)
-			nt.Variables = map[string]interface{}{
+			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, parentTaskID, isFirst, 1)
+			// 会签簿记并入既有变量（整体覆写会丢掉 CreateTask 写好的 isFirstTaskNode 标记）
+			putTaskVars(nt, map[string]interface{}{
 				prefixKey("nrOfInstances", node.ID): len(actors),
 				prefixKey("loopCounter", node.ID):   0,
 				prefixKey("operatorList", node.ID):  actors,
-			}
+			})
 			e.saveNewTask(ctx, nt, pn)
 			e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 		default:
 			for _, actor := range actors {
-				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1)
+				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
 				e.saveNewTask(ctx, nt, pn)
 				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
@@ -568,7 +589,7 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 		return nil
 	}
 	// 普通任务：一个任务，全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
-	nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now)
+	nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, parentTaskID, isFirst)
 	if len(actors) > 1 {
 		nt.ActorIDs = actors
 	}
@@ -768,6 +789,12 @@ func mergeVars(args map[string]interface{}, base map[string]interface{}) map[str
 // 发起人 u_*）为底，并入执行上下文中**非 u_*** 键（f_ 表单字段 / submitType 等流转数据）。
 // addUserInfo 生成的操作人 u_* 只属于当次执行上下文与任务行 ext，不整体写回实例——
 // 实例 u_realName 语义是「发起人」（与 autoGenTitle 一致），不随审批节点漂移。
+//
+// isFirstTaskNode 同被挡在实例之外（issues/121 P1）：它是**行级**建单标记（规范「引擎操作 04」
+// 建单不变量②），实例层没有"首任务节点行"这一说。Java 侧 task 变量根本不并入实例变量
+// （prepareExecution 只 merge instance.variables + args），Go 侧因会签簿记共用 exec 变量池
+// （prepareExecuteTask 把 task.Variables 并入 vars），若不挡就会凭空给实例加一个逐节点漂移的
+// isFirstTaskNode —— 那属于 P1 承诺"行为零变化"之外的副作用。
 func mergeExecIntoInstance(base, exec map[string]interface{}) map[string]interface{} {
 	out := make(map[string]interface{})
 	for k, v := range base {
@@ -775,6 +802,9 @@ func mergeExecIntoInstance(base, exec map[string]interface{}) map[string]interfa
 	}
 	for k, v := range exec {
 		if strings.HasPrefix(k, "u_") {
+			continue
+		}
+		if k == model.IsFirstTaskNodeKey {
 			continue
 		}
 		out[k] = v
@@ -822,6 +852,18 @@ func isTruthy(v interface{}) bool {
 }
 
 func prefixKey(key, nodeID string) string { return key + "_" + nodeID }
+
+// putTaskVars 向任务行变量**并入**键值（不整体覆写）。
+// 建单不变量 ②（issues/121 P1）把 isFirstTaskNode 写在 CreateTask 里，会签簿记等后置变量若用
+// `nt.Variables = map[...]` 整体赋值就会把标记顺手抹掉——落库标记正是本案唯一必需的产物，故一律走并入。
+func putTaskVars(nt *model.ProcessTask, kv map[string]interface{}) {
+	if nt.Variables == nil {
+		nt.Variables = map[string]interface{}{}
+	}
+	for k, v := range kv {
+		nt.Variables[k] = v
+	}
+}
 
 func intFromProps(props map[string]interface{}, key string) (int, bool) {
 	if v, ok := props[key]; ok {

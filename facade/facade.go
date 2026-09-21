@@ -1374,13 +1374,15 @@ func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 	}
 	actors, _ := f.repo.FindTaskActors(context.Background(), taskID)
 	// issues/82-5：任务级 ext.isFirstTaskNode（前端 detail.vue 双兜底 record.ext?.isFirstTaskNode）
-	// 首个任务节点且 DOING → true，与 instance detail 的 activeTaskList 行语义一致
+	// issues/121 P1：改成「行上值优先、缺键才回退现算」——引擎建单时已把标记落库（已办结的历史行同样
+	// 有效）；存量行没这个键才回退下面那条带 doing 判定的现算，现算只够展示用，引擎内部判定不得用它。
 	tExt := map[string]interface{}{}
 	for k, v := range task.Variables {
 		tExt[k] = v
 	}
 	doing := task.TaskState == model.TaskStateDoing
-	tExt["isFirstTaskNode"] = false
+	rowFirst, hasRowFirst := rowFirstTaskNode(tExt)
+	tExt[engine.KeyIsFirstTaskNode] = rowFirst
 	vo := map[string]interface{}{
 		"id": task.ID, "processInstanceId": task.ProcessInstanceID,
 		"taskName": task.TaskName, "displayName": task.DisplayName,
@@ -1398,7 +1400,10 @@ func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 			graph := map[string]interface{}{}
 			if json.Unmarshal(def.Content, &graph) == nil && len(graph) > 0 {
 				vo["jsonObject"] = graph // issues/05
-				tExt["isFirstTaskNode"] = doing && task.TaskName == firstTaskNodeIDOf(graph)
+				if !hasRowFirst {
+					// 存量行没有落库标记 ⇒ 才回退现算（"仅进行中"口径，只对展示够用）
+					tExt[engine.KeyIsFirstTaskNode] = doing && task.TaskName == firstTaskNodeIDOf(graph)
+				}
 			}
 			var flow model.FlowModel
 			if json.Unmarshal(def.Content, &flow) == nil {
@@ -1831,6 +1836,20 @@ func toIDString(v interface{}) string {
 	return fmt.Sprintf("%v", v)
 }
 
+// derefValue 指针取背值（非指针原样返回；nil 指针给 nil，兜底 fmt 出 "<nil>" 与历史形状一致）。
+// stringifyIDs 的 id 分支需要它：可空 id 列（*int64 的 task_parent_id / parent_id）不解引用就会被
+// toIDString 兜底成**指针地址**（issues/121 P1 激活 task_parent_id 后暴露）。
+func derefValue(v interface{}) interface{} {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Ptr {
+		return v
+	}
+	if rv.IsNil() {
+		return nil
+	}
+	return rv.Elem().Interface()
+}
+
 // stringifyIDs 递归把返回结构中 id 类字段值统一转字符串（反射兼容
 // map[string]interface{} / []interface{} / []map[string]interface{} 等真实类型）
 func stringifyIDs(v interface{}) interface{} {
@@ -1848,7 +1867,10 @@ func stringifyIDs(v interface{}) interface{} {
 			ks := k.String()
 			val := rv.MapIndex(k).Interface()
 			if isIDKey(ks) {
-				out[ks] = toIDString(val)
+				// id 键同样先解引用：*int64 这类可空 id 列（task_parent_id / parent_id）直接进
+				// toIDString 会落到兜底 fmt.Sprintf("%v", ptr) 吐**指针地址**。issues/121 P1 把
+				// task_parent_id 从"恒 nil"写成"恒有值"，正是这条路被踩中——VO 必须带真 id。
+				out[ks] = toIDString(derefValue(val))
 			} else {
 				out[ks] = stringifyIDs(val)
 			}
@@ -2053,7 +2075,13 @@ func (f *Facade) instanceDetail(args map[string]interface{}) (interface{}, error
 			ext[k] = v
 		}
 		doing := t.TaskState == model.TaskStateDoing
-		ext["isFirstTaskNode"] = doing && t.TaskName == firstTaskNodeID
+		// issues/121 P1：行上值优先（引擎建单时写入，已办结的历史行同样有效）；缺键（存量行）才回退
+		// 现算——现算带"仅进行中"判定，只够展示用，不能当引擎判据（issues/121 §4）
+		rowFirst, hasRowFirst := rowFirstTaskNode(ext)
+		if !hasRowFirst {
+			rowFirst = doing && t.TaskName == firstTaskNodeID
+		}
+		ext[engine.KeyIsFirstTaskNode] = rowFirst
 		vo["ext"] = ext
 		tasks = append(tasks, vo)
 		if doing {
@@ -2063,6 +2091,26 @@ func (f *Facade) instanceDetail(args map[string]interface{}) (interface{}, error
 	data["tasks"] = tasks
 	data["activeTaskList"] = activeTaskList
 	return data, nil
+}
+
+// rowFirstTaskNode 读出口的行上值（issues/121 P1「行上值优先、缺键才回退现算」的前半）：
+// 返回 (行上布尔值, 行上是否有值)。键缺失/为 null（存量老行，引擎还没写标记时落的数据）⇒ 第二返回 false，
+// 调用方必须回退现算，不能把"未定义"读成 false。值形态兼容 JSON 反序列化后的 bool 与字符串 "true"。
+func rowFirstTaskNode(ext map[string]interface{}) (bool, bool) {
+	v, ok := ext[engine.KeyIsFirstTaskNode]
+	if !ok || v == nil {
+		return false, false
+	}
+	switch b := v.(type) {
+	case bool:
+		return b, true
+	case string:
+		return strings.EqualFold(strings.TrimSpace(b), "true"), true
+	case json.Number:
+		n, _ := b.Int64()
+		return n != 0, true
+	}
+	return false, true
 }
 
 // firstTaskNodeIDOf 流程 JSON 中第一个任务节点 id（issues/05-4 isFirstTaskNode 用）

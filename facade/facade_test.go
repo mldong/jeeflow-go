@@ -2257,6 +2257,104 @@ func TestTaskDetailExtIsFirstTaskNode(t *testing.T) {
 	}
 }
 
+// detailTaskRowOf 从 processInstance/detail 的 tasks 里按任务名取该行 VO（读出口值，不走内存聚合根）
+func detailTaskRowOf(t *testing.T, f *facade.Facade, instanceID int64, taskName string) map[string]interface{} {
+	t.Helper()
+	r := f.Flow("processInstance/detail", map[string]interface{}{"id": instanceID})
+	mustOk(t, r)
+	raw, _ := r["data"].(map[string]interface{})["tasks"].([]interface{})
+	for _, o := range raw {
+		row, _ := o.(map[string]interface{})
+		if row != nil && row["taskName"] == taskName {
+			return row
+		}
+	}
+	t.Fatalf("detail.tasks 里应有 %s 行（实际 %d 行）", taskName, len(raw))
+	return nil
+}
+
+// detailTaskExtOf 同上，取该行 ext 容器
+func detailTaskExtOf(t *testing.T, f *facade.Facade, instanceID int64, taskName string) map[string]interface{} {
+	t.Helper()
+	ext, _ := detailTaskRowOf(t, f, instanceID, taskName)["ext"].(map[string]interface{})
+	return ext
+}
+
+// taskDetailExtOf processTask/detail 的任务级 ext
+func taskDetailExtOf(t *testing.T, f *facade.Facade, taskID int64, operator string) map[string]interface{} {
+	t.Helper()
+	r := f.Flow("processTask/detail", map[string]interface{}{"id": taskID, "operator": operator})
+	mustOk(t, r)
+	ext, _ := r["data"].(map[string]interface{})["ext"].(map[string]interface{})
+	return ext
+}
+
+// TestFacadeIsFirstTaskNodePrefersRowValue issues/121 P1：两处出口（实例详情 tasks 行 / 任务详情）
+// 改成「行上值优先、缺键才回退现算」。差值只在**已办结的历史行**上看得见——现算带 doing 判定
+// ⇒ 历史行恒 false，而行上值是真 true；血缘版回退（P2）要读的就是这条历史行。
+// 存量老行没有这个键 ⇒ 回退现算得 false，且不报错。
+func TestFacadeIsFirstTaskNodePrefersRowValue(t *testing.T) {
+	repo := memory.New()
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	f := facade.New(eng, repo, memory.NewExt())
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "02-multi-task.json"))})
+	mustOk(t, r0)
+	defID := mustI64(r0["data"].(map[string]interface{})["processDefineId"])
+	// 用引擎发起（不是 startAndExecute——它会把 apply 一并办结，就拿不到"进行中的首节点行"了）
+	inst, err := eng.StartProcessInstanceByID(context.Background(), defID, "applicant", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	applyID := doingTaskID(t, repo, inst.ID, "apply")
+	if applyID == 0 {
+		t.Fatalf("应有进行中的 apply 行")
+	}
+
+	// ① 进行中的首节点行：两处出口都读到行上值 true
+	if v := detailTaskExtOf(t, f, inst.ID, "apply")[engine.KeyIsFirstTaskNode]; v != true {
+		t.Fatalf("进行中的首节点行 instance detail 应读到 true，实际 %v", v)
+	}
+	if v := taskDetailExtOf(t, f, applyID, "applicant")[engine.KeyIsFirstTaskNode]; v != true {
+		t.Fatalf("进行中的首节点行 task detail 应读到 true，实际 %v", v)
+	}
+	// ①b 门面 VO 真带得上这条曾经的死列：发起那条落库 0（不是 null、不是指针地址）
+	if v := detailTaskRowOf(t, f, inst.ID, "apply")["taskParentId"]; v != "0" {
+		t.Fatalf("门面 VO taskParentId 应为 \"0\"，实际 %v(%T)", v, v)
+	}
+
+	// ② 办结后读回**已办结的历史行**：标记随行存活（把出口退回纯现算，这两格必红）
+	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{
+		"processTaskId": applyID, "operator": "applicant", "submitType": 1,
+	}))
+	if tk, _ := repo.FindTaskByID(context.Background(), applyID); tk.TaskState == model.TaskStateDoing {
+		t.Fatalf("apply 应已办结")
+	}
+	// ②b 下一行的 VO 血缘指针指向刚办结的 apply
+	if v := detailTaskRowOf(t, f, inst.ID, "task1")["taskParentId"]; v != strconv.FormatInt(applyID, 10) {
+		t.Fatalf("task1 行 VO taskParentId 应为 apply 的 id %d，实际 %v", applyID, v)
+	}
+	if v := detailTaskExtOf(t, f, inst.ID, "apply")[engine.KeyIsFirstTaskNode]; v != true {
+		t.Fatalf("历史行仍应读到 true（标记随行存活）: %v", v)
+	}
+	if v := taskDetailExtOf(t, f, applyID, "applicant")[engine.KeyIsFirstTaskNode]; v != true {
+		t.Fatalf("历史行 task detail 仍应读到 true: %v", v)
+	}
+
+	// ③ 存量行形状（引擎尚未写标记时落的老数据）：抹掉行上键 ⇒ 只能回退现算 ⇒ 历史行 false，不报错
+	row, err := repo.FindTaskByID(context.Background(), applyID)
+	if err != nil || row == nil {
+		t.Fatalf("apply 行读不回: %v", err)
+	}
+	delete(row.Variables, model.IsFirstTaskNodeKey)
+	_ = repo.UpdateTask(context.Background(), row)
+	if ext := detailTaskExtOf(t, f, inst.ID, "apply"); ext[engine.KeyIsFirstTaskNode] != false {
+		t.Fatalf("缺键历史行应回退现算得 false: %v", ext)
+	}
+	if ext := taskDetailExtOf(t, f, applyID, "applicant"); ext[engine.KeyIsFirstTaskNode] != false {
+		t.Fatalf("缺键历史行 task detail 应回退现算得 false: %v", ext)
+	}
+}
+
 // issues/82-8：doneList 行 finishTime 已格式化（yyyy-MM-dd HH:mm:ss 无 T，对齐 Java/Python/Node）
 func TestFacadeDoneListFinishTime(t *testing.T) {
 	f, repo, _ := setupFacade()
