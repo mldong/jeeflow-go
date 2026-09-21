@@ -17,6 +17,7 @@ package engine
 import (
 	"context"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/mldong/jeeflow-go/model"
@@ -116,12 +117,23 @@ func (e *EngineImpl) saveNewTask(ctx context.Context, nt *model.ProcessTask, pro
 	return e.repo.SaveTask(ctx, nt)
 }
 
-// surrogateProcessName 委托查询用的流程名：取流程模型 name（对齐 Java
-// execution.getProcessModel().getName()），缺失时回落定义行 name（按 defineId 缓存，
-// 与 resolveInterceptors 同一姿势）。
+// surrogateProcessName 委托查询用的流程名（规范 06 §4.5 条款 1.1）：**先 trim 再判空**
+// 取流程模型 name（对齐 Java SurrogateInterceptor.resolveProcessName 的
+// isNotBlank + trim），模型未带（键缺失 / null / 空串 / **仅空白**）才回落
+// wf_process_define.name（同样 trim）；**传给 GetSurrogate 的一律是 trim 后的值**。
+//
+// 为什么不是"假值判空"：流程 JSON 的 name 是 "  " 时，按假值判空会拿空白串去查委托 ——
+// 精确查必不中、兜底查（判据 a 用当前流程名做精确匹配）也拿不到该流程自己配的委托，
+// 只剩"全流程兜底"行能命中 ⇒ 用户视角＝委托静默失效；而 Java/PHP/Node 同数据会回落
+// 定义行 name 并命中。同一份数据两栈不同答案，就是本轮要堵的跨栈分叉。
+//
+// 回落路径读定义行（含 content BLOB）按 defineId 缓存，与 resolveInterceptors 同一姿势：
+// 逐次 execution 解析一次后复用，不得逐任务解析。
 func (e *EngineImpl) surrogateProcessName(flow *model.FlowModel, inst *model.ProcessInstance) string {
-	if flow != nil && flow.Name != "" {
-		return flow.Name
+	if flow != nil {
+		if n := strings.TrimSpace(flow.Name); n != "" {
+			return n
+		}
 	}
 	if inst == nil || inst.DefineID == 0 {
 		return ""
@@ -134,7 +146,7 @@ func (e *EngineImpl) surrogateProcessName(flow *model.FlowModel, inst *model.Pro
 	}
 	name := ""
 	if def, err := e.repo.FindDefineByID(context.Background(), inst.DefineID); err == nil && def != nil {
-		name = def.Name
+		name = strings.TrimSpace(def.Name)
 	}
 	e.defineNameCache[inst.DefineID] = name
 	return name

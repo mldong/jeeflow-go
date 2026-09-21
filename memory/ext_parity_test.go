@@ -16,6 +16,8 @@ import (
 func TestExtSurrogateQueryParity(t *testing.T) {
 	ext := memory.NewExt()
 	now := time.Now().Truncate(time.Millisecond)
+	// 先自证夹具本身有判别力（多条命中的期望行 id 已打乱到非首非末），再对拍内存仓
+	surrparity.Verify(t, now)
 	surrparity.Run(t, ext, func(r surrparity.Row) error {
 		s := &model.ProcessSurrogate{
 			ID: r.ID, Operator: r.Operator, Surrogate: r.Surrogate, ProcessName: r.ProcessName,

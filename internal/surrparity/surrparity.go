@@ -11,6 +11,19 @@
 //
 // 命中多行时的取行规则也在这里对拍：两仓都取 ID 最大者（对齐 SQL
 // `ORDER BY id DESC LIMIT 1`）；内存 map 遍历序随机，不显式取最大即两仓结论不同。
+//
+// ⚠️ **夹具的 id 序是刻意打乱的**（条款 1.4 的判别力所在）：多条命中那一组里，
+// 插入顺序给的是 id 910002 → 910003 → 910001，即"期望命中的最大 id 行"既不是插入
+// 首条也不是插入末条。于是三种写法的结论互相可分：
+//   - 取遍历首条 → 910002（红）
+//   - 取插入末条 / 边扫边覆盖 → 910001（红）
+//   - 取 id 最大 → 910003（绿，期望）
+//
+// ⚠️ 已知事实（Java 实测踩到）：**SQL 侧这种打乱没有判别力**——H2/InnoDB 对
+// `WHERE operator=? ORDER BY id DESC` 本来就按主键序回行，插入序在结果里根本不出现，
+// 打乱与否答案都一样。钉住条款 1.4 的在 SQL 侧是 `ORDER BY id DESC` 这个排序子句本身
+// （去掉它才会退化成"取物理首行"）；插入序打乱真正起作用的是**内存侧**（切片/映射实现
+// 若按插入序取首条或末条即红）。两侧仍必须各跑一遍并对同一答案负责。
 package surrparity
 
 import (
@@ -24,6 +37,7 @@ import (
 type T interface {
 	Helper()
 	Fatalf(format string, args ...interface{})
+	Logf(format string, args ...interface{})
 }
 
 // OpPrefix 全部用例操作人/代理人的命名空间后缀——两仓用同一批人，
@@ -67,20 +81,35 @@ type Case struct {
 func name(base string) string { return base + "-" + OpPrefix }
 
 // Rows 共用数据集。分组：
-//   - zs-*         优先级与兜底（同一授权人多条候选）
+//   - zs-*         优先级与兜底（同一授权人多条候选，**id 序已刻意打乱**）
+//   - zs2-*        兜底路径的多条候选（同样打乱，钉住兜底分支也按 id 取最大）
 //   - solo-*       单判据隔离（每个只有一条委托，答错无法被其它判据掩盖）
 func Rows(now time.Time) []Row {
 	return []Row{
 		// ── a. 精确优先 + 全流程兜底 + 取最大 ID ──
-		{ID: 910001, Operator: name("zs"), Surrogate: name("exact-old"), ProcessName: Flow, StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
-		{ID: 910002, Operator: name("zs"), Surrogate: name("exact-new"), ProcessName: Flow, StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
-		{ID: 910003, Operator: name("zs"), Surrogate: name("all-flow"), ProcessName: "", StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
-		{ID: 910004, Operator: name("zs"), Surrogate: name("other-flow"), ProcessName: OtherFlow, StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
-		{ID: 910005, Operator: name("zs"), Surrogate: name("disabled"), ProcessName: Flow, StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 0},
+		// 三条"精确命中且生效"的候选按 id 910002 → 910003 → 910001 的顺序插入：
+		// 期望的 910003 既非插入首条也非插入末条（判别力见包注释）。
+		{ID: 910002, Operator: name("zs"), Surrogate: name("exact-first"), ProcessName: Flow, StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
+		{ID: 910003, Operator: name("zs"), Surrogate: name("exact-max"), ProcessName: Flow, StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
+		{ID: 910001, Operator: name("zs"), Surrogate: name("exact-last"), ProcessName: Flow, StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
+		// 兜底行：a2/a3/a4 的期望。ID 必须小于下面 other-flow 行，才能钉住
+		// "非空 processName 的行不得充当兜底"（兜底若不判空就会答成 other-flow）。
+		{ID: 910005, Operator: name("zs"), Surrogate: name("all-flow"), ProcessName: "", StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
+		{ID: 910007, Operator: name("zs"), Surrogate: name("other-flow"), ProcessName: OtherFlow, StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
+		// 停用行 ID 比生效行更大：实现若把"enabled 非 1"折叠成启用，a1/d3 就会答成 disabled
+		{ID: 910006, Operator: name("zs"), Surrogate: name("disabled"), ProcessName: Flow, StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 0},
 		// zs 组内的自委托行：ID 比生效行更大——实现若不过滤自委托，a1 就会答成 zs 自己
-		{ID: 910006, Operator: name("zs"), Surrogate: name("zs"), ProcessName: Flow, StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
+		{ID: 910008, Operator: name("zs"), Surrogate: name("zs"), ProcessName: Flow, StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
 		// 与"自委托"形似但不同的正常行：被委托人恰好叫 self-go116（字符串不同于 zs-go116）
-		{ID: 910007, Operator: name("zs"), Surrogate: name("self"), ProcessName: name("self"), StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
+		{ID: 910009, Operator: name("zs"), Surrogate: name("self"), ProcessName: name("self"), StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
+
+		// ── a 补：兜底分支的多条候选（条款 1.4 在兜底路径同样要打乱序才看得出）──
+		// 三条 process_name 为空（'' 与 NULL 混着放，两仓都属同一逻辑类）的生效兜底行，
+		// 插入序 id 910042 → 910043 → 910041，期望 910043（最大，且它在 SQL 侧是 NULL，
+		// 兜底若只写 process_name = '' 就会答成 910042）。
+		{ID: 910042, Operator: name("zs2"), Surrogate: name("all2-first"), ProcessName: "", StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
+		{ID: 910043, Operator: name("zs2"), Surrogate: name("all2-max"), ProcessName: "", NullProcessName: true, StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
+		{ID: 910041, Operator: name("zs2"), Surrogate: name("all2-last"), ProcessName: "", StartOff: -time.Hour, HasStart: true, EndOff: time.Hour, HasEnd: true, Enabled: 1},
 
 		// ── b. 时间窗（单侧 NULL = 该侧不限）──
 		{ID: 910010, Operator: name("solo-window"), Surrogate: name("agent"), ProcessName: Flow, StartOff: -10 * time.Hour, HasStart: true, EndOff: -9 * time.Hour, HasEnd: true, Enabled: 1},
@@ -111,12 +140,17 @@ func Rows(now time.Time) []Row {
 // Cases 期望表：判据名 + 期望 surrogate。
 func Cases(now time.Time) []Case {
 	return []Case{
-		// a：精确命中优先于全流程；两条精确命中取最大 ID
-		{Name: "a1 精确命中取最大ID", Operator: name("zs"), ProcessName: Flow, Want: name("exact-new")},
+		// a：精确命中优先于全流程；多条精确命中取最大 ID
+		// （夹具的 id 序已打乱：910002→910003→910001，故这里同时钉住"既不取遍历首条、
+		// 也不取插入末条"；SQL 侧的钉住点是 ORDER BY id DESC，见包注释）
+		{Name: "a1 多条精确命中取最大ID（非遍历首条/非插入末条）", Operator: name("zs"), ProcessName: Flow, Want: name("exact-max")},
 		{Name: "a2 未精确命中→全流程兜底", Operator: name("zs"), ProcessName: "unmatched116", Want: name("all-flow")},
 		{Name: "a3 查询传空流程名=只走兜底", Operator: name("zs"), ProcessName: "", Want: name("all-flow")},
 		{Name: "a4 非空 processName 的行不得充当兜底（它 ID 更大）", Operator: name("zs"), ProcessName: "unmatched116", Want: name("all-flow")},
 		{Name: "a5 NULL process_name 也属全流程兜底", Operator: name("solo-nullflow"), ProcessName: "any116", Want: name("agent")},
+		// 兜底分支自己也要按 id 取最大（精确分支答对不代表兜底分支答对——两分支在
+		// 两仓里都是各查一次的独立代码路径）
+		{Name: "a6 多条兜底命中同样取最大ID（含 NULL 行）", Operator: name("zs2"), ProcessName: Flow, Want: name("all2-max")},
 
 		// b：时间窗，单侧 NULL = 该侧不限
 		{Name: "b1 窗口已过期", Operator: name("solo-window"), ProcessName: Flow, Want: ""},
@@ -131,7 +165,7 @@ func Cases(now time.Time) []Case {
 		{Name: "d2 enabled=2 非 1 值不得当启用", Operator: name("solo-dirty"), ProcessName: Flow, Want: ""},
 		// 停用行与生效行同授权人：必须只取生效那条（zs 的 disabled 行 ID 更大，
 		// 若实现把"非 1"折叠成"启用"就会返回 disabled）
-		{Name: "d3 停用行不参与取最大", Operator: name("zs"), ProcessName: Flow, Want: name("exact-new")},
+		{Name: "d3 停用行不参与取最大", Operator: name("zs"), ProcessName: Flow, Want: name("exact-max")},
 
 		// c：自委托过滤
 		{Name: "c1 精确路径自委托不生效", Operator: name("solo-self-exact"), ProcessName: Flow, Want: ""},
@@ -170,6 +204,7 @@ func Run(t T, ext spi.ProcessExtRepository, seed func(Row) error, now time.Time)
 				r.ID, r.Operator, r.Surrogate)
 		}
 	}
+	passed := 0
 	for _, c := range Cases(now) {
 		hit, err := ext.GetSurrogate(ctx, c.Operator, c.ProcessName, now.Add(c.QueryOff))
 		if err != nil {
@@ -183,5 +218,79 @@ func Run(t T, ext spi.ProcessExtRepository, seed func(Row) error, now time.Time)
 			t.Fatalf("判据对拍 [%s] GetSurrogate(operator=%s, processName=%s, at=now%v) 命中=%q，期望=%q",
 				c.Name, c.Operator, c.ProcessName, c.QueryOff, got, c.Want)
 		}
+		passed++
+	}
+	t.Logf("判据对拍全绿：%d 条种子行、%d 条判据（内存仓与 SQL 仓跑的是同一份数据 + 同一份期望）",
+		len(rows), passed)
+}
+
+// ─── 夹具自证（不依赖任何仓储实现）─────────────────────────────────────────────
+
+// rowMatches 判据 5 的单行判定：授权人匹配 + enabled 只认 1 + 自委托过滤 + 时间窗，
+// 再叠加调用方给的"属于本次查询命中分支"的流程名条件。
+// 时间用相对偏移直接比：start<=at<=end ⇔ StartOff<=QueryOff<=EndOff（偏移都相对同一起点）。
+func rowMatches(r Row, c Case, at time.Duration, flowOK func(Row) bool) bool {
+	return r.Operator == c.Operator && r.Enabled == 1 && r.Surrogate != r.Operator &&
+		!(r.HasStart && r.StartOff > at) && !(r.HasEnd && r.EndOff < at) && flowOK(r)
+}
+
+// Verify 钉住**夹具自己**的判别力（条款 1.4）：每个期望命中的判据，按判据 a 的两段式
+// 解析出真正生效的候选集合后，
+//  1. 期望值必须就是集合里 id 最大那条（否则期望表和判据自相矛盾）；
+//  2. 候选 ≥2 条时，那条最大 id 记录的**插入位次既不能是首条也不能是末条**——
+//     否则"取遍历首条"或"边扫边覆盖取末条"的错误实现会跟着夹具一起绿，
+//     打乱 id 序这件事就等于没做。
+//
+// 两仓测试各调一次（数据同一份、性质同一份），夹具退化时立刻红，不用等实现出错。
+func Verify(t T, now time.Time) {
+	t.Helper()
+	rows := Rows(now)
+	multi := 0
+	for _, c := range Cases(now) {
+		if c.Want == "" {
+			continue
+		}
+		at := c.QueryOff
+		pool := []Row{}
+		for _, r := range rows {
+			if c.ProcessName != "" && rowMatches(r, c, at, func(r Row) bool { return r.ProcessName == c.ProcessName }) {
+				pool = append(pool, r)
+			}
+		}
+		if len(pool) == 0 { // 精确分支空 → 走全流程兜底分支
+			for _, r := range rows {
+				if rowMatches(r, c, at, func(r Row) bool { return r.ProcessName == "" }) {
+					pool = append(pool, r)
+				}
+			}
+		}
+		if len(pool) == 0 {
+			t.Fatalf("夹具自证：判据 [%s] 期望命中 %q，但数据集里没有任何生效候选行——期望表与数据不自洽",
+				c.Name, c.Want)
+		}
+		maxIdx, maxID := 0, pool[0].ID
+		for i, r := range pool {
+			if r.ID > maxID {
+				maxID, maxIdx = r.ID, i
+			}
+		}
+		if pool[maxIdx].Surrogate != c.Want {
+			t.Fatalf("夹具自证：判据 [%s] 按「取 id 最大」应命中 %q(id=%d)，期望表却写了 %q——期望与数据不自洽",
+				c.Name, pool[maxIdx].Surrogate, maxID, c.Want)
+		}
+		if len(pool) < 2 {
+			continue
+		}
+		multi++
+		if maxIdx == 0 || maxIdx == len(pool)-1 {
+			t.Fatalf("夹具失去判别力：判据 [%s] 有 %d 条同时命中，期望那条(id=%d)却落在插入序第 %d 位"+
+				"（首位/末位）——「取遍历首条」「取插入末条」的错误实现会跟着这份夹具一起绿。"+
+				"须把 id 序打乱到期望行既非首条也非末条",
+				c.Name, len(pool), maxID, maxIdx+1)
+		}
+	}
+	if multi == 0 {
+		t.Fatalf("夹具自证：没有任何一个判据存在 ≥2 条同时命中的记录——条款 1.4「多条命中取 id 最大」" +
+			"根本没被对拍到")
 	}
 }

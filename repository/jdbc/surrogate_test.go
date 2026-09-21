@@ -44,6 +44,10 @@ func TestSurrogateQueryParityJdbc(t *testing.T) {
 
 	ext := jdbc.NewExt(db)
 	now := time.Now().Truncate(time.Millisecond)
+	// 同一份夹具自证（与 memory/ext_parity_test.go 同一函数同一份数据），再对拍 SQL 仓。
+	// ⚠️ 条款 1.4 在 SQL 侧的钉住点是 ext.go 的 `ORDER BY id DESC`：H2/InnoDB 按主键序回行，
+	// 夹具里打乱的插入序在 SQL 侧不改变答案，两侧仍必须对同一期望负责（见 surrparity 包注释）。
+	surrparity.Verify(t, now)
 	surrparity.Run(t, ext, func(r surrparity.Row) error {
 		var processName interface{} = r.ProcessName
 		if r.NullProcessName {
