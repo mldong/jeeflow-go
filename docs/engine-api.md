@@ -72,7 +72,7 @@ inst, err := eng.ExecuteAndJumpTask(taskID, "张三", nil, "task1")
 | `u_deptName` | 部门名称 |
 | `u_postId` | 岗位 ID |
 | `u_postName` | 岗位名称 |
-| `submitType` | 0=发起 1=同意 2=拒绝 3=退回上一步 4=跳转 5=重新提交 6=退回发起人 7=转办 20=会签拒绝 |
+| `submitType` | 0=发起 1=同意 2=拒绝 3=退回上一步（血缘版，见规范 04）4=跳转 5=重新提交 6=退回发起人（首任务节点，与 3 不同实现） 7=转办 20=会签拒绝 |
 | `BUSINESS_NO` | 业务流水号 |
 
 ## 状态码
