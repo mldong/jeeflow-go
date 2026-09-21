@@ -191,3 +191,41 @@ deploy 自动版本管理，execute 按 submitType 全分发，操作人由 `arg
 
 > 分页说明（v1.1.0）：核心表分页 SPI（pageDefines/pageTodoTasks 等）目前 Java 提供，
 > 本语言对应分页 action 返回明确错误，计划 1.2.0 补齐；设计/委托分页全支持。
+
+## 委托代理自动生效（引擎内置、默认开启）
+
+`processSurrogate/*` 五个 action 只是台账 CRUD。真正的能力在引擎侧：
+**任务参与者落库前**，引擎对每个参与者查一次生效委托（`GetSurrogate`），
+命中的被委托人**并入该任务的参与者集合**后随任务一起落 `wf_process_task_actor`
+——授权人保留，任一可办（委托不是转办，不摘原人）。
+
+装配（三条路，任选其一）：
+
+```go
+// ① 构造期 Option
+eng := engine.New(repo, userProv, idGen, exprEval,
+    engine.WithSurrogateRepository(ext))            // ext: spi.ProcessExtRepository
+
+// ② 门面装配路：facade.New 传了 ext 就自动接到引擎（集成方零额外配置）
+f := facade.New(eng, repo, ext)
+
+// ③ 链式 setter（对齐 SetRegistry / SetExtensions 风格）
+eng.SetSurrogateRepository(ext)
+```
+
+显式关闭（回退"仅台账"）：
+
+```go
+engine.New(repo, userProv, idGen, exprEval,
+    engine.WithSurrogateRepository(ext), engine.WithSurrogateAutoApply(false))
+eng.SetSurrogateAutoApply(false) // 运行期也可关/再开
+```
+
+- **未配置扩展仓储（不注入 / 注入 nil）＝ 静默跳过**，不报错、不打断建单；
+  委托查询本身报错时也只记日志跳过该参与者。
+- 查询判据（内存仓与 JDBC 仓逐条等价）：空 `processName` 全流程兜底（先精确再兜底）、
+  时间窗 `start<=now<=end`（任一侧 NULL＝该侧不限）、`surrogate <> operator` 自委托过滤、
+  `enabled` 只认 1；多行命中取 ID 最大者。对拍用例见 `internal/surrparity`
+  （`memory/ext_parity_test.go` 与 `repository/jdbc/surrogate_test.go` 跑同一份数据期望）。
+- 只对"解析出的那批参与者"各查一次，被委托人不再级联委托（A→B、B→C 只并入 B）。
+- 委托在待办列表的合并展示属集成层视图职责，引擎不改 todoList。

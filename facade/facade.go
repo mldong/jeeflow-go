@@ -67,8 +67,15 @@ func (f *Facade) SetOrgUserProvider(orgProv spi.OrgUserProvider) *Facade {
 	return f
 }
 
-// New 构造门面
+// New 构造门面。
+//
+// issues/116：ext 非空时一并注入引擎，使「委托代理自动生效」默认可用
+// （引擎内置、默认开启；集成方关闭走 engine.WithSurrogateAutoApply(false) /
+// eng.SetSurrogateAutoApply(false)，或传 nil 让引擎静默跳过）。
 func New(e *engine.EngineImpl, repo spi.ProcessRepository, ext spi.ProcessExtRepository) *Facade {
+	if e != nil && ext != nil && e.SurrogateRepository() == nil {
+		e.SetSurrogateRepository(ext)
+	}
 	return &Facade{engine: e, repo: repo, extRepo: ext}
 }
 
@@ -934,8 +941,34 @@ func applySurrogateFields(s *model.ProcessSurrogate, args map[string]interface{}
 	s.Surrogate = toStr(args["surrogate"], "")
 	s.StartTime = parseSurrogateTime(args["startTime"])
 	s.EndTime = parseSurrogateTime(args["endTime"])
-	s.Enabled = toIntDef(args["enabled"], 1)
+	s.Enabled = parseSurrogateEnabled(args["enabled"])
 	s.UpdateUser = operator
+}
+
+// parseSurrogateEnabled 委托启用位解析（issues/116 判据 d："enabled 只有 1 生效，
+// 脏值不得默认当启用"）：
+//   - 未传（nil）→ 1，契约默认启用（processSurrogate/save 的 enabled 可省）；
+//   - bool → true=1 / false=0（前端开关组件偶发传布尔，不落入脏值分支）；
+//   - 传了但不可解析为整数（"abc"、{}…）→ **0 停用**。
+//
+// 此前走 toIntDef(args["enabled"], 1)，脏值回落 1＝"垃圾值当启用"，与 C# 的
+// ToInt(default=1) 同侧、与 PHP (int)'abc'→0 反侧（issues/116 §5）；本轮按契约
+// canonical 统一到"脏值停用"。
+func parseSurrogateEnabled(v interface{}) int {
+	if v == nil {
+		return 1
+	}
+	if b, ok := v.(bool); ok {
+		if b {
+			return 1
+		}
+		return 0
+	}
+	n, err := toInt(v)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // parseSurrogateTime 解析委托时间入参：兼容 yyyy-MM-dd HH:mm:ss（前端 RangePicker/SPEC 契约）

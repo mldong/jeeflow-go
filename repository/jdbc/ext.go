@@ -193,8 +193,8 @@ func (r *ExtRepository) SaveSurrogate(ctx context.Context, s *model.ProcessSurro
 	if s.UpdateTime.IsZero() {
 		s.UpdateTime = now
 	}
-	// 不在仓储层把 enabled=0 改回 1：显式停用是合法值，缺省由门面 toIntDef 兜底
-	// （对齐 Java 可空 Integer 的 null 判断，issues/82-7）
+	// 不在仓储层把 enabled=0 改回 1：显式停用是合法值，缺省由门面 parseSurrogateEnabled
+	// 兜底（对齐 Java 可空 Integer 的 null 判断，issues/82-7；脏值→0 停用，issues/116 判据 d）
 	_, err := r.conn(ctx).ExecContext(ctx,
 		"INSERT INTO wf_process_surrogate (id, process_name, operator, surrogate, start_time, end_time, enabled, create_time, create_user, update_time, update_user) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
 		s.ID, s.ProcessName, s.Operator, s.Surrogate, s.StartTime, s.EndTime, s.Enabled,

@@ -19,10 +19,21 @@ type EngineImpl struct {
 	ext              *Extensions
 	registry         *HandlerRegistry
 	interceptorCache map[int64][]FlowInterceptor
+	// 委托代理自动生效（issues/116）：surrogateRepo 未注入＝静默跳过；
+	// surrogateOff 为"关闭位"（零值＝开启，见 SurrogateAutoApply 注释）
+	surrogateRepo   spi.ProcessExtRepository
+	surrogateOff    bool
+	defineNameCache map[int64]string
 }
 
-func New(repo spi.ProcessRepository, userProv spi.UserProvider, idGen spi.IDGenerator, exprEval spi.ExpressionEvaluator) *EngineImpl {
-	return &EngineImpl{repo: repo, userProv: userProv, idGen: idGen, exprEval: exprEval}
+func New(repo spi.ProcessRepository, userProv spi.UserProvider, idGen spi.IDGenerator, exprEval spi.ExpressionEvaluator, opts ...Option) *EngineImpl {
+	e := &EngineImpl{repo: repo, userProv: userProv, idGen: idGen, exprEval: exprEval}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(e)
+		}
+	}
+	return e
 }
 
 // UserProvider 用户提供者访问（issue 41 补强：nodeProgress 姓名解析用）
@@ -81,41 +92,42 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 		return nil, err
 	}
 
-		curNode := findNode(flow, task.TaskName)
-		if curNode != nil {
-			// 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
-			// createTask 触发的同节点 PostHandle 幂等一致（同一节点同一次执行仅更新一次）
-			// issues/60：声明未解析 → 显式报错（不静默跳过）
-			if err := e.firePostInterceptors(curNode, inst); err != nil {
-				return nil, err
-			}
-			now := time.Now()
-			ct, _ := stringFromProps(curNode.Properties, "countersignType")
-			csCond, _ := stringFromProps(curNode.Properties, "countersignCompletionCondition")
-			// issues/91：会签一票否决仅当节点配置 ONE_VOTE_VETO（忽略大小写）时生效，
-			// submitType=20 才跳过会签"未完成即停留"门控提前流转；否则为软拒绝——
-			// 否决者任务正常完成、countersignDisagreeFlag=1 已记录为变量（供下游参考），
-			// 流程不阻断（对齐 mldong 内置引擎 / Java CountersignHandler）
-			csVeto := ct != "" &&
-				toIntOf(vars[KeySubmitType]) == int(model.SubmitTypeCountersignDisagree) &&
-				strings.EqualFold(strings.TrimSpace(csCond), "ONE_VOTE_VETO")
-			if ct == "SEQUENTIAL" && !csVeto {
-				doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
-				if len(doing) == 0 {
-					actors, lc := getCsState(vars, curNode.ID)
-					if actors != nil && lc+1 < len(actors) {
-						// 聚合根：创建串行会签下一步任务
-						nt := inst.CreateTask(e.nextID(), curNode.ID, curNode.Text.Value, actors[lc+1], operator, formKeyOf(curNode), now, 1)
-						nt.Variables = map[string]interface{}{
-							prefixKey("nrOfInstances", curNode.ID): len(actors),
-							prefixKey("loopCounter", curNode.ID):   lc + 1,
-							prefixKey("operatorList", curNode.ID):  actors,
-						}
-						e.repo.SaveTask(ctx, nt)
-						// TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
-						e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: curNode.ID, Operator: operator})
-						inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
-						return inst, nil
+	curNode := findNode(flow, task.TaskName)
+	if curNode != nil {
+		// 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
+		// createTask 触发的同节点 PostHandle 幂等一致（同一节点同一次执行仅更新一次）
+		// issues/60：声明未解析 → 显式报错（不静默跳过）
+		if err := e.firePostInterceptors(curNode, inst); err != nil {
+			return nil, err
+		}
+		now := time.Now()
+		ct, _ := stringFromProps(curNode.Properties, "countersignType")
+		csCond, _ := stringFromProps(curNode.Properties, "countersignCompletionCondition")
+		// issues/91：会签一票否决仅当节点配置 ONE_VOTE_VETO（忽略大小写）时生效，
+		// submitType=20 才跳过会签"未完成即停留"门控提前流转；否则为软拒绝——
+		// 否决者任务正常完成、countersignDisagreeFlag=1 已记录为变量（供下游参考），
+		// 流程不阻断（对齐 mldong 内置引擎 / Java CountersignHandler）
+		csVeto := ct != "" &&
+			toIntOf(vars[KeySubmitType]) == int(model.SubmitTypeCountersignDisagree) &&
+			strings.EqualFold(strings.TrimSpace(csCond), "ONE_VOTE_VETO")
+		if ct == "SEQUENTIAL" && !csVeto {
+			doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
+			if len(doing) == 0 {
+				actors, lc := getCsState(vars, curNode.ID)
+				if actors != nil && lc+1 < len(actors) {
+					// 聚合根：创建串行会签下一步任务
+					nt := inst.CreateTask(e.nextID(), curNode.ID, curNode.Text.Value, actors[lc+1], operator, formKeyOf(curNode), now, 1)
+					nt.Variables = map[string]interface{}{
+						prefixKey("nrOfInstances", curNode.ID): len(actors),
+						prefixKey("loopCounter", curNode.ID):   lc + 1,
+						prefixKey("operatorList", curNode.ID):  actors,
+					}
+					// issues/116：顺序会签推进的新任务同样在建单期并入生效委托代理人
+					e.saveNewTask(ctx, nt, e.surrogateProcessName(flow, inst))
+					// TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
+					e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: curNode.ID, Operator: operator})
+					inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
+					return inst, nil
 				}
 			} else {
 				inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
@@ -191,7 +203,7 @@ func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, opera
 		if prevName != "" {
 			if prev := findNode(flow, prevName); prev != nil {
 				actors := e.resolveActorsForRollback(prev, inst, operator, task)
-				e.createTaskWithActors(ctx, prev, inst, operator, vars, actors)
+				e.createTaskWithActors(ctx, flow, prev, inst, operator, vars, actors)
 			}
 		}
 	} else {
@@ -331,19 +343,20 @@ func (e *EngineImpl) resolveActorsForRollback(node *model.FlowNode, inst *model.
 }
 
 // createTaskWithActors 以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）
-func (e *EngineImpl) createTaskWithActors(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}, actors []string) error {
+func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowModel, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}, actors []string) error {
 	if len(actors) == 0 {
 		return nil
 	}
 	ct, _ := stringFromProps(node.Properties, "countersignType")
 	now := time.Now()
 	form := formKeyOf(node)
+	pn := e.surrogateProcessName(flow, inst)
 	if IsCountersign(node.Properties["performType"]) && ct != "" {
 		switch ct {
 		case "PARALLEL", "":
 			for _, actor := range actors {
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1)
-				e.repo.SaveTask(ctx, nt)
+				e.saveNewTask(ctx, nt, pn)
 				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
 		case "SEQUENTIAL":
@@ -353,12 +366,12 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, node *model.FlowN
 				prefixKey("loopCounter", node.ID):   0,
 				prefixKey("operatorList", node.ID):  actors,
 			}
-			e.repo.SaveTask(ctx, nt)
+			e.saveNewTask(ctx, nt, pn)
 			e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 		default:
 			for _, actor := range actors {
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1)
-				e.repo.SaveTask(ctx, nt)
+				e.saveNewTask(ctx, nt, pn)
 				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
 		}
@@ -368,7 +381,7 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, node *model.FlowN
 	if len(actors) > 1 {
 		nt.ActorIDs = actors
 	}
-	e.repo.SaveTask(ctx, nt)
+	e.saveNewTask(ctx, nt, pn)
 	e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 	return nil
 }
@@ -397,7 +410,7 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 	// 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
 	// 任务完成的拦截器由 ExecuteProcessTask 显式触发，1.8.0 SYNC 同步演进）
 	if node.Type == model.TypeTask || node.Type == model.TypeCustom {
-		return e.createTask(ctx, node, inst, operator, vars)
+		return e.createTask(ctx, flow, node, inst, operator, vars)
 	}
 	// issues/60：声明未解析 → 显式报错（不静默跳过）
 	proceed, err := e.firePreInterceptors(node, inst)
@@ -515,7 +528,7 @@ func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel
 	return nil
 }
 
-func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}) error {
+func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}) error {
 	actors := e.resolveActors(node, inst, operator, vars)
 	if len(actors) == 0 {
 		return nil
@@ -523,6 +536,7 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 	ct, _ := stringFromProps(node.Properties, "countersignType")
 	now := time.Now()
 	form := formKeyOf(node)
+	pn := e.surrogateProcessName(flow, inst)
 
 	// issue 42：performType 字符串兼容（'1'/'ALL'/'COUNTERSIGN' → 会签，对齐 Java codeOf）
 	if IsCountersign(node.Properties["performType"]) && ct != "" {
@@ -530,7 +544,7 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 		case "PARALLEL":
 			for _, actor := range actors {
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1)
-				e.repo.SaveTask(ctx, nt)
+				e.saveNewTask(ctx, nt, pn)
 				// TASK_CREATE：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
 				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
@@ -542,12 +556,12 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 				prefixKey("loopCounter", node.ID):   0,
 				prefixKey("operatorList", node.ID):  actors,
 			}
-			e.repo.SaveTask(ctx, nt)
+			e.saveNewTask(ctx, nt, pn)
 			e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 		default:
 			for _, actor := range actors {
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, 1)
-				e.repo.SaveTask(ctx, nt)
+				e.saveNewTask(ctx, nt, pn)
 				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
 		}
@@ -558,7 +572,8 @@ func (e *EngineImpl) createTask(ctx context.Context, node *model.FlowNode, inst 
 	if len(actors) > 1 {
 		nt.ActorIDs = actors
 	}
-	e.repo.SaveTask(ctx, nt)
+	// issues/116：委托代理在**参与者落库前**并入（见 engine/surrogate.go），随任务一起落库
+	e.saveNewTask(ctx, nt, pn)
 	e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 	return nil
 }

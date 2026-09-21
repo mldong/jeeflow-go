@@ -79,6 +79,7 @@ type Extensions struct {
 func (e *EngineImpl) SetExtensions(ext *Extensions) {
 	e.ext = ext
 	e.interceptorCache = map[int64][]FlowInterceptor{}
+	e.defineNameCache = map[int64]string{}
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
