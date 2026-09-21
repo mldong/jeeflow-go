@@ -203,17 +203,11 @@ func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, opera
 		return nil, err
 	}
 	if targetTaskName == "" {
-		// issues/79：ROLLBACK 对齐 Java rejectTask——退回上一任务节点（首条输入边 source），
-		// 新任务 actor=当前任务完成人（退回操作人）；无上一任务节点则不产生新待办
-		prevName := e.previousTaskName(flow, task.TaskName)
-		if prevName != "" {
-			if prev := findNode(flow, prevName); prev != nil {
-				actors := e.resolveActorsForRollback(prev, inst, operator, task)
-				// 建单不变量（issues/121 P1）：回退新建的任务同样必写 parent。
-				// 本路径**仍是拓扑版落点**（P2 才换血缘版）：parent 先记"谁造了它"＝被回退的当前任务；
-				// 届时按契约第 8 条改为随复活行拷贝（＝上一步的上一步）。
-				e.createTaskWithActors(ctx, flow, prev, inst, operator, vars, actors, task.ID)
-			}
+		// issues/121 P2：ROLLBACK 走血缘版——复活血缘前驱（task_parent_id）那条历史行，
+		// 参与者＝该行办结人（首任务节点行则取该行 u_userId）。无血缘/守卫不过显式报错，
+		// 不再像拓扑版那样"什么都不做、实例保持 DOING 却零待办"。
+		if err := e.rollbackToParent(ctx, flow, inst, task, operator); err != nil {
+			return nil, err
 		}
 	} else {
 		// issues/79：对齐 Java——目标节点不存在显式报错（前端 JUMP 无效 taskName 不再静默空操作）
@@ -308,21 +302,101 @@ func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, opera
 	return task, inst, &flow, vars, nil
 }
 
-// previousTaskName 当前任务节点的首条输入边 source（issues/79 对齐 Java getPreviousTaskName）
-func (e *EngineImpl) previousTaskName(flow *model.FlowModel, taskName string) string {
-	node := findNode(flow, taskName)
-	if node == nil {
-		return ""
+// rollbackToParent 退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的
+// TaskParentID，复活那条历史行；不按模型入边拓扑推（拓扑版在分支/回环流会回到本实例
+// 没走过的节点）。错码走 msg 前缀（本栈 error 无码位，出口统一 99999999）。
+func (e *EngineImpl) rollbackToParent(ctx context.Context, flow *model.FlowModel,
+	inst *model.ProcessInstance, task *model.ProcessTask, operator string) error {
+	const noLineage = "20010007: 上一步任务ID为空，无法驳回至上一步处理"
+	const guardFail = "20010008: 无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务"
+
+	var parentID int64
+	if task.ParentTaskID != nil {
+		parentID = *task.ParentTaskID
 	}
-	for _, edge := range flow.Edges {
-		if edge.TargetNodeID == node.ID {
-			if src := findNode(flow, edge.SourceNodeID); src != nil &&
-				(src.Type == model.TypeTask || src.Type == model.TypeCustom) {
-				return src.ID
-			}
+	if parentID == 0 {
+		return fmt.Errorf(noLineage)
+	}
+	his, err := e.repo.FindTaskByID(ctx, parentID)
+	if err != nil {
+		return err
+	}
+	if his == nil {
+		return fmt.Errorf(noLineage)
+	}
+	prev := findNode(flow, his.TaskName)
+	if prev == nil || !canRejected(flow, task.TaskName, prev.ID) {
+		return fmt.Errorf(guardFail)
+	}
+	// 首任务节点那条由发起人提交 ⇒ 参与者取该行 u_userId；其余取该行办结人。
+	// 老行没这个键 ⇒ 按 false 处理（宁可派给该行 ActorID，也不用带"仅进行中"判定的现算值）。
+	isFirst := his.Variables[model.IsFirstTaskNodeKey] == true
+	actor := his.ActorID
+	if isFirst {
+		if uid, ok := his.Variables["u_userId"].(string); ok && uid != "" {
+			actor = uid
+		} else {
+			actor = inst.Operator
 		}
 	}
-	return ""
+	if actor == "" {
+		return fmt.Errorf(noLineage)
+	}
+	var carry int64
+	if his.ParentTaskID != nil {
+		carry = *his.ParentTaskID // parent 随行拷贝＝"上一步的上一步"，与 mldong-boot2 一致
+	}
+	now := time.Now()
+	nt := inst.CreateTask(e.nextID(), prev.ID, prev.Text.Value, actor, his.CreateUser,
+		formKeyOf(prev), now, carry, isFirst)
+	// 复活行只带数据类键：tf_*/csv_*/submitType/taskName/会签簿记都是"上次提交"的残留
+	nt.Variables = lineageVars(his.Variables)
+	putTaskVars(nt, map[string]interface{}{model.IsFirstTaskNodeKey: isFirst})
+	pn := e.surrogateProcessName(flow, inst)
+	e.saveNewTask(ctx, nt, pn)
+	e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID,
+		NodeID: prev.ID, Operator: operator})
+	return nil
+}
+
+// canRejected 照 mldong-boot2 NodeModel.canRejected：自 current 的入边回溯，命中 parent 放行；
+// 来源是 fork/join/start 时**跳过该条入边、不再深入**（boot2 是 continue，不是穿透），
+// 其余来源节点递归下去。subprocess 在 boot2 里被注释掉，等同普通节点。
+func canRejected(flow *model.FlowModel, currentID, parentID string) bool {
+	for _, edge := range flow.Edges {
+		if edge.TargetNodeID != currentID {
+			continue
+		}
+		if edge.SourceNodeID == parentID {
+			return true
+		}
+		src := findNode(flow, edge.SourceNodeID)
+		if src == nil {
+			continue
+		}
+		if src.Type == model.TypeFork || src.Type == model.TypeJoin || src.Type == model.TypeStart {
+			continue
+		}
+		if canRejected(flow, src.ID, parentID) {
+			return true
+		}
+	}
+	return false
+}
+
+// lineageVars 复活行的变量净化：剔控制类残留，保留 f_*/u_*/autoGenTitle/isFirstTaskNode。
+func lineageVars(src map[string]interface{}) map[string]interface{} {
+	out := map[string]interface{}{}
+	for k, v := range src {
+		if k == "submitType" || k == "taskName" ||
+			strings.HasPrefix(k, "tf_") || strings.HasPrefix(k, "csv_") ||
+			strings.HasPrefix(k, "loopCounter") || strings.HasPrefix(k, "nrOfInstances") ||
+			strings.HasPrefix(k, "operatorList") {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // isFirstTaskNode 是否 start 直接后继任务节点（issues/79 对齐 Java FlowUtil.isFirstTaskName）
@@ -337,20 +411,6 @@ func (e *EngineImpl) isFirstTaskNode(flow *model.FlowModel, node *model.FlowNode
 		}
 	}
 	return false
-}
-
-// resolveActorsForRollback ROLLBACK 新任务参与者：优先当前任务完成人（退回操作人，
-// 对齐 Java rejectTask Collections.singletonList(currentTask.getActorId())），
-// 其次按目标节点 assignee 解析
-func (e *EngineImpl) resolveActorsForRollback(node *model.FlowNode, inst *model.ProcessInstance, operator string, task *model.ProcessTask) []string {
-	if task.ActorID != "" {
-		return []string{task.ActorID}
-	}
-	actors := e.resolveActors(node, inst, operator, inst.Variables)
-	if len(actors) == 0 {
-		actors = []string{operator}
-	}
-	return actors
 }
 
 // createTaskWithActors 以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）

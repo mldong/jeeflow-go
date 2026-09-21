@@ -885,7 +885,7 @@ func Test153CreateWritesLineageOnRollback(t *testing.T) {
 	wantParent(t, task1, apply.ID)
 	wantFirstFlag(t, task1, false)
 
-	// 在 task1 上办"退回上一步"⇒ 在 apply 节点新建一行
+	// 在 task1 上办"退回上一步"⇒ 复活 apply 那条历史行（血缘版，issues/121 P2）
 	if _, err := eng.ExecuteAndJumpTask(context.Background(), task1.ID, "leader",
 		map[string]interface{}{"submitType": int(model.SubmitTypeRollback)}, ""); err != nil {
 		t.Fatalf("rollback: %v", err)
@@ -894,8 +894,13 @@ func Test153CreateWritesLineageOnRollback(t *testing.T) {
 	if back.ID == apply.ID {
 		t.Fatalf("回退应新建行，不应复活原 apply 行")
 	}
-	wantParent(t, back, task1.ID) // 拓扑版：parent＝被回退的那条（P2 换血缘版再随复活行拷贝）
-	wantFirstFlag(t, back, true)  // apply 是 start 直接后继
+	// 随行拷贝：复活行的 parent＝apply 原行的 parent（发起 execution 无当前任务 ⇒ 0）
+	wantParent(t, back, 0)
+	wantFirstFlag(t, back, true) // apply 是 start 直接后继
+	// 首任务节点行 ⇒ 参与者取该行 u_userId（发起人），不是执行回退的 leader
+	if actors, _ := repo.FindTaskActors(context.Background(), back.ID); len(actors) == 0 || actors[0] != "applicant" {
+		t.Fatalf("血缘版回退到首节点，参与者应为发起人 applicant，实得 %v", actors)
+	}
 }
 
 // customFirstFlow 自定义节点作为 start 直接后继的流（Go 的 TypeCustom 建单复用 createTask，
@@ -936,4 +941,82 @@ func Test154CreateWritesLineageCustomNode(t *testing.T) {
 	task1 := doingByName(t, repo, inst.ID, "task1")
 	wantParent(t, task1, cust.ID)
 	wantFirstFlag(t, task1, false)
+}
+
+// Test154RollbackLineageNegatives issues/121 P2 两格负向：
+// ① 无血缘（parent 为 0，以及 P1 之前老行的 NULL 形状）⇒ 20010007，不得静默不建单；
+// ② 血缘前驱跨不过 fork（boot2 canRejected 遇 fork/join/start 是跳过该入边、不再深入）
+//
+//	⇒ 20010008。夹具 04-fork-join：分支行的 parent 是 fork 之前的 apply。
+func Test154RollbackLineageNegatives(t *testing.T) {
+	ctx := context.Background()
+
+	// ① 无血缘
+	eng, repo := setup()
+	def := registerFlow(repo, "02-multi-task.json")
+	inst, err := eng.StartProcessInstanceByID(ctx, def.ID, "applicant", nil)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	apply := firstDoing(t, repo, ctx, inst.ID, "apply")
+	if apply.ParentTaskID == nil || *apply.ParentTaskID != 0 {
+		t.Fatalf("前置条件：发起那条 parent 应为 0，实得 %v", apply.ParentTaskID)
+	}
+	errRollback(ctx, t, eng, apply.ID, "applicant", "20010007")
+
+	// 老行形状：parent 为 NULL
+	nullParent := apply
+	nullParent.ParentTaskID = nil
+	if err := repo.UpdateTask(ctx, &nullParent); err != nil {
+		t.Fatalf("置 NULL 被打断: %v", err)
+	}
+	errRollback(ctx, t, eng, apply.ID, "applicant", "20010007")
+
+	// ② 守卫：fork 分支行退到 fork 之前的节点
+	eng2, repo2 := setup()
+	def2 := registerFlow(repo2, "04-fork-join.json")
+	inst2, err := eng2.StartProcessInstanceByID(ctx, def2.ID, "applicant", nil)
+	if err != nil {
+		t.Fatalf("start fork: %v", err)
+	}
+	// 推进到 fork 之后（apply 办结 → 两条并行 DOING）
+	apply2 := firstDoing(t, repo2, ctx, inst2.ID, "apply")
+	if err := repo2.AddTaskActor(ctx, apply2.ID, []string{"applicant"}); err != nil {
+		t.Fatalf("加参与者: %v", err)
+	}
+	apply2.ActorIDs = append(apply2.ActorIDs, "applicant")
+	if _, err := eng2.ExecuteProcessTask(ctx, apply2.ID, "applicant", nil); err != nil {
+		t.Fatalf("推进过 fork 被打断: %v", err)
+	}
+	branch := firstDoing(t, repo2, ctx, inst2.ID, "taskA")
+	if branch.ParentTaskID == nil || *branch.ParentTaskID == 0 {
+		t.Fatalf("前置条件：分支行的 parent 应已由 P1 写入，实得 %v", branch.ParentTaskID)
+	}
+	if len(branch.ActorIDs) == 0 {
+		t.Fatalf("前置条件：分支行应有参与者，否则测不到守卫（会被权限校验先挡下）")
+	}
+	errRollback(ctx, t, eng2, branch.ID, branch.ActorIDs[0], "20010008")
+}
+
+// firstDoing 取该实例某节点的进行中任务（不存在即 fail，避免"节点名写错→空集合→假绿"）
+func firstDoing(t *testing.T, repo *memory.Repository, ctx context.Context, instID int64, node string) model.ProcessTask {
+	t.Helper()
+	tasks, err := repo.FindDoingTasks(ctx, instID, []string{node})
+	if err != nil || len(tasks) == 0 {
+		t.Fatalf("节点 %s 应有进行中任务（len=%d err=%v）", node, len(tasks), err)
+	}
+	return *tasks[0]
+}
+
+// errRollback 在 taskID 上办"退回上一步"（targetTaskName 传空），断言报错且 msg 含指定期望码
+func errRollback(ctx context.Context, t *testing.T, eng *engine.EngineImpl, taskID int64, operator, wantCode string) {
+	t.Helper()
+	_, err := eng.ExecuteAndJumpTask(ctx, taskID, operator,
+		map[string]interface{}{"submitType": int(model.SubmitTypeRollback)}, "")
+	if err == nil {
+		t.Fatalf("退回上一步在 %s 上必须报错（期望码 %s），不得静默不建单", wantCode, wantCode)
+	}
+	if !strings.Contains(err.Error(), wantCode) {
+		t.Fatalf("错码应体现在 msg（期望 %s），实得 %v", wantCode, err)
+	}
 }

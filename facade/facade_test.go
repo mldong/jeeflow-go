@@ -1782,7 +1782,8 @@ func TestExecuteSubmitTypeBehavior(t *testing.T) {
 	f, repo, _ := setupFacade()
 	ctx := context.Background()
 
-	// ── submitType=3 ROLLBACK：task2 退回上一步 → task1 新待办（actor=退回操作人），实例保持 DOING(10)
+	// ── submitType=3 ROLLBACK（血缘版 issues/121 P2）：task2 退回 → 复活 task1 那条历史行，
+	//    参与者＝task1 的原办结人 leader（不是执行回退的 manager），实例保持 DOING(10)
 	rb := startMultiTaskAt(t, f, repo, "task2")
 	t2 := doingTaskID(t, repo, rb, "task2")
 	repo.AddTaskActor(ctx, t2, []string{"manager"})
@@ -1791,8 +1792,8 @@ func TestExecuteSubmitTypeBehavior(t *testing.T) {
 	if rbTask1 == 0 {
 		t.Fatalf("ROLLBACK 应在 task1 产生新待办")
 	}
-	if actors, _ := repo.FindTaskActors(ctx, rbTask1); !containsStr2(actors, "manager") {
-		t.Fatalf("退回任务 actor 应为退回操作人 manager: %v", actors)
+	if actors, _ := repo.FindTaskActors(ctx, rbTask1); !containsStr2(actors, "leader") || containsStr2(actors, "manager") {
+		t.Fatalf("血缘版：复活行 actor 应为 task1 原办结人 leader、不该是执行回退的 manager: %v", actors)
 	}
 	if inst, _ := repo.FindInstanceByID(ctx, rb); inst.State != model.InstanceStateDoing {
 		t.Fatalf("ROLLBACK 后实例应保持 DOING(10): %d", inst.State)

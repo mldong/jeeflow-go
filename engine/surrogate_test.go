@@ -624,9 +624,9 @@ func TestSurrogateAppliesOnRollbackPath(t *testing.T) {
 			taskSpec{id: "b1", assignee: "rbk-zhang"},
 			taskSpec{id: "b2", assignee: "rbk-wang"}), ext)
 	now := time.Now()
-	// 回退新建的 b1 任务参与者 = b2 的完成人 rbk-wang（不是 b1 的原参与者 rbk-zhang），
-	// 而委托只配在 rbk-wang 身上 ⇒ 新 b1 任务里的代理人只能由回退路径写入
-	putSurr(t, ext, "rbk-wang", "rbk-agent", "surrback116", ptrOf(now.Add(-time.Hour)), ptrOf(now.Add(time.Hour)), 1)
+	// issues/121 P2 血缘版：回退复活的是 b1 那条历史行；b1 是 start 直接后继 ⇒ 契约规定参与者
+	// 取该行 variable.u_userId（发起人快照），不是执行回退的 rbk-wang。本 harness 的 UserProvider
+	// 桩把 u_userId 写成 "u"，故委托配在 "u" 身上。台账延后到 b1 建单之后再配，否则起点自证不成立。
 
 	inst, err := eng.StartProcessInstanceByID(ctx, defID, "boss1", nil)
 	if err != nil {
@@ -642,6 +642,7 @@ func TestSurrogateAppliesOnRollbackPath(t *testing.T) {
 	if _, err := eng.ExecuteProcessTask(ctx, b1[0].ID, "rbk-zhang", nil); err != nil {
 		t.Fatalf("推进到 b2 被打断: %v", err)
 	}
+	putSurr(t, ext, "u", "rbk-agent", "surrback116", ptrOf(now.Add(-time.Hour)), ptrOf(now.Add(time.Hour)), 1)
 	b2, err := repo.FindDoingTasks(ctx, inst.ID, []string{"b2"})
 	if err != nil || len(b2) != 1 {
 		t.Fatalf("取 b2 任务: len=%d err=%v", len(b2), err)
@@ -650,8 +651,8 @@ func TestSurrogateAppliesOnRollbackPath(t *testing.T) {
 		t.Fatalf("回退(ROLLBACK)被打断: %v", err)
 	}
 	// 原 b1 任务已 DONE，b1 上唯一的进行中任务就是回退新建的那一条
-	if a := doingActors(t, repo, inst.ID, "b1", 1); len(a) != 2 || a[0] != "rbk-wang" || a[1] != "rbk-agent" {
-		t.Fatalf("条款 1「回退(ROLLBACK)」：回退新建的任务未并入代理人，读回 %v（期望 [rbk-wang rbk-agent]）", a)
+	if a := doingActors(t, repo, inst.ID, "b1", 1); len(a) != 2 || a[0] != "u" || a[1] != "rbk-agent" {
+		t.Fatalf("条款 1「回退(ROLLBACK)」：复活行应＝该行 u_userId + 其代理人，读回 %v（期望 [u rbk-agent]）", a)
 	}
 }
 
