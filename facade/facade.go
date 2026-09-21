@@ -168,6 +168,8 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 		err = f.taskAddActor(args)
 	case "processTask/addCandidate":
 		err = f.taskAddActor(args)
+	case "processTask/transfer":
+		err = f.taskTransfer(args)
 	case "processTask/latest":
 		data, err = f.taskLatest(args)
 	case "processInstance/stats/overview":
@@ -345,10 +347,18 @@ func (f *Facade) upAndDown(args map[string]interface{}) error {
 	return nil
 }
 
+// withdraw 撤回（spec 06 §processInstance/withdraw，issues/114）
+//
+// operator 硬必填：缺失/空串直接报错，**严禁缺省回落 user1**——那会把撤回人静默记成别人，
+// 审计链失真且不报错。归属三判据命中任一放行，全不命中拒绝（失败码统一 99999999，细粒度原因走 msg）。
 func (f *Facade) withdraw(args map[string]interface{}) error {
 	instanceID, err := toInt64(args["id"])
 	if err != nil {
 		return fmt.Errorf("id 缺失或非法: %v", err)
+	}
+	operator := strings.TrimSpace(toStr(args["operator"], ""))
+	if operator == "" {
+		return errors.New("operator 必填")
 	}
 	inst, err := f.repo.FindInstanceByID(context.Background(), instanceID)
 	if err != nil || inst == nil {
@@ -357,11 +367,14 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 	// 撤回：全部 doing 任务置 Withdraw(30) + 实例置 30（v1.0.1：updateInstance 级联落库）
 	// 注意：FindInstanceByID 现水合 Tasks（issues/110），此处仍按实例单独查 doing 任务撤回，
 	// 且必须把聚合副本重置为仅被撤回项（见下方 inst.Tasks = doing），防级联回写多余任务
-	operator := toStr(args["operator"], "user1")
+	// ——20（已完成）/40（已终止）的任务行因此不被改写，撤回只作用于整单的进行中任务
 	now := time.Now()
 	doing, err := f.repo.FindDoingTasks(context.Background(), instanceID, nil)
 	if err != nil {
 		return err
+	}
+	if !f.canWithdrawInstance(inst, doing, operator) {
+		return errors.New("无权限撤回该流程实例")
 	}
 	// issues/53 E25 补正：改状态后的副本必须同步回聚合（UpdateInstance 级联会用聚合内
 	// 旧任务副本覆盖已撤回状态——先 updateTask 再 updateInstance 会被覆盖回 DOING）
@@ -369,11 +382,41 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 	// 混用会让"发起人撤回"和"引擎废弃"在任务表里塌成同一个值
 	for _, t := range doing {
 		t.Withdraw(now)
+		// issues/114：进行中任务的 update_user 同样回写为真实撤回人（实例侧见下）
+		t.UpdateUser = operator
 	}
 	inst.Withdraw(now) // 撤回状态 Withdraw(30) 而非 Reject(45)
 	inst.UpdateUser = operator
 	inst.Tasks = doing
 	return f.repo.UpdateInstance(context.Background(), inst)
+}
+
+// canWithdrawInstance 撤回归属判据（issues/114）——命中任一即放行：
+//  1. operator = 实例发起人（wf_process_instance.operator）；
+//  2. operator 是该实例任一**进行中**任务的参与者（wf_process_task_actor.actor_id）；
+//  3. operator ∈ {flow.auto, flow.admin}。
+//
+// ⚠️ 判据 1 不可复用引擎 isAllowed：engine_impl.go 的 isAllowed 只判"operator 在不在该任务
+// actorIds"+ auto/admin 放行，**不查实例发起人**（八语言同构缺口），故发起人这一支显式补在这里。
+// 判据 2/3 与 isAllowed 同口径（任务副本 ActorIDs + 参与者表兜底；两仓的 doing 任务查询都会
+// 水合 ActorIDs，仍留仓储兜底以防自定义仓储不水合）。
+func (f *Facade) canWithdrawInstance(inst *model.ProcessInstance, doing []*model.ProcessTask, operator string) bool {
+	if inst != nil && inst.Operator == operator {
+		return true
+	}
+	if strings.EqualFold(operator, engine.KeyAutoExecute) || strings.EqualFold(operator, engine.KeyAdminID) {
+		return true
+	}
+	for _, t := range doing {
+		if t.IsAllowed(operator) {
+			return true
+		}
+		actors, _ := f.repo.FindTaskActors(context.Background(), t.ID)
+		if containsStr(actors, operator) {
+			return true
+		}
+	}
+	return false
 }
 
 // ═══ 流程任务 ═══
@@ -1483,6 +1526,153 @@ func (f *Facade) taskAddActor(args map[string]interface{}) error {
 		return errors.New("actorIds 缺失")
 	}
 	return f.repo.AddTaskActor(context.Background(), taskID, actors)
+}
+
+// taskTransfer 转办（spec 06 §processTask/transfer，issues/115）：只摘 fromActor 那一行参与者、
+// toActor 追加，**沿用同一 processTaskId**（待办从 A 挪到 B，不新建任务，高亮图/节点进度不变），
+// 并在该任务行上留痕三件（submitType=7 槽位 + tf_transferHistory 追加式账本 + tf_approvalComment 末跳文案）。
+//
+// 与 surrogate/addCandidate 的区别：那两个 action 只追加（加签，原参与人保留可办），本 action 才摘人。
+// 鉴权：operator == fromActor（只能转自己那一条待办），或 operator ∈ {flow.auto, flow.admin}。
+func (f *Facade) taskTransfer(args map[string]interface{}) error {
+	taskID, err := toInt64(args["processTaskId"])
+	if err != nil {
+		return fmt.Errorf("processTaskId 缺失或非法: %v", err)
+	}
+	operator := strings.TrimSpace(toStr(args["operator"], ""))
+	if operator == "" {
+		return errors.New("operator 必填")
+	}
+	fromActor := strings.TrimSpace(toStr(args["fromActor"], ""))
+	if fromActor == "" {
+		return errors.New("fromActor 必填")
+	}
+	toActor := strings.TrimSpace(toStr(args["toActor"], ""))
+	if toActor == "" {
+		return errors.New("toActor 必填")
+	}
+	reason := toStr(args["reason"], "")
+	if operator != fromActor &&
+		!strings.EqualFold(operator, engine.KeyAutoExecute) &&
+		!strings.EqualFold(operator, engine.KeyAdminID) {
+		return errors.New("无权限转办该任务")
+	}
+	ctx := context.Background()
+	task, err := f.repo.FindTaskByID(ctx, taskID)
+	if err != nil || task == nil {
+		return errors.New("任务不存在")
+	}
+	if task.TaskState != model.TaskStateDoing {
+		return errors.New("任务非进行中，不可转办")
+	}
+	// 参与者以关系表为准（内存/SQL 两仓同源），任务副本 ActorIDs 一并去重纳入（仓储不水合时的兜底）
+	actors, err := f.repo.FindTaskActors(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	participants := dedupStrs(append(append([]string{}, actors...), task.ActorIDs...))
+	if !containsStr(participants, fromActor) {
+		return errors.New("原办理人不是该任务参与人")
+	}
+	if containsStr(participants, toActor) {
+		return errors.New("目标人已是该任务参与人")
+	}
+	// 摘原人 + 加新人：RemoveTaskActor 只删 fromActor 那一行，同任务其余参与人（会签其他成员、
+	// 加签来的人）不受影响
+	if err := f.repo.RemoveTaskActor(ctx, taskID, []string{fromActor}); err != nil {
+		return err
+	}
+	if err := f.repo.AddTaskActor(ctx, taskID, []string{toActor}); err != nil {
+		return err
+	}
+	now := time.Now()
+	// 留痕三件（Go 的审批记录即任务行：approvalRecord 透出 variable/ext）——槽位就是任务行本身，
+	// B 办结时 submitType 必被他的办理参数覆盖，没有追加式账本则多跳只剩末跳、办结后转办整体消失。
+	// ① submitType=7 当前槽位（B 办结前记录直接读作"转办"）；办理人记谁由 update_user +
+	//    tf_transferHistory[].operator 承载——**严禁覆写 actor_id 列**（契约 06 §transfer 留痕⚠️：
+	//    进行中任务该列恒无值是既有不变量，写进去会让撤回/终止单凭空冒进被摘人的「我已办」）；
+	// ② tf_transferHistory 跨跳持久账本，每跳 append 只追加不覆盖（B 办结后仍在）；
+	// ③ tf_approvalComment 末跳可读文案，前端审批意见既有读取位（issues/15），多跳只留末跳。
+	// 单跳便捷键 tf_transferTo/tf_transferReason 一并写，省前端一次遍历。
+	vars := task.Variables
+	if vars == nil {
+		vars = map[string]interface{}{}
+	}
+	vars[engine.KeySubmitType] = int(model.SubmitTypeTransfer)
+	vars["tf_transferTo"] = toActor
+	vars["tf_transferReason"] = reason
+	vars["tf_approvalComment"] = transferComment(fromActor, toActor, reason)
+	vars["tf_transferHistory"] = appendTransferRecord(vars["tf_transferHistory"], map[string]interface{}{
+		"submitType": int(model.SubmitTypeTransfer),
+		"fromActor":  fromActor,
+		"toActor":    toActor,
+		"reason":     reason,
+		"time":       now.Format(timeFmt),
+		"operator":   operator,
+	})
+	task.Variables = vars
+	// actor_id/operator 列**不写**（契约 06 §transfer 留痕⚠️，Node 实测复现）：进行中任务该列恒无值
+	// 是本家族既有不变量；写进被摘走的人，该单一经撤回/终止会凭空出现在他从没办过的「我已办」
+	// 列表（pageDoneTasks 按 state <> 10 AND operator = ? 过滤）。办理人由 update_user + 账本 operator 承载。
+	task.UpdateTime = now
+	task.UpdateUser = operator
+	// 内存仓 UpdateTask 会用任务副本的 ActorIDs 覆盖参与者表：必须回传变更后的清单，
+	// 否则上面的摘人/加人被旧副本回滚（SQL 仓 UpdateTask 不碰参与者表，同值回写无害）
+	task.ActorIDs = dedupStrs(append(
+		removeStr(participants, fromActor), toActor))
+	return f.repo.UpdateTask(ctx, task)
+}
+
+// transferComment 转办末跳可读文案（tf_approvalComment 槽位，前端审批意见的既有读取位 issues/15）：
+// 形如「A 转办给 B（原因…）」，无原因时「A 转办给 B」。
+func transferComment(fromActor, toActor, reason string) string {
+	r := strings.TrimSpace(reason)
+	if r == "" {
+		return fromActor + " 转办给 " + toActor
+	}
+	return fromActor + " 转办给 " + toActor + "（" + r + "）"
+}
+
+// appendTransferRecord tf_transferHistory 追加（只追加不覆盖，spec 06 §transfer 留痕②）。
+// 既有值三种来源都要容错：本仓内存写入的 []interface{}、其他代码可能构造的 []map[string]interface{}、
+// SQL 仓 variable 列 JSON 回读的 []interface{}（元素为 map[string]interface{}）。
+// 统一归一为 []interface{}{map[string]interface{}{...}}——与 JSON 落地形态同构，便于七栈读到同一形状。
+func appendTransferRecord(cur interface{}, rec map[string]interface{}) []interface{} {
+	out := make([]interface{}, 0, 1)
+	switch v := cur.(type) {
+	case []interface{}:
+		out = append(out, v...)
+	case []map[string]interface{}:
+		for _, m := range v {
+			out = append(out, m)
+		}
+	}
+	return append(out, rec)
+}
+
+// dedupStrs 去重保序（空串剔除）
+func dedupStrs(list []string) []string {
+	seen := make(map[string]bool, len(list))
+	out := make([]string, 0, len(list))
+	for _, s := range list {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// removeStr 剔除指定值（其余顺序不变）
+func removeStr(list []string, s string) []string {
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		if v != s {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func (f *Facade) taskLatest(args map[string]interface{}) (interface{}, error) {

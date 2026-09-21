@@ -263,10 +263,11 @@ func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, opera
 	// issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
 	// 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
 	baseVars := inst.Variables
-	vars := mergeVars(args, baseVars)
-	for k, v := range task.Variables {
-		vars[k] = v
-	}
+	// 任务既有变量（会签簿记、转办留痕 submitType=7/tf_transferTo 等）以实例变量为底并入，
+	// 但**本次提交参数覆盖同名键**——对齐 Java ProcessTask.finish 的 `variables.putAll(args)`：
+	// 转办（issues/115）把留痕写在仍然进行中的同一任务行上，若不让我方 args 反压，
+	// B 后续提交"同意/会签拒绝"会被上一手的 submitType=7 顶掉（记录失真 + 一票否决判据失效）。
+	vars := mergeVars(args, mergeVars(task.Variables, baseVars))
 	e.addUserInfo(operator, vars)
 
 	now := time.Now()

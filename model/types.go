@@ -96,6 +96,8 @@ const (
 )
 
 // SubmitType 流程提交类型（wf_process_submit_type）
+//
+// 7=转办留痕（issues/115）：processTask/transfer 写审批记录用，不走 execute。
 type SubmitType int
 
 const (
@@ -106,6 +108,7 @@ const (
 	SubmitTypeJump                SubmitType = 4
 	SubmitTypeReApply             SubmitType = 5
 	SubmitTypeRollbackToOperator  SubmitType = 6
+	SubmitTypeTransfer            SubmitType = 7
 	SubmitTypeCountersignDisagree SubmitType = 20
 )
 

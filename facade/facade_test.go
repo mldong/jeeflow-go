@@ -2404,3 +2404,577 @@ func TestCCCreateEventNoListenerPureIncremental(t *testing.T) {
 	// 直接 FireEvent：无监听器零副作用、不抛错
 	eng.FireEvent(engine.ProcessEvent{Type: engine.EventCCCreate, InstanceID: instID, CcActorID: "cc_only"})
 }
+
+// ═══ 撤回鉴权 / 转办（issues/114 · issues/115，spec 06 §processInstance/withdraw · §processTask/transfer）═══
+
+// mustFailWithMsg 断言门面失败：code=99999999（引擎侧统一失败码）+ msg 含跨栈统一文案关键字
+func mustFailWithMsg(t *testing.T, label string, r map[string]interface{}, keyword string) {
+	t.Helper()
+	if code, _ := r["code"].(int); code != 99999999 {
+		t.Fatalf("%s 应失败且 code=99999999（禁止静默成功）, got %v", label, r)
+	}
+	msg, _ := r["msg"].(string)
+	if !strings.Contains(msg, keyword) {
+		t.Fatalf("%s msg = %q, want 含「%s」", label, msg, keyword)
+	}
+}
+
+// varNum 读回变量里的数字（内存仓为 int，SQL 仓 variable JSON 反序列化为 float64）
+func varNum(v interface{}) int64 {
+	switch n := v.(type) {
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case float64:
+		return int64(n)
+	case string:
+		x, _ := strconv.ParseInt(n, 10, 64)
+		return x
+	}
+	return -1
+}
+
+// histTaskByName 实例下指定节点的任务行（含已完成；同名多任务取首条），无则 nil
+func histTaskByName(t *testing.T, repo *memory.Repository, instanceID int64, taskName string) *model.ProcessTask {
+	t.Helper()
+	his, err := repo.FindHistoryTasks(context.Background(), instanceID)
+	if err != nil {
+		t.Fatalf("FindHistoryTasks: %v", err)
+	}
+	for _, tk := range his {
+		if tk.TaskName == taskName {
+			return tk
+		}
+	}
+	return nil
+}
+
+// doingTaskOfActor 实例下「参与者含 actor」的进行中任务 id（会签逐人任务定位用）
+func doingTaskOfActor(t *testing.T, repo *memory.Repository, instanceID int64, actor string) int64 {
+	t.Helper()
+	doing, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
+	for _, tk := range doing {
+		if actors, _ := repo.FindTaskActors(context.Background(), tk.ID); containsStr2(actors, actor) {
+			return tk.ID
+		}
+	}
+	return 0
+}
+
+// todoIDsOf 某人待办（走门面 todoList，即用户视角）的任务 id 列表
+func todoIDsOf(t *testing.T, f *facade.Facade, operator string) []int64 {
+	t.Helper()
+	r := f.Flow("processTask/todoList", map[string]interface{}{"operator": operator, "pageSize": 100})
+	mustOk(t, r)
+	rows, _ := r["data"].(map[string]interface{})["rows"].([]interface{})
+	ids := make([]int64, 0, len(rows))
+	for _, m := range rows {
+		ids = append(ids, mustI64(m.(map[string]interface{})["id"]))
+	}
+	return ids
+}
+
+// containsI64 数字列表包含判定
+func containsI64(list []int64, v int64) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// recordRowWithVar 审批记录里 ext.<key> == want 的首行（Go 栈审批记录即任务行历史）
+func recordRowWithVar(t *testing.T, f *facade.Facade, instanceID int64, key, want string) map[string]interface{} {
+	t.Helper()
+	r := f.Flow("processInstance/approvalRecord", map[string]interface{}{"id": instanceID})
+	mustOk(t, r)
+	rows, _ := r["data"].([]interface{})
+	for _, m := range rows {
+		row, _ := m.(map[string]interface{})
+		ext, _ := row["ext"].(map[string]interface{})
+		if s, _ := ext[key].(string); s == want {
+			return row
+		}
+	}
+	t.Fatalf("审批记录里找不到 ext.%s == %q 的行: %v", key, want, rows)
+	return nil
+}
+
+// TestWithdrawAuthorization spec 08 用例 24：撤回鉴权（operator 硬必填 + 三条归属判据 + update_user 回写）
+//
+// 断言一律落在**持久值/读回值**上（issues/113 的教训：只断"doing 列表为空"时 30 与 99 都满足）。
+func TestWithdrawAuthorization(t *testing.T) {
+	f, repo, _ := setupFacade()
+	ctx := context.Background()
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "02-multi-task.json"))})
+	mustOk(t, r0)
+	defineID := r0["data"].(map[string]interface{})["processDefineId"]
+	// 发起并自动完成 apply → 停 task1（参与者 leader，发起人 zhangsan 不在参与者里）
+	start := func() int64 {
+		r := f.Flow("processInstance/startAndExecute", map[string]interface{}{"processDefineId": defineID, "operator": "zhangsan"})
+		mustOk(t, r)
+		return mustI64(r["data"].(map[string]interface{})["processInstanceId"])
+	}
+	// 读回"未被撤回"的原状（负向用例的零副作用证据）
+	assertUntouched := func(instanceID int64, label string) {
+		t.Helper()
+		inst, err := repo.FindInstanceByID(ctx, instanceID)
+		if err != nil || inst == nil {
+			t.Fatalf("%s 实例读回失败: %v", label, err)
+		}
+		if inst.State != model.InstanceStateDoing {
+			t.Fatalf("%s 实例态 = %d, want 仍 DOING(10)", label, inst.State)
+		}
+		if inst.UpdateUser == "user1" {
+			t.Fatalf("%s 实例 update_user 被记成 user1（operator 缺省回落缺陷）: %q", label, inst.UpdateUser)
+		}
+		tk := histTaskByName(t, repo, instanceID, "task1")
+		if tk == nil {
+			t.Fatalf("%s task1 任务行读不到", label)
+		}
+		if tk.TaskState != model.TaskStateDoing {
+			t.Fatalf("%s task1 任务态 = %d, want 仍 DOING(10)", label, tk.TaskState)
+		}
+	}
+
+	// ── 负向①：operator 缺失 / 空串 → 明确报错，严禁回落 user1 ──
+	instA := start()
+	mustFailWithMsg(t, "撤回缺 operator", f.Flow("processInstance/withdraw", map[string]interface{}{"id": instA}), "operator 必填")
+	mustFailWithMsg(t, "撤回空 operator",
+		f.Flow("processInstance/withdraw", map[string]interface{}{"id": instA, "operator": "   "}), "operator 必填")
+	assertUntouched(instA, "缺 operator")
+
+	// ── 负向②：无关第三人（既非发起人，也不是任何进行中任务的参与者）──
+	mustFailWithMsg(t, "无关第三人撤回",
+		f.Flow("processInstance/withdraw", map[string]interface{}{"id": instA, "operator": "stranger"}),
+		"无权限撤回该流程实例")
+	assertUntouched(instA, "第三人撤回")
+
+	// ── 正向①（判据 2 参与者可撤整单）+ update_user 回写真实撤回人 + 已完成任务不被改写 ──
+	mustOk(t, f.Flow("processInstance/withdraw", map[string]interface{}{"id": instA, "operator": "leader"}))
+	inst, _ := repo.FindInstanceByID(ctx, instA)
+	if inst == nil || inst.State != model.InstanceStateWithdraw {
+		t.Fatalf("参与者撤回后实例态 = %+v, want Withdraw(30)", inst)
+	}
+	if inst.UpdateUser != "leader" {
+		t.Fatalf("实例 update_user = %q, want 真实撤回人 leader", inst.UpdateUser)
+	}
+	doneTask := histTaskByName(t, repo, instA, "apply")
+	if doneTask == nil {
+		t.Fatalf("apply 任务行读不到")
+	}
+	t1, _ := repo.FindTaskByID(ctx, histTaskByName(t, repo, instA, "task1").ID)
+	if t1.TaskState != model.TaskStateWithdraw {
+		t.Fatalf("撤回任务态 = %d, want 30（WITHDRAW；99 是废弃码）", t1.TaskState)
+	}
+	if t1.UpdateUser != "leader" {
+		t.Fatalf("撤回任务 update_user = %q, want leader", t1.UpdateUser)
+	}
+	// 已完成(20) 的 apply 行：状态与 update_user 都不得被撤回改写
+	if doneTask.TaskState != model.TaskStateDone || doneTask.UpdateUser == "leader" {
+		t.Fatalf("已完成任务被撤回改写: state=%d update_user=%q", doneTask.TaskState, doneTask.UpdateUser)
+	}
+	// 撤回后不残留进行中任务（读回值，非"列表为空"这一弱形状）
+	if doing, _ := repo.FindDoingTasks(ctx, instA, nil); len(doing) != 0 {
+		t.Fatalf("撤回后仍剩 %d 条 doing 任务", len(doing))
+	}
+
+	// ── 正向②（判据 1 发起人）：zhangsan 不在任何进行中任务的参与者里，
+	// 若实现直接复用引擎 isAllowed（只判 actorIds + auto/admin），这一支必红 ──
+	instB := start()
+	if actors, _ := repo.FindTaskActors(ctx, doingTaskID(t, repo, instB, "task1")); containsStr2(actors, "zhangsan") {
+		t.Fatalf("前置被破坏：发起人成了 task1 参与者，判据 1 断言将恒真: %v", actors)
+	}
+	mustOk(t, f.Flow("processInstance/withdraw", map[string]interface{}{"id": instB, "operator": "zhangsan"}))
+	if got, _ := repo.FindInstanceByID(ctx, instB); got.State != model.InstanceStateWithdraw || got.UpdateUser != "zhangsan" {
+		t.Fatalf("发起人撤回后实例 = %+v, want state 30 + update_user zhangsan", got)
+	}
+
+	// ── 正向③（判据 3）：flow.admin / flow.auto 放行 ──
+	for _, op := range []string{"flow.admin", "flow.auto"} {
+		instC := start()
+		mustOk(t, f.Flow("processInstance/withdraw", map[string]interface{}{"id": instC, "operator": op}))
+		got, _ := repo.FindInstanceByID(ctx, instC)
+		if got.State != model.InstanceStateWithdraw {
+			t.Fatalf("%s 撤回后实例态 = %d, want 30", op, got.State)
+		}
+	}
+
+	// ── 会签整单：任一参与者撤整单，其余成员的进行中任务同样落 30（不是只撤自己那一条）──
+	r5 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "05-countersign-parallel.json"))})
+	mustOk(t, r5)
+	r6 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r5["data"].(map[string]interface{})["processDefineId"], "operator": "zhangsan",
+	})
+	mustOk(t, r6)
+	csID := mustI64(r6["data"].(map[string]interface{})["processInstanceId"])
+	csDoing, _ := repo.FindDoingTasks(ctx, csID, nil)
+	if len(csDoing) != 3 {
+		t.Fatalf("并行会签应有 3 条 doing 任务, got %d", len(csDoing))
+	}
+	mustOk(t, f.Flow("processInstance/withdraw", map[string]interface{}{"id": csID, "operator": "userB"}))
+	for _, tk := range csDoing {
+		stored, _ := repo.FindTaskByID(ctx, tk.ID)
+		if stored.TaskState != model.TaskStateWithdraw {
+			t.Fatalf("整单撤回后会签任务 %s(%d) 态 = %d, want 30", stored.TaskName, stored.ID, stored.TaskState)
+		}
+		if stored.UpdateUser != "userB" {
+			t.Fatalf("整单撤回后会签任务 update_user = %q, want userB", stored.UpdateUser)
+		}
+	}
+}
+
+// TestTaskTransfer spec 08 用例 25：转办（摘原人一行 + 换新人 + submitType=7 留痕 + 四条明确报错）
+func TestTaskTransfer(t *testing.T) {
+	f, repo, _ := setupFacade()
+	ctx := context.Background()
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
+	mustOk(t, r0)
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"], "operator": "zhangsan",
+	})
+	mustOk(t, r1)
+	instanceID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	taskID := doingTaskID(t, repo, instanceID, "task1")
+	if taskID == 0 {
+		t.Fatalf("前置：应有 task1 进行中任务")
+	}
+	transfer := func(args map[string]interface{}) map[string]interface{} {
+		return f.Flow("processTask/transfer", args)
+	}
+
+	// ── 回归前置：加签（surrogate）仍是"只追加"，原参与人保留可办 ──
+	mustOk(t, f.Flow("processTask/surrogate", map[string]interface{}{
+		"processTaskId": taskID, "actorIds": []string{"coworker"},
+	}))
+	base, _ := repo.FindTaskActors(ctx, taskID)
+	if !containsStr2(base, "leader") || !containsStr2(base, "coworker") {
+		t.Fatalf("加签后参与人 = %v, want 原人 leader 保留 + coworker", base)
+	}
+
+	// ── 负向：四类明确报错 + 报错零副作用（参与人、留痕都不动）──
+	mustFailWithMsg(t, "转办缺 operator",
+		transfer(map[string]interface{}{"processTaskId": taskID, "fromActor": "leader", "toActor": "newcomer"}),
+		"operator 必填")
+	mustFailWithMsg(t, "第三人转别人的待办",
+		transfer(map[string]interface{}{"processTaskId": taskID, "fromActor": "leader", "toActor": "newcomer", "operator": "stranger"}),
+		"无权限转办该任务")
+	mustFailWithMsg(t, "fromActor 非参与者",
+		transfer(map[string]interface{}{"processTaskId": taskID, "fromActor": "nobody", "toActor": "newcomer", "operator": "nobody"}),
+		"原办理人不是该任务参与人")
+	mustFailWithMsg(t, "toActor 已是参与者",
+		transfer(map[string]interface{}{"processTaskId": taskID, "fromActor": "leader", "toActor": "coworker", "operator": "leader"}),
+		"目标人已是该任务参与人")
+	after, _ := repo.FindTaskActors(ctx, taskID)
+	if !reflect.DeepEqual(after, base) {
+		t.Fatalf("报错后参与人被改动: before=%v after=%v", base, after)
+	}
+	if tk, _ := repo.FindTaskByID(ctx, taskID); tk.Variables["tf_transferTo"] != nil ||
+		varNum(tk.Variables["submitType"]) == varNum(int(model.SubmitTypeTransfer)) {
+		t.Fatalf("报错却写入了转办留痕: %+v", tk.Variables)
+	}
+
+	// ── 正向：leader 转给 newcomer（只摘自己那一行，coworker 不动），沿用同一 taskId ──
+	mustOk(t, transfer(map[string]interface{}{
+		"processTaskId": taskID, "fromActor": "leader", "toActor": "newcomer",
+		"reason": "出差三天", "operator": "leader",
+	}))
+	swapped, _ := repo.FindTaskActors(ctx, taskID)
+	if containsStr2(swapped, "leader") || !containsStr2(swapped, "newcomer") || !containsStr2(swapped, "coworker") {
+		t.Fatalf("转办后参与人 = %v, want 摘 leader、留 coworker、加 newcomer", swapped)
+	}
+	if got := todoIDsOf(t, f, "leader"); containsI64(got, taskID) {
+		t.Fatalf("转办后 A 待办仍含该任务: %v", got)
+	}
+	gotB := todoIDsOf(t, f, "newcomer")
+	if !containsI64(gotB, taskID) {
+		t.Fatalf("转办后 B 待办应含同一 taskId(%d): %v", taskID, gotB)
+	}
+
+	// ── 留痕读回：审批记录出现 submitType=7，tf_transferTo/tf_transferReason 可取 ──
+	row := recordRowWithVar(t, f, instanceID, "tf_transferTo", "newcomer")
+	ext := row["ext"].(map[string]interface{})
+	if got := varNum(ext["submitType"]); got != int64(model.SubmitTypeTransfer) {
+		t.Fatalf("审批记录 submitType = %d, want 7（TRANSFER）", got)
+	}
+	if s, _ := ext["tf_transferReason"].(string); s != "出差三天" {
+		t.Fatalf("审批记录 tf_transferReason = %v, want 出差三天", ext["tf_transferReason"])
+	}
+	// 契约 06 §transfer 留痕⚠️（Node 实测复现）：转办**严禁覆写 actor_id 列**——进行中任务
+	// 该列恒无值是既有不变量，"办理人记谁"由 update_user + 账本 operator 承载
+	tk, _ := repo.FindTaskByID(ctx, taskID)
+	if tk.ActorID != "" {
+		t.Fatalf("转办后进行中任务 actor_id = %q, want 恒无值（覆写会致撤回单冒进「我已办」）", tk.ActorID)
+	}
+	if tk.UpdateUser != "leader" {
+		t.Fatalf("转办留痕 update_user = %v, want 操作人 leader", tk.UpdateUser)
+	}
+	if hop := ledgerOf(t, ext["tf_transferHistory"]); len(hop) != 1 || hop[0]["operator"] != "leader" {
+		t.Fatalf("账本 tf_transferHistory = %v, want 1 条且 operator=leader（办理人经账本承载）", ext["tf_transferHistory"])
+	}
+	// 高亮/节点进度不变：任务仍在 task1 节点上活跃
+	hl := f.Flow("processInstance/highLight", map[string]interface{}{"id": instanceID})
+	mustOk(t, hl)
+	if acts, _ := hl["data"].(map[string]interface{})["activeNodeNames"].([]interface{}); !containsStr2(toStringSlice2Any(acts), "task1") {
+		t.Fatalf("转办后高亮活跃节点应仍含 task1: %v", acts)
+	}
+
+	// ── 回归：接手人正常办结，其 submitType 不被留痕顶掉（记录与会签否决判据都依赖它）──
+	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{
+		"processTaskId": taskID, "operator": "newcomer", "submitType": 1,
+	}))
+	done, _ := repo.FindTaskByID(ctx, taskID)
+	if done.TaskState != model.TaskStateDone {
+		t.Fatalf("B 办结后任务态 = %d, want 20", done.TaskState)
+	}
+	if got := varNum(done.Variables["submitType"]); got != 1 {
+		t.Fatalf("B 办结记录 submitType = %d, want 1（留痕 7 不得反噬后续提交）", got)
+	}
+	if done.ActorID != "newcomer" {
+		t.Fatalf("B 办结后办理人 = %q, want newcomer", done.ActorID)
+	}
+	// 转办证据仍留在同一任务行上（tf_transferTo 不在提交参数里，不被覆盖）
+	if s, _ := done.Variables["tf_transferTo"].(string); s != "newcomer" {
+		t.Fatalf("办结后转办证据丢失: %v", done.Variables["tf_transferTo"])
+	}
+	if inst, _ := repo.FindInstanceByID(ctx, instanceID); inst.State != model.InstanceStateDone {
+		t.Fatalf("实例态 = %d, want 已完成(20)", inst.State)
+	}
+
+	// ── 负向：已完成任务不可转办 ──
+	mustFailWithMsg(t, "已完成任务转办",
+		transfer(map[string]interface{}{"processTaskId": taskID, "fromActor": "newcomer", "toActor": "third", "operator": "newcomer"}),
+		"任务非进行中，不可转办")
+
+	// ── flow.admin 代转（鉴权例外）+ 会签只摘 fromActor 那一行 ──
+	r2 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "05-countersign-parallel.json"))})
+	mustOk(t, r2)
+	r3 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r2["data"].(map[string]interface{})["processDefineId"], "operator": "zhangsan",
+	})
+	mustOk(t, r3)
+	csID := mustI64(r3["data"].(map[string]interface{})["processInstanceId"])
+	taskA := doingTaskOfActor(t, repo, csID, "userA")
+	taskB := doingTaskOfActor(t, repo, csID, "userB")
+	if taskA == 0 || taskB == 0 || taskA == taskB {
+		t.Fatalf("前置：会签逐人任务定位失败 A=%d B=%d", taskA, taskB)
+	}
+	mustOk(t, transfer(map[string]interface{}{
+		"processTaskId": taskA, "fromActor": "userA", "toActor": "userD", "operator": "flow.admin",
+	}))
+	actorsA, _ := repo.FindTaskActors(ctx, taskA)
+	if !reflect.DeepEqual(actorsA, []string{"userD"}) {
+		t.Fatalf("管理员代转后本人任务参与人 = %v, want 只剩 userD", actorsA)
+	}
+	actorsB, _ := repo.FindTaskActors(ctx, taskB)
+	if !reflect.DeepEqual(actorsB, []string{"userB"}) {
+		t.Fatalf("同会签节点其他成员任务被改动: %v, want userB 不动", actorsB)
+	}
+	if got := todoIDsOf(t, f, "userA"); containsI64(got, taskA) {
+		t.Fatalf("转办后 userA 待办仍含该票: %v", got)
+	}
+	if got := todoIDsOf(t, f, "userD"); !containsI64(got, taskA) {
+		t.Fatalf("转办后 userD 待办应含该票(%d): %v", taskA, got)
+	}
+}
+
+// TestTaskTransferKeepsOperatorColumnEmpty 契约 06 §transfer 留痕⚠️（spec 08 用例 25 延伸）：
+// 转办严禁覆写任务 actor_id 列——进行中该列恒无值是既有不变量；把被摘走的人写进去，
+// 该单一旦撤回（离开 DOING 但列值留着），会凭空出现在他从没办过的「我已办」列表
+// （pageDoneTasks 判据 state <> 10 AND operator = ?，Node 实测复现）。断言全落持久值/读回值。
+func TestTaskTransferKeepsOperatorColumnEmpty(t *testing.T) {
+	f, repo, _ := setupFacade()
+	ctx := context.Background()
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
+	mustOk(t, r0)
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"], "operator": "zhangsan",
+	})
+	mustOk(t, r1)
+	instanceID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	taskID := doingTaskID(t, repo, instanceID, "task1")
+	if taskID == 0 {
+		t.Fatalf("前置：应有 task1 进行中任务")
+	}
+	mustOk(t, f.Flow("processTask/transfer", map[string]interface{}{
+		"processTaskId": taskID, "fromActor": "leader", "toActor": "newcomer",
+		"reason": "出差三天", "operator": "leader",
+	}))
+	// 读回持久任务行：actor_id 列仍无值（不变量），办理人经 update_user + 账本 operator 承载
+	tk, _ := repo.FindTaskByID(ctx, taskID)
+	if tk.ActorID != "" {
+		t.Fatalf("转办后 actor_id 列 = %q, want 恒无值", tk.ActorID)
+	}
+	if tk.UpdateUser != "leader" {
+		t.Fatalf("转办后 update_user = %q, want leader", tk.UpdateUser)
+	}
+
+	// 撤回整单（发起人 zhangsan，判据 1）：task1 离开 DOING(→30)，operator 列保持无值
+	mustOk(t, f.Flow("processInstance/withdraw", map[string]interface{}{"id": instanceID, "operator": "zhangsan"}))
+	withdrawn, _ := repo.FindTaskByID(ctx, taskID)
+	if withdrawn.TaskState != model.TaskStateWithdraw {
+		t.Fatalf("撤回后任务态 = %d, want 30（撤回未生效则本用例失去意义）", withdrawn.TaskState)
+	}
+	if withdrawn.ActorID != "" {
+		t.Fatalf("撤回后 actor_id 列 = %q, want 恒无值", withdrawn.ActorID)
+	}
+	// 被摘走的 leader 与未办的 newcomer 的「我已办」都不含该单（冒单即本缺陷的实证形态）
+	doneIDs := func(operator string) []int64 {
+		r := f.Flow("processTask/doneList", map[string]interface{}{"operator": operator, "pageSize": 100})
+		mustOk(t, r)
+		rows, _ := r["data"].(map[string]interface{})["rows"].([]interface{})
+		ids := make([]int64, 0, len(rows))
+		for _, m := range rows {
+			ids = append(ids, mustI64(m.(map[string]interface{})["id"]))
+		}
+		return ids
+	}
+	for _, who := range []string{"leader", "newcomer"} {
+		if got := doneIDs(who); containsI64(got, taskID) {
+			t.Fatalf("转办→撤回后 %s 的已办列表冒入该单（他从没办过）: %v", who, got)
+		}
+	}
+}
+
+// transferTimeLayout tf_transferHistory.time 的落地格式：写字符串而非可序列化为对象的时刻，
+// 保证跨 JSON 往返（内存仓 → SQL 仓）形状稳定，七栈对齐时按同一格式写入。
+const transferTimeLayout = "2006-01-02 15:04:05"
+
+// ledgerOf 归一 tf_transferHistory 的读出形态：内存仓为本仓写入的 []interface{}，SQL 仓为 variable
+// 列 JSON 反序列化的 []interface{}（元素同为 map[string]interface{}）；另兼容 []map 形状。
+// 元素不是对象、整体不是数组即 Fail——钉住跨栈对齐用的落地形状。
+func ledgerOf(t *testing.T, v interface{}) []map[string]interface{} {
+	t.Helper()
+	switch list := v.(type) {
+	case nil:
+		return nil
+	case []map[string]interface{}:
+		return list
+	case []interface{}:
+		out := make([]map[string]interface{}, 0, len(list))
+		for i, e := range list {
+			m, ok := e.(map[string]interface{})
+			if !ok {
+				t.Fatalf("tf_transferHistory[%d] 应为对象，实际 %T", i, e)
+			}
+			out = append(out, m)
+		}
+		return out
+	}
+	t.Fatalf("tf_transferHistory 落地形状异常: %T", v)
+	return nil
+}
+
+// checkHop 逐字段核对账本里的一跳（不做整片 DeepEqual：内存仓 int / SQL 仓 float64 不同形）
+func checkHop(t *testing.T, idx int, rec map[string]interface{}, from, to, reason, op string) {
+	t.Helper()
+	if got := varNum(rec["submitType"]); got != int64(model.SubmitTypeTransfer) {
+		t.Fatalf("第 %d 跳 submitType = %d, want 7（TRANSFER）", idx, got)
+	}
+	for _, kv := range []struct{ key, want string }{
+		{"fromActor", from}, {"toActor", to}, {"reason", reason}, {"operator", op},
+	} {
+		if s, _ := rec[kv.key].(string); s != kv.want {
+			t.Fatalf("第 %d 跳 %s = %v, want %q", idx, kv.key, rec[kv.key], kv.want)
+		}
+	}
+	s, _ := rec["time"].(string)
+	if _, err := time.Parse(transferTimeLayout, s); err != nil {
+		t.Fatalf("第 %d 跳 time = %v, want 「%s」格式（跨 JSON 往返形状稳定）: %v", idx, rec["time"], transferTimeLayout, err)
+	}
+}
+
+// TestTaskTransferMultiHopLedger spec 06 §processTask/transfer 留痕②③（契约 fc0883a 改约三件）：
+// A→B、B→C 两跳后 C 办结——tf_transferHistory 必须仍是两条且逐字段正确（只追加不覆盖，办结后存活），
+// submitType 槽位被 C 自己的 1 覆盖属预期，末跳文案落 tf_approvalComment（前端审批意见读取位 issues/15）。
+func TestTaskTransferMultiHopLedger(t *testing.T) {
+	f, repo, _ := setupFacade()
+	ctx := context.Background()
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
+	mustOk(t, r0)
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"], "operator": "zhangsan",
+	})
+	mustOk(t, r1)
+	instanceID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	taskID := doingTaskID(t, repo, instanceID, "task1")
+	if taskID == 0 {
+		t.Fatalf("前置：应有 task1 进行中任务")
+	}
+	transfer := func(from, to, reason, operator string) {
+		mustOk(t, f.Flow("processTask/transfer", map[string]interface{}{
+			"processTaskId": taskID, "fromActor": from, "toActor": to,
+			"reason": reason, "operator": operator,
+		}))
+	}
+
+	transfer("leader", "newcomer", "出差三天", "leader")
+	transfer("newcomer", "third", "不熟悉该业务", "newcomer")
+
+	// ── 两跳后（C 尚未办结）：同一任务行上账本两条 + 末跳便捷键 + 末跳可读文案 + 槽位仍读作转办 ──
+	hopped, _ := repo.FindTaskByID(ctx, taskID)
+	recs := ledgerOf(t, hopped.Variables["tf_transferHistory"])
+	if len(recs) != 2 {
+		t.Fatalf("两跳后 tf_transferHistory = %d 条, want 2（B 再转给 C 不得抹掉 A→B 那条）", len(recs))
+	}
+	checkHop(t, 1, recs[0], "leader", "newcomer", "出差三天", "leader")
+	checkHop(t, 2, recs[1], "newcomer", "third", "不熟悉该业务", "newcomer")
+	if s, _ := hopped.Variables["tf_transferTo"].(string); s != "third" {
+		t.Fatalf("末跳便捷键 tf_transferTo = %v, want third", hopped.Variables["tf_transferTo"])
+	}
+	if s, _ := hopped.Variables["tf_approvalComment"].(string); s != "newcomer 转办给 third（不熟悉该业务）" {
+		t.Fatalf("末跳文案 tf_approvalComment = %q, want「newcomer 转办给 third（不熟悉该业务）」", s)
+	}
+	if got := varNum(hopped.Variables["submitType"]); got != int64(model.SubmitTypeTransfer) {
+		t.Fatalf("办结前当前槽位 submitType = %d, want 7（转办后、办结前审批记录直接读作转办）", got)
+	}
+	// 任务不新建：两跳后仍是同一 taskId 的进行中任务，参与人已换成 C
+	if actors, _ := repo.FindTaskActors(ctx, taskID); !reflect.DeepEqual(actors, []string{"third"}) {
+		t.Fatalf("两跳后参与人 = %v, want 只剩 third", actors)
+	}
+
+	// ── C 办结（并自填审批意见）：槽位被 1 覆盖属预期、账本两条原样存活、意见槽位本次提交优先 ──
+	mustOk(t, f.Flow("processTask/execute", map[string]interface{}{
+		"processTaskId": taskID, "operator": "third", "submitType": 1,
+		"tf_approvalComment": "已核对，同意",
+	}))
+	done, _ := repo.FindTaskByID(ctx, taskID)
+	if done.TaskState != model.TaskStateDone {
+		t.Fatalf("C 办结后任务态 = %d, want 20", done.TaskState)
+	}
+	if got := varNum(done.Variables["submitType"]); got != int64(model.SubmitTypeAgree) {
+		t.Fatalf("C 办结后 submitType = %d, want 1（末跳槽位被办理参数覆盖属预期）", got)
+	}
+	kept := ledgerOf(t, done.Variables["tf_transferHistory"])
+	if len(kept) != 2 {
+		t.Fatalf("办结后 tf_transferHistory = %d 条, want 2（无追加式账本则转办事实整体消失、审计断链）", len(kept))
+	}
+	checkHop(t, 1, kept[0], "leader", "newcomer", "出差三天", "leader")
+	checkHop(t, 2, kept[1], "newcomer", "third", "不熟悉该业务", "newcomer")
+	if s, _ := done.Variables["tf_approvalComment"].(string); s != "已核对，同意" {
+		t.Fatalf("C 自填意见被转办留痕反噬: tf_approvalComment = %q, want「已核对，同意」（spec 留痕前置条件：本次提交参数最高）", s)
+	}
+
+	// ── 前端读取位：approvalRecord 的 ext 直接取得账本与意见（issues/15）──
+	row := recordRowWithVar(t, f, instanceID, "tf_transferTo", "third")
+	ext := row["ext"].(map[string]interface{})
+	if s, _ := ext["tf_approvalComment"].(string); s != "已核对，同意" {
+		t.Fatalf("审批记录 ext.tf_approvalComment = %v, want「已核对，同意」", ext["tf_approvalComment"])
+	}
+	if n := len(ledgerOf(t, ext["tf_transferHistory"])); n != 2 {
+		t.Fatalf("审批记录 ext.tf_transferHistory = %d 条, want 2: %v", n, ext["tf_transferHistory"])
+	}
+}
+
+// toStringSlice2Any 审批记录/高亮数组（[]interface{} of string）转字符串列表
+func toStringSlice2Any(list []interface{}) []string {
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}

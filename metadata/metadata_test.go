@@ -38,14 +38,22 @@ func TestInstanceStateDict(t *testing.T) {
 
 func TestSubmitTypeDict(t *testing.T) {
 	items := EnumDict("wf_process_submit_type")
-	if len(items) != 8 {
-		t.Fatalf("items = %d, want 8", len(items))
+	// issues/115：新增 7=转办（processTask/transfer 留痕），共 9 档
+	if len(items) != 9 {
+		t.Fatalf("items = %d, want 9", len(items))
 	}
 	if items[0].Value != "0" || items[0].Label != "发起申请" {
 		t.Fatalf("items[0] = %v", items[0])
 	}
-	if items[7].Value != "20" || items[7].Label != "拒绝申请" {
-		t.Fatalf("items[7] = %v", items[7])
+	if items[7].Value != "7" || items[7].Label != "转办" {
+		t.Fatalf("items[7] = %v, want 7 转办", items[7])
+	}
+	// spec 07：2=拒绝申请、20=会签拒绝——两项同名会让前端下拉分不开（Go 曾两档都写"拒绝申请"）
+	if items[2].Value != "2" || items[2].Label != "拒绝申请" {
+		t.Fatalf("items[2] = %v, want 2 拒绝申请", items[2])
+	}
+	if items[8].Value != "20" || items[8].Label != "会签拒绝" {
+		t.Fatalf("items[8] = %v, want 20 会签拒绝", items[8])
 	}
 }
 
