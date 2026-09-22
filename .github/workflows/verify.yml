@@ -1,0 +1,62 @@
+name: Verify Release
+# Go 这条线"tag 即发布"（没有 twine/npm 那样的上传步骤），所以 CI 本来**没有任何一步**能证明
+# 用户拉得到——RELEASE.md 旧述里的"go list -m 轮询"此前并不存在。本 workflow 把它补成真的：
+# tag 推上去就轮询公共代理 + 真解一次模块，拉不到就判红，别让"打了个 tag"当成"已发版"。
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要核验的版本号（形如 v1.8.29）"
+        required: true
+        default: ""
+
+jobs:
+  verify:
+    name: 模块可拉取核验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: 定版本
+        id: v
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "tag=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: 轮询公共代理到可解析
+        env:
+          MOD: github.com/mldong/jeeflow-go
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + 1800 ))   # 30 min：公共代理是懒抓取，冷启动要等
+          for px in https://goproxy.cn https://proxy.golang.org; do
+            echo "—— 核验 $MOD@$TAG @ $px"
+            ok=0
+            while :; do
+              code=$(curl -sL -o /dev/null -w '%{http_code}' "$px/$MOD/@v/$TAG.info" || echo 000)
+              if [ "$code" = "200" ]; then echo "  ✅ $px 已可拉（.info 200）"; ok=1; break; fi
+              if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+              echo "  等待中（当前 $code，剩余 $(( (deadline - $(date +%s)) / 60 ))min）"; sleep 20
+            done
+            [ "$ok" = "1" ] || { echo "::error::$px 上拉不到 $MOD@$TAG —— 别当已发版"; exit 1; }
+          done
+      - name: 干净环境真解一次模块
+        env:
+          MOD: github.com/mldong/jeeflow-go
+          TAG: ${{ steps.v.outputs.tag }}
+          GOPROXY: https://goproxy.cn,direct
+          GOSUMDB: off
+        run: |
+          set -euo pipefail
+          d=$(mktemp -d); cd "$d"
+          go mod init verify.example.com/tmp >/dev/null 2>&1
+          go get "$MOD@$TAG"
+          got=$(go list -m -f '{{.Version}}' "$MOD")
+          [ "$got" = "$TAG" ] || { echo "::error::解析到 $got，期望 $TAG"; exit 1; }
+          echo "✅ go get 成功：$MOD $got"
