@@ -304,11 +304,11 @@ func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, opera
 
 // rollbackToParent 退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的
 // TaskParentID，复活那条历史行；不按模型入边拓扑推（拓扑版在分支/回环流会回到本实例
-// 没走过的节点）。错码走 msg 前缀（本栈 error 无码位，出口统一 99999999）。
+// 没走过的节点）。对外 msg 用固定中文文案、不含引擎内部码（本栈 error 无码位，出口统一 99999999）。
 func (e *EngineImpl) rollbackToParent(ctx context.Context, flow *model.FlowModel,
 	inst *model.ProcessInstance, task *model.ProcessTask, operator string) error {
-	const noLineage = "20010007: 上一步任务ID为空，无法驳回至上一步处理"
-	const guardFail = "20010008: 无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务"
+	const noLineage = "上一步任务ID为空，无法驳回至上一步处理"
+	const guardFail = "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务"
 
 	var parentID int64
 	if task.ParentTaskID != nil {

@@ -962,7 +962,7 @@ func Test154RollbackLineageNegatives(t *testing.T) {
 	if apply.ParentTaskID == nil || *apply.ParentTaskID != 0 {
 		t.Fatalf("前置条件：发起那条 parent 应为 0，实得 %v", apply.ParentTaskID)
 	}
-	errRollback(ctx, t, eng, apply.ID, "applicant", "20010007")
+	errRollback(ctx, t, eng, apply.ID, "applicant", "上一步任务ID为空，无法驳回至上一步处理")
 
 	// 老行形状：parent 为 NULL
 	nullParent := apply
@@ -970,7 +970,7 @@ func Test154RollbackLineageNegatives(t *testing.T) {
 	if err := repo.UpdateTask(ctx, &nullParent); err != nil {
 		t.Fatalf("置 NULL 被打断: %v", err)
 	}
-	errRollback(ctx, t, eng, apply.ID, "applicant", "20010007")
+	errRollback(ctx, t, eng, apply.ID, "applicant", "上一步任务ID为空，无法驳回至上一步处理")
 
 	// ② 守卫：fork 分支行退到 fork 之前的节点
 	eng2, repo2 := setup()
@@ -995,7 +995,7 @@ func Test154RollbackLineageNegatives(t *testing.T) {
 	if len(branch.ActorIDs) == 0 {
 		t.Fatalf("前置条件：分支行应有参与者，否则测不到守卫（会被权限校验先挡下）")
 	}
-	errRollback(ctx, t, eng2, branch.ID, branch.ActorIDs[0], "20010008")
+	errRollback(ctx, t, eng2, branch.ID, branch.ActorIDs[0], "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务")
 }
 
 // firstDoing 取该实例某节点的进行中任务（不存在即 fail，避免"节点名写错→空集合→假绿"）
@@ -1009,14 +1009,14 @@ func firstDoing(t *testing.T, repo *memory.Repository, ctx context.Context, inst
 }
 
 // errRollback 在 taskID 上办"退回上一步"（targetTaskName 传空），断言报错且 msg 含指定期望码
-func errRollback(ctx context.Context, t *testing.T, eng *engine.EngineImpl, taskID int64, operator, wantCode string) {
+func errRollback(ctx context.Context, t *testing.T, eng *engine.EngineImpl, taskID int64, operator, wantMsg string) {
 	t.Helper()
 	_, err := eng.ExecuteAndJumpTask(ctx, taskID, operator,
 		map[string]interface{}{"submitType": int(model.SubmitTypeRollback)}, "")
 	if err == nil {
-		t.Fatalf("退回上一步在 %s 上必须报错（期望码 %s），不得静默不建单", wantCode, wantCode)
+		t.Fatalf("退回上一步必须报错（期望文案 %s），不得静默不建单", wantMsg)
 	}
-	if !strings.Contains(err.Error(), wantCode) {
-		t.Fatalf("错码应体现在 msg（期望 %s），实得 %v", wantCode, err)
+	if !strings.Contains(err.Error(), wantMsg) || strings.Contains(err.Error(), "2001000") {
+		t.Fatalf("msg 应为固定文案且不含引擎内部码（期望 %s），实得 %v", wantMsg, err)
 	}
 }
