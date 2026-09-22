@@ -51,7 +51,8 @@ jobs:
           MOD: github.com/mldong/jeeflow-go
           TAG: ${{ steps.v.outputs.tag }}
           GOPROXY: https://goproxy.cn,direct
-          GOSUMDB: off
+          # 别关 sumdb：模块要求 go>=1.25 ⇒ runner 会 go1.26.x 自动切工具链，
+          # GOSUMDB=off 会让工具链自身那次下载 "checksum database disabled" 直接失败。
         run: |
           set -euo pipefail
           d=$(mktemp -d); cd "$d"
