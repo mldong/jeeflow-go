@@ -289,3 +289,154 @@ func mustFirstSurrogateID(t *testing.T, db *sql.DB, operator string) int64 {
 	}
 	return id
 }
+
+// ─── issues/123 任务 A/B（SQL 仓 + 建单落库断言）───────────────────────────────
+
+// TestSurrogateIneffectiveExactRowStillFallsBackToAllFlow 钉跨作用域回落（SQL 仓侧，
+// 与 engine/surrogate_test.go 同名用例同数据集，双仓必须同答案）：
+// 全流程委托（process_name 空、窗内 enabled=1、更旧）+ 针对本流程的一条**更新但不生效**的委托
+// ⇒ 代理人仍须由全流程委托并入。Java 参考实现既有测试
+// JdbcProcessExtRepositoryTest#testSurrogateCrudAndGet 钉的正是「精确已过期 → 兜底全流程」。
+func TestSurrogateIneffectiveExactRowStillFallsBackToAllFlow(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	ensureExtTables(t, db)
+	cleanup(t, db)
+	defer cleanup(t, db)
+	ctx := context.Background()
+
+	insertDefine(t, db, "surr116", []byte(surrFlowContent))
+	repo := jdbc.New(db)
+	ext := jdbc.NewExt(db)
+	delAll := func() {
+		_, _ = db.ExecContext(ctx, ph("DELETE FROM wf_process_surrogate WHERE operator = ?"), "zhangsan")
+	}
+	delAll()
+	defer delAll()
+
+	now := time.Now()
+	at := func(off time.Duration) *time.Time { p := now.Add(off); return &p }
+	cases := []struct {
+		name       string
+		agent      string
+		start, end *time.Time
+		enabled    int
+		wantAgent  string
+	}{
+		{"窗外（未来）⇒ 回落", "wangwu", at(9 * time.Hour), at(10 * time.Hour), 1, "lisi"},
+		{"窗外（已过期）⇒ 回落", "wangwu", at(-10 * time.Hour), at(-9 * time.Hour), 1, "lisi"},
+		{"enabled=0 ⇒ 回落", "wangwu", at(-time.Hour), at(time.Hour), 0, "lisi"},
+		{"enabled=2 脏值 ⇒ 回落", "wangwu", at(-time.Hour), at(time.Hour), 2, "lisi"},
+		{"自委托 ⇒ 回落", "zhangsan", at(-time.Hour), at(time.Hour), 1, "lisi"},
+		{"正向对照：精确生效 ⇒ 用精确的代理人", "wangwu", at(-time.Hour), at(time.Hour), 1, "wangwu"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			delAll()
+			putSurrogate(t, ext, "zhangsan", "lisi", "", at(-time.Hour), at(time.Hour), 1)
+			putSurrogate(t, ext, "zhangsan", c.agent, "surr116", c.start, c.end, c.enabled)
+
+			// 夹具自证：确有两条、且最新那条是本流程那条（否则"回落"是空转）
+			var cnt int
+			var newestName string
+			if err := db.QueryRowContext(ctx, ph(
+				"SELECT COUNT(*) FROM wf_process_surrogate WHERE operator = ?"), "zhangsan").Scan(&cnt); err != nil || cnt != 2 {
+				t.Fatalf("台账应有 2 条，实际 cnt=%d err=%v", cnt, err)
+			}
+			if err := db.QueryRowContext(ctx, ph(
+				"SELECT process_name FROM wf_process_surrogate WHERE operator = ? ORDER BY id DESC LIMIT 1"),
+				"zhangsan").Scan(&newestName); err != nil || newestName != "surr116" {
+				t.Fatalf("最新一条应落在 surr116 作用域，实际 %q err=%v", newestName, err)
+			}
+
+			eng := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli() * 1000}, nil,
+				engine.WithSurrogateRepository(ext))
+			actors := startSurrFlow(t, db, eng, repo)
+			if len(actors) != 2 || !hasActor(actors, "zhangsan") || !hasActor(actors, c.wantAgent) {
+				t.Fatalf("%s：期望 [zhangsan %s]，读回 %v", c.name, c.wantAgent, actors)
+			}
+			if c.wantAgent == "lisi" && hasActor(actors, "wangwu") {
+				t.Fatalf("%s：本流程那条不生效，wangwu 不得进参与者，读回 %v", c.name, actors)
+			}
+			if c.wantAgent == "wangwu" && hasActor(actors, "lisi") {
+				t.Fatalf("%s：精确作用域生效时全流程代理人不得并列，读回 %v", c.name, actors)
+			}
+		})
+	}
+}
+
+// TestSurrogateNewestRowDecidesNoMerge 同一授权人+同一流程先有一条「窗内 enabled=1」，
+// 之后用户再新建一条**更新**的窗外 / enabled=0 / enabled=2 脏值 / 自委托记录：
+// 建单时必须**不**并入代理人——规范 06 §4.5 条款 1.4 要求「先按 id 取最新一条，再由四判据
+// 裁决这一条」。反过来写（SQL 先把不生效的滤掉，剩下的才取最新）等价于
+// 「历史上留过一条窗内委托就永久生效」，正是 issues/123 里 13 栈 L2-17/L2-18 全红的成因。
+//
+// 每组都配一条正向对照（最新一条窗内 enabled=1 ⇒ 必须并入），防判据被写反成「恒不并入」
+// 后本用例仍空转绿（issues/123 任务 B）。
+func TestSurrogateNewestRowDecidesNoMerge(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	ensureExtTables(t, db)
+	cleanup(t, db)
+	defer cleanup(t, db)
+	ctx := context.Background()
+
+	insertDefine(t, db, "surr116", []byte(surrFlowContent))
+	repo := jdbc.New(db)
+	ext := jdbc.NewExt(db)
+	delAll := func() {
+		_, _ = db.ExecContext(ctx, ph("DELETE FROM wf_process_surrogate WHERE operator = ?"), "zhangsan")
+	}
+	delAll()
+	defer delAll()
+
+	now := time.Now()
+	at := func(off time.Duration) *time.Time { p := now.Add(off); return &p }
+
+	cases := []struct {
+		name               string
+		agent              string
+		start, end         *time.Time
+		enabled            int
+		newestMustBeMerged bool
+	}{
+		{"A1 最新一条窗外（未来窗口）", "lisi", at(9 * time.Hour), at(10 * time.Hour), 1, false},
+		{"A2 最新一条窗外（已过期）", "lisi", at(-10 * time.Hour), at(-9 * time.Hour), 1, false},
+		{"A3 最新一条 enabled=0", "lisi", at(-time.Hour), at(time.Hour), 0, false},
+		{"A4 最新一条 enabled=2 脏值", "lisi", at(-time.Hour), at(time.Hour), 2, false},
+		{"A5 最新一条自委托", "zhangsan", at(-time.Hour), at(time.Hour), 1, false},
+		{"B 正向对照：最新一条窗内 enabled=1 ⇒ 并入", "lisi", at(-time.Hour), at(time.Hour), 1, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			delAll() // 每组从"只有一条窗内生效行"开始
+			// 更旧的一条：窗内 + enabled=1 —— 旧写法会把它当成"最新生效行"永远命中
+			putSurrogate(t, ext, "zhangsan", "lisi", "surr116", at(-time.Hour), at(time.Hour), 1)
+			// 更新的一条：按某判据不生效（正向对照组则是生效的）
+			putSurrogate(t, ext, "zhangsan", c.agent, "surr116", c.start, c.end, c.enabled)
+
+			// 种子自证：台账确有两条，"不并入"不是因为数据没进去（issues/113 教训）
+			var cnt int
+			if err := db.QueryRowContext(ctx, ph(
+				"SELECT COUNT(*) FROM wf_process_surrogate WHERE operator = ?"), "zhangsan").Scan(&cnt); err != nil || cnt != 2 {
+				t.Fatalf("%s：台账应有 2 条（更旧生效行 + 最新一条），实际 cnt=%d err=%v", c.name, cnt, err)
+			}
+
+			eng := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli() * 1000}, nil,
+				engine.WithSurrogateRepository(ext))
+			actors := startSurrFlow(t, db, eng, repo)
+			if c.newestMustBeMerged {
+				if !hasActor(actors, "lisi") || !hasActor(actors, "zhangsan") {
+					t.Fatalf("%s：最新一条生效 ⇒ 代理人应并入且授权人保留，读回 %v", c.name, actors)
+				}
+				if len(actors) != 2 {
+					t.Fatalf("%s：参与者 = %v, want [zhangsan lisi]", c.name, actors)
+				}
+				return
+			}
+			if len(actors) != 1 || actors[0] != "zhangsan" {
+				t.Fatalf("%s：最新一条不生效 ⇒ 不得并入代理人、也不得回落到更旧那条，读回 %v", c.name, actors)
+			}
+		})
+	}
+}

@@ -317,27 +317,45 @@ func (r *ExtRepository) PageSurrogates(ctx context.Context, query spi.PageQuery)
 }
 
 func (r *ExtRepository) GetSurrogate(ctx context.Context, operator, processName string, at time.Time) (*model.ProcessSurrogate, error) {
-	// 1. 精确匹配流程
-	hit, err := r.querySurrogate(ctx, operator, processName, at)
-	if err != nil || hit != nil {
-		return hit, err
+	// 规范 06 §4.5 条款 1.4 + issues/123：同一作用域内多条并存时按主键 id 取**最新一条**，
+	// 再交 model.ProcessSurrogate.IsEffective 裁决四判据。反过来写（SQL 先把 enabled / 时间窗 /
+	// 自委托滤掉，剩下的才排序取最新）等价于"历史上留过一条窗内 enabled=1 就永久生效"——
+	// 用户随后改停用、把窗口挪到未来都不算数，这正是 issues/123 里 A 组 9 栈的成因。
+	// 精确流程作用域只要**存在**记录，就由它自己的最新一条裁决，同层内不得回落到更旧那条。
+	// 但"本流程这条不生效"≠"用户没有全流程委托"：仍要看全流程作用域的最新一条——
+	// Java 参考实现既有测试 JdbcProcessExtRepositoryTest#testSurrogateCrudAndGet 钉的正是
+	// 「精确已过期 → 兜底全流程」，跨栈必须同答案。
+	newest, err := r.queryNewestSurrogate(ctx, operator, processName)
+	if err != nil {
+		return nil, err
 	}
-	// 2. 全流程委托兜底（process_name 为空）
-	return r.querySurrogate(ctx, operator, "", at)
+	if newest.IsEffective(operator, at) {
+		return newest, nil
+	}
+	if processName == "" {
+		return nil, nil
+	}
+	// 精确作用域判否（或该作用域压根没有记录）⇒ 回落全流程作用域，同样先取最新一条再裁决
+	global, err := r.queryNewestSurrogate(ctx, operator, "")
+	if err != nil {
+		return nil, err
+	}
+	if !global.IsEffective(operator, at) {
+		return nil, nil
+	}
+	return global, nil
 }
 
-func (r *ExtRepository) querySurrogate(ctx context.Context, operator, processName string, at time.Time) (*model.ProcessSurrogate, error) {
-	sqlStr := "SELECT " + surrogateCols + " FROM wf_process_surrogate WHERE operator = ? AND enabled = 1 AND surrogate <> ?"
-	args := []interface{}{operator, operator}
+// queryNewestSurrogate 取该授权人在指定流程作用域内**最新的一条**委托：
+// 只按 id 排序取首行，不带任何生效判据（enabled / 时间窗 / 自委托一律不滤，交由调用方裁决）。
+func (r *ExtRepository) queryNewestSurrogate(ctx context.Context, operator, processName string) (*model.ProcessSurrogate, error) {
+	sqlStr := "SELECT " + surrogateCols + " FROM wf_process_surrogate WHERE operator = ?"
+	args := []interface{}{operator}
 	if processName == "" {
 		sqlStr += " AND (process_name IS NULL OR process_name = '')"
 	} else {
 		sqlStr += " AND process_name = ?"
 		args = append(args, processName)
-	}
-	if !at.IsZero() {
-		sqlStr += " AND (start_time IS NULL OR start_time <= ?) AND (end_time IS NULL OR end_time >= ?)"
-		args = append(args, at, at)
 	}
 	sqlStr += " ORDER BY id DESC LIMIT 1"
 	rows, err := r.conn(ctx).QueryContext(ctx, sqlStr, args...)

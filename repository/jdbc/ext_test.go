@@ -143,7 +143,9 @@ func TestExtSurrogateGet(t *testing.T) {
 		t.Fatalf("save surrogate spec: %v", err)
 	}
 
-	// leave：精确匹配已过期 → 兜底全流程
+	// leave：精确匹配已过期 → 兜底全流程（Java 参考实现 JdbcProcessExtRepositoryTest#
+	// testSurrogateCrudAndGet 同数据集同结论；规范 06 §4.5 条款 1.4 的「判否仍要看全流程作用域」。
+	// 同作用域内"不得回落到更旧生效行"由 surrogate_test.go 的 TestSurrogateNewestRowDecidesNoMerge 钉。
 	hit, err := ext.GetSurrogate(ctx, "goext-op", "leave", now)
 	if err != nil || hit == nil || hit.Surrogate != "agent-all" {
 		t.Fatalf("getSurrogate = %+v err=%v, want agent-all（兜底）", hit, err)

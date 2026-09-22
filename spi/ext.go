@@ -30,7 +30,12 @@ type ProcessExtRepository interface {
 	RemoveSurrogate(ctx context.Context, id int64) error
 	PageSurrogates(ctx context.Context, query PageQuery) ([]*model.ProcessSurrogate, int, error)
 
-	// GetSurrogate 查询指定时间生效中的委托：enabled=1 且时间窗内（起止为空表示不限）。
+	// GetSurrogate 查询指定时间生效中的委托（规范 06 §4.5 条款 1.4 + issues/123）：
+	// 先按主键 id 取该授权人在该流程作用域内的**最新一条**（不带生效判据过滤），再由
+	// model.ProcessSurrogate.IsEffective 裁决四判据（enabled 严格 ==1 / 时间窗覆盖 at，
+	// 起止为空 = 该侧不限 / 自委托不生效）；at 为零值时不做窗口比较。
+	// 同层内最新一条判否 ⇒ 直接返回 nil，**不得**回落到该层更旧的记录；
+	// 但精确作用域判否（含无记录）后仍要看 processName 为空的"全流程委托"作用域的最新一条。
 	// 优先 processName 精确匹配，其次 processName 为空的"全流程委托"兜底。
 	GetSurrogate(ctx context.Context, operator, processName string, at time.Time) (*model.ProcessSurrogate, error)
 }

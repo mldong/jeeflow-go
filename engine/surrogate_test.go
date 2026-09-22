@@ -186,6 +186,153 @@ func TestSurrogateAutoApplyAllFlowFallback(t *testing.T) {
 	}
 }
 
+// ─── issues/123 任务 A/B（内存仓 + 建单落库断言）───────────────────────────────
+
+// TestSurrogateIneffectiveExactRowStillFallsBackToAllFlow 钉跨作用域回落：
+// 全流程委托（processName 空、窗内 enabled=1、更旧）+ 针对本流程的一条**更新但不生效**的委托
+// ⇒ 代理人仍须由全流程委托并入（"本流程这条废了"不等于"我没委托"）。
+// 这与 Java 参考实现既有测试 JdbcProcessExtRepositoryTest#testSurrogateCrudAndGet 同数据集同结论；
+// 写成"精确作用域只要存在记录就不回落"会把这五格判成不并入，与 Java 分叉。
+// 正向对照另钉精确优先：本流程那条生效时用本流程的代理人，全流程那条不得盖它。
+func TestSurrogateIneffectiveExactRowStillFallsBackToAllFlow(t *testing.T) {
+	now := time.Now()
+	at := func(off time.Duration) *time.Time { p := now.Add(off); return &p }
+	cases := []struct {
+		name       string
+		agent      string
+		start, end *time.Time
+		enabled    int
+		wantAgent  string
+	}{
+		{"窗外（未来）⇒ 回落", "wangwu", at(9 * time.Hour), at(10 * time.Hour), 1, "lisi"},
+		{"窗外（已过期）⇒ 回落", "wangwu", at(-10 * time.Hour), at(-9 * time.Hour), 1, "lisi"},
+		{"enabled=0 ⇒ 回落", "wangwu", at(-time.Hour), at(time.Hour), 0, "lisi"},
+		{"enabled=2 脏值 ⇒ 回落", "wangwu", at(-time.Hour), at(time.Hour), 2, "lisi"},
+		{"自委托 ⇒ 回落", "zhangsan", at(-time.Hour), at(time.Hour), 1, "lisi"},
+		{"正向对照：精确生效 ⇒ 用精确的代理人", "wangwu", at(-time.Hour), at(time.Hour), 1, "wangwu"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ext := memory.NewExt()
+			eng, repo, defID := newHarness(t, "surr116", flowSingle, ext)
+			// 更旧的一条：全流程作用域 + 窗内 + enabled=1
+			putSurr(t, ext, "zhangsan", "lisi", "", at(-time.Hour), at(time.Hour), 1)
+			// 更新的一条：本流程作用域，按判据不生效（正向对照组生效）
+			putSurr(t, ext, "zhangsan", c.agent, "surr116", c.start, c.end, c.enabled)
+
+			// 夹具自证：两条都在、id 序正确、最新那条落在本流程作用域
+			all, _ := ext.FindSurrogateByID(context.Background(), 1)
+			newest, _ := ext.FindSurrogateByID(context.Background(), 2)
+			if all == nil || newest == nil || !(newest.ID > all.ID) ||
+				all.ProcessName != "" || newest.ProcessName != "surr116" {
+				t.Fatalf("夹具失效: all=%+v newest=%+v", all, newest)
+			}
+
+			actors := startOneTaskActor(t, eng, repo, defID)
+			if len(actors) != 2 || countOf(actors, "zhangsan") != 1 || countOf(actors, c.wantAgent) != 1 {
+				t.Fatalf("%s：期望 [zhangsan %s]，读回 %v", c.name, c.wantAgent, actors)
+			}
+			if c.wantAgent == "lisi" && countOf(actors, "wangwu") != 0 {
+				t.Fatalf("%s：本流程那条不生效，wangwu 不得进参与者，读回 %v", c.name, actors)
+			}
+			if c.wantAgent == "wangwu" && countOf(actors, "lisi") != 0 {
+				t.Fatalf("%s：精确作用域生效时全流程代理人不得并列，读回 %v", c.name, actors)
+			}
+		})
+	}
+}
+
+// TestSurrogateNewestRowDecidesNoMerge 同一授权人+同一流程先有一条「窗内 enabled=1」，
+// 之后再新建一条**更新**的窗外 / enabled=0 / enabled=2 脏值 / 自委托记录：
+// 建单时必须**不**并入代理人（规范 06 §4.5 条款 1.4：先按 id 取最新一条，再由四判据裁决
+// 这一条；不生效即不命中，**不得**回落到更旧那条）。
+// 旧形状（先按判据过滤、剩下的才取最新）在这四组里都会答成"并入"—— issues/123 的病灶。
+// 与 SQL 仓 repository/jdbc/surrogate_test.go 同名用例同数据集，两仓必须同答案。
+func TestSurrogateNewestRowDecidesNoMerge(t *testing.T) {
+	now := time.Now()
+	at := func(off time.Duration) *time.Time { p := now.Add(off); return &p }
+	cases := []struct {
+		name               string
+		agent              string
+		start, end         *time.Time
+		enabled            int
+		newestMustBeMerged bool
+	}{
+		{"A1 最新一条窗外（未来窗口）", "lisi", at(9 * time.Hour), at(10 * time.Hour), 1, false},
+		{"A2 最新一条窗外（已过期）", "lisi", at(-10 * time.Hour), at(-9 * time.Hour), 1, false},
+		{"A3 最新一条 enabled=0", "lisi", at(-time.Hour), at(time.Hour), 0, false},
+		{"A4 最新一条 enabled=2 脏值", "lisi", at(-time.Hour), at(time.Hour), 2, false},
+		{"A5 最新一条自委托", "zhangsan", at(-time.Hour), at(time.Hour), 1, false},
+		{"B 正向对照：最新一条窗内 enabled=1 ⇒ 并入", "lisi", at(-time.Hour), at(time.Hour), 1, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ext := memory.NewExt()
+			eng, repo, defID := newHarness(t, "surr116", flowSingle, ext)
+			// 更旧的一条：窗内 + enabled=1 —— 旧形状会把它当成"最新生效行"永远命中
+			putSurr(t, ext, "zhangsan", "lisi", "surr116", at(-time.Hour), at(time.Hour), 1)
+			// 更新的一条：按某判据不生效（正向对照组则是生效的）
+			putSurr(t, ext, "zhangsan", c.agent, "surr116", c.start, c.end, c.enabled)
+
+			// 种子自证：两条都落库、且新建那条 id 更大，否则"不并入"是因数据没进去而空转
+			older, err := ext.FindSurrogateByID(context.Background(), 1)
+			if err != nil || older == nil {
+				t.Fatalf("更旧那条生效委托未落库: %+v err=%v", older, err)
+			}
+			newest, err := ext.FindSurrogateByID(context.Background(), 2)
+			if err != nil || newest == nil {
+				t.Fatalf("最新那条委托未落库: %+v err=%v", newest, err)
+			}
+			if !(newest.ID > older.ID) {
+				t.Fatalf("夹具失效：最新一条 id=%d 未大于更旧一条 id=%d", newest.ID, older.ID)
+			}
+
+			actors := startOneTaskActor(t, eng, repo, defID)
+			if c.newestMustBeMerged {
+				if countOf(actors, "lisi") != 1 || countOf(actors, "zhangsan") != 1 {
+					t.Fatalf("%s：最新一条生效 ⇒ 代理人应并入且授权人保留，读回 %v", c.name, actors)
+				}
+				if len(actors) != 2 {
+					t.Fatalf("%s：参与者 = %v, want [zhangsan lisi]", c.name, actors)
+				}
+				return
+			}
+			if len(actors) != 1 || actors[0] != "zhangsan" {
+				t.Fatalf("%s：最新一条不生效 ⇒ 不得并入代理人、也不得回落到更旧那条，读回 %v", c.name, actors)
+			}
+		})
+	}
+}
+
+// 空 processName 全流程兜底在**最新一条不生效**时同样不得跨作用域回落（issues/123 判据 4）
+// TestSurrogateIneffectiveExactRowFallsBackToAllFlow 跨作用域回落（条款 1.4 的后半句）：
+// 全流程委托（生效、id 更小）+ 本流程作用域的最新一条停用 ⇒ 仍须由全流程委托并入。
+// 「本流程这条废了」不等于「我没委托」；Java 参考实现的既有测试
+// JdbcProcessExtRepositoryTest#testSurrogateCrudAndGet 用同一形状钉的是"兜底命中"。
+func TestSurrogateIneffectiveExactRowFallsBackToAllFlow(t *testing.T) {
+	ext := memory.NewExt()
+	eng, repo, defID := newHarness(t, "surr116", flowSingle, ext)
+	now := time.Now()
+	// 全流程委托（生效、id 更小）
+	putSurr(t, ext, "zhangsan", "lisi", "", ptrOf(now.Add(-time.Hour)), ptrOf(now.Add(time.Hour)), 1)
+	// 本流程作用域里的最新一条：停用 ⇒ 本层判否，仍要看全流程作用域那条
+	putSurr(t, ext, "zhangsan", "lisi2", "surr116", ptrOf(now.Add(-time.Hour)), ptrOf(now.Add(time.Hour)), 0)
+	actors := startOneTaskActor(t, eng, repo, defID)
+	if len(actors) != 2 || countOf(actors, "zhangsan") != 1 || countOf(actors, "lisi") != 1 {
+		t.Fatalf("精确作用域最新一条停用 ⇒ 应回落全流程委托，期望 [zhangsan lisi]，读回 %v", actors)
+	}
+	if countOf(actors, "lisi2") != 0 {
+		t.Fatalf("停用那条的代理人不得进参与者，读回 %v", actors)
+	}
+	// 对照：删掉精确作用域那条后仍命中同一条全局委托——证明上面的并入来自全局行而非夹具空转
+	if err := ext.RemoveSurrogate(context.Background(), 2); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if actors = startOneTaskActor(t, eng, repo, defID); countOf(actors, "lisi") != 1 {
+		t.Fatalf("删掉精确作用域那条后，全流程委托应兜底并入，读回 %v", actors)
+	}
+}
+
 // ─── ③ 未配置扩展仓储：静默跳过，不打断建单 ───────────────────────────────────
 
 func TestSurrogateNoExtRepoDoesNotBreakStart(t *testing.T) {

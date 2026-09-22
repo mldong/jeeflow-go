@@ -233,48 +233,42 @@ func surrogateFields(s *model.ProcessSurrogate) map[string]interface{} {
 
 // GetSurrogate 查询指定时间生效中的委托。
 //
-// 判据与 JDBC 实现（repository/jdbc/ext.go querySurrogate）**逐条等价**（issues/116 §5：
-// 同一份数据在同一栈的内存仓与 SQL 仓不得给出不同结论）：
-//  1. enabled 只认 1（其余值含 0 一律不生效）；
-//  2. 时间窗 start<=at<=end，任一侧为 nil 表示该侧不限（at 为零值时整窗不限，
-//     对齐 SQL 侧 `if !at.IsZero()` 分支）；
-//  3. 自委托过滤 surrogate <> operator（自己委托给自己不生效）——本方法此前缺这条，
-//     与 JDBC 侧 `AND surrogate <> ?` 分叉，同栈两仓结论相反；
-//  4. 先按 processName 精确匹配，未命中再用空 processName（全流程委托）兜底；
-//  5. 多行命中取 ID 最大者（对齐 SQL `ORDER BY id DESC LIMIT 1`）。内存 map 遍历序随机，
-//     不显式取最大即"同一份数据两次调用可能返回不同行"。
+// 与 SQL 仓（repository/jdbc/ext.go GetSurrogate）同形（规范 06 §4.5 条款 1.4 + issues/123）：
+// 先在指定流程作用域内按 ID 取**最新一条**，交 model.ProcessSurrogate.IsEffective 裁决四判据
+// （enabled 只认 1 / 时间窗 start<=at<=end 且任一侧 nil = 该侧不限 / 自委托过滤）；
+// 该作用域判否（含压根没有记录）再看"全流程委托"（processName 为空）作用域的最新一条。
+//
+// ⚠️ 不得"先滤生效再取最新"（issues/123 的成因）：那样只要历史上留过一条窗内且 enabled=1
+// 的记录，用户随后新建的窗外 / enabled=0 / 脏值 / 自委托记录就都判不动它。
+// 同层内判否就不许回落到更旧那条；跨层（精确 → 全流程）必须回落，Java 参考实现既有测试
+// JdbcProcessExtRepositoryTest#testSurrogateCrudAndGet 钉的正是「精确已过期 → 兜底全流程」。
+// 内存 map 遍历序随机，取最新必须显式按 ID 比较（对齐 SQL `ORDER BY id DESC LIMIT 1`），
+// 否则同一份数据两次调用可能返回不同行（08-compliance 用例 27 要求双仓同答案）。
 func (r *ExtRepository) GetSurrogate(ctx context.Context, operator, processName string, at time.Time) (*model.ProcessSurrogate, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if processName != "" {
-		if hit := r.pickSurrogateLocked(operator, processName, at, false); hit != nil {
-			return hit, nil
-		}
+	newest := r.newestInScopeLocked(operator, processName, false)
+	if newest.IsEffective(operator, at) {
+		return newest, nil
 	}
-	return r.pickSurrogateLocked(operator, "", at, true), nil
+	if processName == "" {
+		return nil, nil
+	}
+	global := r.newestInScopeLocked(operator, "", true)
+	if !global.IsEffective(operator, at) {
+		return nil, nil
+	}
+	return global, nil
 }
 
-// pickSurrogateLocked 按判据取一条生效委托；allFlows=true 表示只匹配"全流程委托"
-// （process_name 为空）。调用方须持读锁。
-func (r *ExtRepository) pickSurrogateLocked(operator, processName string, at time.Time, allFlows bool) *model.ProcessSurrogate {
+// newestInScopeLocked 取该授权人在指定流程作用域内 ID 最大（最新）的一条委托，
+// 不带任何生效判据过滤；allFlows=true 表示只看"全流程委托"（processName 为空）。
+// 调用方须持读锁。
+func (r *ExtRepository) newestInScopeLocked(operator, processName string, allFlows bool) *model.ProcessSurrogate {
 	var hit *model.ProcessSurrogate
 	for _, s := range r.surrogates {
 		if s.Operator != operator {
 			continue
-		}
-		if s.Enabled != 1 {
-			continue
-		}
-		if s.Surrogate == operator {
-			continue
-		}
-		if !at.IsZero() {
-			if s.StartTime != nil && s.StartTime.After(at) {
-				continue
-			}
-			if s.EndTime != nil && s.EndTime.Before(at) {
-				continue
-			}
 		}
 		if allFlows {
 			if s.ProcessName != "" {
