@@ -1,0 +1,3 @@
+# 建表 SQL 副本由 jeeflow-hub/scripts/sync-schema.sh 分发：blob 与工作树一律 LF，
+# 否则维护机 core.autocrlf=true 会把副本检出成 CRLF，每次分发后都被报"已修改"。
+*.sql text eol=lf
