@@ -3077,3 +3077,105 @@ func toStringSlice2Any(list []interface{}) []string {
 	}
 	return out
 }
+
+// TestVariablesOnlyExitViaExt issues/124：变量唯一对外出口是 ext（任务侧另有 instanceExt），
+// variables 全集与 variable/instanceVariable 原串不再出现在门面出口
+func TestVariablesOnlyExitViaExt(t *testing.T) {
+	f, repo, _ := setupFacade()
+	content := string(flowContent(t, "01-simple.json"))
+	r := f.Flow("processDefine/deploy", map[string]interface{}{"content": content})
+	defineID := mustI64(r["data"].(map[string]interface{})["processDefineId"])
+
+	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": defineID, "operator": "zhangsan", "f_reasonType": "休假", "f_amount": 500,
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("startAndExecute failed: %v", r)
+	}
+	instanceID := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
+
+	// 正向：detail.ext = 实例变量全集（键形态与列表行 ext 一致），详情头部两键有真值
+	r = f.Flow("processInstance/detail", map[string]interface{}{"id": instanceID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("detail failed: %v", r)
+	}
+	data := r["data"].(map[string]interface{})
+	ext, ok := data["ext"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("detail 应含 ext 容器（issues/124）: %v", data)
+	}
+	if ext["f_reasonType"] != "休假" {
+		t.Fatalf("ext.f_reasonType = %v", ext["f_reasonType"])
+	}
+	if v, _ := ext["u_realName"].(string); v == "" {
+		t.Fatalf("详情头部发起人 ext.u_realName 应有真值: %v", ext)
+	}
+	if v, _ := ext["autoGenTitle"].(string); v == "" {
+		t.Fatalf("详情头部标题 ext.autoGenTitle 应有值: %v", ext)
+	}
+	for _, banned := range []string{"variables", "variable"} {
+		if _, exists := data[banned]; exists {
+			t.Fatalf("detail 出口不应含 %s（issues/124）: %v", banned, data)
+		}
+	}
+
+	// 行出口：variable/instanceVariable 原串不出现，ext/instanceExt 仍在
+	r = f.Flow("processInstance/page", map[string]interface{}{"operator": "zhangsan"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("page failed: %v", r)
+	}
+	irow := r["data"].(map[string]interface{})["rows"].([]interface{})[0].(map[string]interface{})
+	if _, exists := irow["variable"]; exists {
+		t.Fatalf("实例行不应含 variable 原串: %v", irow)
+	}
+	if _, ok := irow["ext"]; !ok {
+		t.Fatalf("实例行应含 ext")
+	}
+
+	r = f.Flow("processTask/todoList", map[string]interface{}{"operator": "leader"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("todoList failed: %v", r)
+	}
+	trow := r["data"].(map[string]interface{})["rows"].([]interface{})[0].(map[string]interface{})
+	for _, banned := range []string{"variable", "instanceVariable"} {
+		if _, exists := trow[banned]; exists {
+			t.Fatalf("任务行不应含 %s 原串: %v", banned, trow)
+		}
+	}
+	if _, ok := trow["ext"]; !ok {
+		t.Fatalf("任务行应含 ext")
+	}
+	if _, ok := trow["instanceExt"]; !ok {
+		t.Fatalf("任务行应含 instanceExt")
+	}
+
+	// taskDetail 顶层 taskFormData（对齐 java 出口装配）
+	r = f.Flow("processTask/detail", map[string]interface{}{"id": mustI64(trow["id"]), "operator": "leader"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("taskDetail failed: %v", r)
+	}
+	if _, ok := r["data"].(map[string]interface{})["taskFormData"]; !ok {
+		t.Fatalf("taskDetail 顶层应含 taskFormData: %v", r["data"])
+	}
+
+	// 负向：变量为空的实例 ext 出 {} 而非 null/缺键
+	inst, err := repo.FindInstanceByID(context.Background(), instanceID)
+	if err != nil || inst == nil {
+		t.Fatalf("FindInstanceByID: %v", err)
+	}
+	inst.Variables = nil
+	if err := repo.UpdateInstance(context.Background(), inst); err != nil {
+		t.Fatalf("UpdateInstance: %v", err)
+	}
+	r = f.Flow("processInstance/detail", map[string]interface{}{"id": instanceID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("detail(空变量) failed: %v", r)
+	}
+	data = r["data"].(map[string]interface{})
+	if _, exists := data["ext"]; !exists {
+		t.Fatalf("变量为空时 detail.ext 键应存在: %v", data)
+	}
+	if m, ok := data["ext"].(map[string]interface{}); !ok || len(m) != 0 {
+		t.Fatalf("变量为空时 ext 应为空对象而非 %v", data["ext"])
+	}
+}

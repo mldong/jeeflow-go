@@ -994,7 +994,7 @@ func surrogateRowToMap(s *model.ProcessSurrogate) map[string]interface{} {
 	return map[string]interface{}{
 		"id": s.ID, "processName": s.ProcessName, "operator": s.Operator, "surrogate": s.Surrogate,
 		"startTime": fmtTime(s.StartTime), "endTime": fmtTime(s.EndTime),
-		"enabled": s.Enabled,
+		"enabled":    s.Enabled,
 		"createTime": fmtTimeV(s.CreateTime), "createUser": s.CreateUser,
 		"updateTime": fmtTimeV(s.UpdateTime), "updateUser": s.UpdateUser,
 	}
@@ -1285,8 +1285,8 @@ func (f *Facade) approvalRecord(args map[string]interface{}) (interface{}, error
 			"taskName": t.TaskName, "displayName": t.DisplayName,
 			"taskType": t.TaskType, "performType": t.PerformType,
 			"taskState": t.TaskState, "operator": t.ActorID,
-			"finishTime": fmtTime(t.FinishTime), "variable": t.Variables,
-			"ext": t.Variables, // issues/15：前端读 ext.tf_approvalComment
+			"finishTime": fmtTime(t.FinishTime),
+			"ext":        t.Variables, // issues/15：前端读 ext.tf_approvalComment；issues/124 variable 原串出口下线
 		})
 	}
 	return rows, nil
@@ -1389,8 +1389,9 @@ func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 		"taskType": task.TaskType, "performType": task.PerformType,
 		"taskState": task.TaskState, "operator": task.ActorID,
 		"formKey": task.FormKey, "taskActorIdList": actors,
-		"executable": task.IsAllowed(operator),
-		"ext": tExt,
+		"executable":   task.IsAllowed(operator),
+		"ext":          tExt,
+		"taskFormData": formDataOf(task.Variables, "tf_"), // issues/15 + 对齐 java taskDetail 顶层出口（issues/124 G4）
 	}
 	// taskModel：流程定义中对应节点
 	inst, _ := f.repo.FindInstanceByID(context.Background(), task.ProcessInstanceID)
@@ -2047,11 +2048,15 @@ func (f *Facade) instanceDetail(args map[string]interface{}) (interface{}, error
 	if err != nil || inst == nil {
 		return nil, errors.New("流程实例不存在")
 	}
+	instExt := inst.Variables
+	if instExt == nil { // issues/124：变量为空的实例 ext 出 {} 而非 null
+		instExt = map[string]interface{}{}
+	}
 	data := map[string]interface{}{
 		"id": inst.ID, "parentId": inst.ParentID, "processDefineId": inst.DefineID,
 		"state": inst.State, "parentNodeName": inst.ParentNodeName,
 		"businessNo": inst.BusinessNo, "operator": inst.Operator,
-		"variables": inst.Variables, "formData": formDataOf(inst.Variables, "f_"), // issues/15
+		"ext": instExt, "formData": formDataOf(inst.Variables, "f_"), // issues/15 + issues/124：ext 是变量唯一对外出口
 		"createTime": inst.CreateTime, "createUser": inst.CreateUser,
 	}
 	var graph map[string]interface{}
@@ -2163,7 +2168,7 @@ func (f *Facade) taskVo(t *model.ProcessTask) map[string]interface{} {
 		"displayName": t.DisplayName, "taskType": t.TaskType, "performType": t.PerformType,
 		"taskState": t.TaskState, "operator": t.ActorID, "finishTime": t.FinishTime,
 		"expireTime": t.ExpireTime, "formKey": t.FormKey, "taskParentId": t.ParentTaskID,
-		"variable": t.Variables, "createTime": t.CreateTime, "createUser": t.CreateUser,
+		"createTime": t.CreateTime, "createUser": t.CreateUser,
 		"updateTime": t.UpdateTime, "updateUser": t.UpdateUser, "taskActorIdList": t.ActorIDs,
 		"taskFormData": formDataOf(t.Variables, "tf_"), // issues/15
 	}
@@ -2267,7 +2272,7 @@ func instanceRowToMap(r *model.InstanceRow) map[string]interface{} {
 		"id": r.ID, "parentId": r.ParentID, "processDefineId": r.DefineID,
 		"state": r.State, "parentNodeName": r.ParentNodeName, "businessNo": r.BusinessNo,
 		"operator": r.Operator, "expireTime": fmtTime(r.ExpireTime),
-		"variable": r.Variables, "createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
+		"createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
 		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
 		"processDefineName": r.DefineName, "processDefineDisplayName": r.DefineDisplayName,
 		"processDefineVersion": r.DefineVersion,
@@ -2289,11 +2294,11 @@ func taskRowToMap(r *model.TaskRow) map[string]interface{} {
 		"displayName": r.DisplayName, "taskType": r.TaskType, "performType": r.PerformType,
 		"taskState": r.TaskState, "operator": r.Operator, "finishTime": fmtTime(r.FinishTime),
 		"expireTime": fmtTime(r.ExpireTime), "formKey": r.FormKey, "taskParentId": r.TaskParentID,
-		"variable": r.Variables, "createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
+		"createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
 		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
 		"processDefineName": r.ProcessDefineName, "processDefineDisplayName": r.ProcessDefineDisplayName,
-		"instanceVariable": r.InstanceVariable, "instanceCreateTime": fmtTimeV(r.InstanceCreateTime),
-		"ext": ext, "instanceExt": instanceExt, "version": r.DefineVersion,
+		"instanceCreateTime": fmtTimeV(r.InstanceCreateTime),
+		"ext":                ext, "instanceExt": instanceExt, "version": r.DefineVersion,
 		"taskFormData": formDataOf(r.Variables, "tf_"), // issues/15
 	}
 }
@@ -2304,7 +2309,7 @@ func ccRowToMap(r *model.CcInstanceRow) map[string]interface{} {
 		"id": r.ID, "parentId": r.ParentID, "processDefineId": r.DefineID,
 		"state": r.State, "parentNodeName": r.ParentNodeName, "businessNo": r.BusinessNo,
 		"operator": r.Operator, "expireTime": fmtTime(r.ExpireTime),
-		"variable": r.Variables, "createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
+		"createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
 		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
 		"processDefineName": r.DefineName, "processDefineDisplayName": r.DefineDisplayName,
 		"processDefineVersion": r.DefineVersion,
@@ -2720,8 +2725,8 @@ func (f *Facade) statsGroup(args map[string]interface{}) (interface{}, error) {
 			agg.totalDur += dur
 		}
 		type kv struct {
-			key   string
-			agg   *nodeAgg
+			key string
+			agg *nodeAgg
 		}
 		entries := make([]kv, 0, len(grouped))
 		for k, v := range grouped {
