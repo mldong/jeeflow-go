@@ -317,19 +317,26 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 	if pageSize <= 0 {
 		pageSize = 10
 	}
+	// issues/129 案 A 第二层（仓储兜底）：归属入参为空 ⇒ **空页**，绝不允许折叠成"这条条件不加"。
+	// 本栈"空串读出全库"的症状就发生在这里——以前 `if actorID != ""` 把空串读成"不过滤"，
+	// 于是 demo（内存仓，见 demo/controller.go 的 memory.New()）里 `{"operator":""}` 直接
+	// 返回**全部** cc 实例（谁的都混进来），而 user1 只该收到抄给他的那几条。
+	// 门面已把空串归一化成缺省 user1（facade.operatorArg），这一道防的是绕过门面直调仓储的
+	// 调用方与将来的门面改动，只留门面那半不算修完（同 Java buildWhere / Rust 1.0.17 两层）。
+	if blankOwnership(actorID) {
+		return []*model.CcInstanceRow{}, 0, nil
+	}
 	var rows []*model.CcInstanceRow
 	for instID, actors := range r.ccInstances {
-		if actorID != "" {
-			hit := false
-			for _, a := range actors {
-				if a == actorID {
-					hit = true
-					break
-				}
+		hit := false
+		for _, a := range actors {
+			if a == actorID {
+				hit = true
+				break
 			}
-			if !hit {
-				continue
-			}
+		}
+		if !hit {
+			continue
 		}
 		inst, ok := r.instances[instID]
 		if !ok {
@@ -431,9 +438,13 @@ func (r *Repository) PageDefines(ctx context.Context, query spi.PageQuery) ([]*m
 func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, operator string) ([]*model.InstanceRow, int, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	// issues/129 案 A 第二层：归属入参空 ⇒ 空页（判据同上 PageCcInstances，不再折叠成"不过滤"）
+	if blankOwnership(operator) {
+		return []*model.InstanceRow{}, 0, nil
+	}
 	var rows []*model.InstanceRow
 	for _, inst := range r.instances {
-		if operator != "" && inst.Operator != operator {
+		if inst.Operator != operator {
 			continue
 		}
 		row := &model.InstanceRow{
@@ -459,22 +470,17 @@ func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, ope
 func (r *Repository) PageTodoTasks(ctx context.Context, query spi.PageQuery, actorID string) ([]*model.TaskRow, int, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	// issues/129 案 A 第二层：归属入参空 ⇒ 空页（pta.actor_id 是归属列，空值不得折叠成"不过滤"）
+	if blankOwnership(actorID) {
+		return []*model.TaskRow{}, 0, nil
+	}
 	var rows []*model.TaskRow
 	for _, t := range r.tasks {
 		if t.TaskState != model.TaskStateDoing {
 			continue
 		}
-		if actorID != "" {
-			hit := false
-			for _, a := range r.actors[t.ID] {
-				if a == actorID {
-					hit = true
-					break
-				}
-			}
-			if !hit {
-				continue
-			}
+		if !containsStr(r.actors[t.ID], actorID) {
+			continue
 		}
 		row := r.taskRow(t)
 		fields := taskFields(row)
@@ -490,12 +496,17 @@ func (r *Repository) PageTodoTasks(ctx context.Context, query spi.PageQuery, act
 func (r *Repository) PageDoneTasks(ctx context.Context, query spi.PageQuery, operator string) ([]*model.TaskRow, int, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	// issues/129 案 A 第二层：归属入参空 ⇒ 空页（issues/117 §3.2 原话"operator 为空 → 返回空页，
+	// 不得返回全库"；以前这里是 `operator != "" &&` ⇒ 空串读成全库已办）
+	if blankOwnership(operator) {
+		return []*model.TaskRow{}, 0, nil
+	}
 	var rows []*model.TaskRow
 	for _, t := range r.tasks {
 		if t.TaskState == model.TaskStateDoing {
 			continue
 		}
-		if operator != "" && t.ActorID != operator {
+		if t.ActorID != operator {
 			continue
 		}
 		row := r.taskRow(t)
@@ -541,6 +552,12 @@ func defineFields(r *model.DefineRow) map[string]interface{} {
 // matchConditions 条件全匹配（操作符对齐 JDBC buildWhere；列不在字段中则跳过）
 func matchConditions(conditions []spi.Condition, fields map[string]interface{}) bool {
 	for _, c := range conditions {
+		// issues/129 案 A 第二层：归属谓词列 + 空值 ⇒ 该行不匹配（空页），不是"这条条件不加"。
+		// 只收归属列——下面那句 expect==nil 的放行是 m_LIKE_* 等**可选过滤**的通用行为，
+		// 照字面改成"空值即空页"会把可选过滤一起改坏（与 Java buildWhere/OWNERSHIP 同一判据）。
+		if ownershipColumns[c.Column] && strings.ToUpper(c.Operator) == "EQ" && blankCondValue(c.Value) {
+			return false
+		}
 		v, ok := fields[c.Column]
 		if !ok || v == nil {
 			continue
@@ -620,6 +637,36 @@ func containsAny(list []interface{}, v interface{}) bool {
 		}
 	}
 	return false
+}
+
+func containsStr(list []string, s string) bool {
+	for _, item := range list {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+// blankOwnership 归属入参判空（issues/129 案 A 第二层）：空串与全空白同判"空"。
+// 与 Java `(val instanceof String) && ((String) val).trim().isEmpty()` 同判据。
+func blankOwnership(s string) bool { return strings.TrimSpace(s) == "" }
+
+// blankCondValue 条件值判空（同 Java buildWhere 的 blankVal：nil 或全空白串）。
+func blankCondValue(val interface{}) bool {
+	if val == nil {
+		return true
+	}
+	if s, ok := val.(string); ok {
+		return strings.TrimSpace(s) == ""
+	}
+	return false
+}
+
+// ownershipColumns 归属谓词列（issues/129）：这几列定义"这条记录属于谁"，空值绝不能等于"不过滤"。
+// 列名与 JDBC 白名单/Java OWNERSHIP_COLUMNS 逐字一致（t.operator/pi.operator/pta.actor_id/cc.actor_id）。
+var ownershipColumns = map[string]bool{
+	"t.operator": true, "pi.operator": true, "pta.actor_id": true, "cc.actor_id": true,
 }
 
 // compareValues 值比较：数字可比则数值比较，否则字符串比较

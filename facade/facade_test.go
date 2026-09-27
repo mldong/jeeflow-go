@@ -3179,3 +3179,199 @@ func TestVariablesOnlyExitViaExt(t *testing.T) {
 		t.Fatalf("变量为空时 ext 应为空对象而非 %v", data["ext"])
 	}
 }
+
+// ═══ issues/129 案 A：operator 空串与缺键同档（spec 06-facade.md §2.5）═══════════
+//
+// 裁定语义（owner 2026-09-28 拍 A）：
+//   ① 空串/全空白串 == 缺键 ⇒ 一并回落 demo 缺省 user1（门面归一化，第一层）；
+//   ② 仓储拿到空的归属入参/空的归属列条件 ⇒ **空页**，绝不允许折叠成"这条条件不加"（第二层）；
+//   ③ 只收归属谓词列，m_LIKE_* 等可选过滤的"空值当作没填"通用放行保持不动。
+//
+// 本栈的"空串⇒读全库"落在**内存仓**（demo/160 go 镜像跑的正是 memory.New()，
+// 见 demo/controller.go:36 + seedBusiness 的 16 进行中 + 9 已完成 = 25 行）：
+// memory/repository.go 四条 page 以前写的是 `if actorID != ""` ⇒ 空串走"不过滤"分支。
+
+// issue129Seed 造一份"两个用户都有行、且行数不等"的夹具：
+// user1 起 2 单、userB 起 1 单 ⇒ 三档读数互不相等，"读全库"必然露形。
+// 两侧都非空是刻意的：空仓上"空串档 == 缺键档 == user1 档"是 0==0 恒真的自等假绿
+// （rust 1.0.17 门票同一条教训）。
+func issue129Seed(t *testing.T, f *facade.Facade, repo *memory.Repository) {
+	t.Helper()
+	mustOk(t, f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))}))
+	defID := mustDefineID(t, repo, "simple")
+	start := func(who string) {
+		r := f.Flow("processInstance/startAndExecute", map[string]interface{}{"processDefineId": defID, "operator": who})
+		mustOk(t, r)
+		instID := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
+		// startAndExecute 已自动办结 apply 任务（办理人 = who）⇒ who 的"我已办"必有 1 行
+		taskID := doingTaskID(t, repo, instID, "task1")
+		if taskID == 0 {
+			t.Fatalf("夹具前置：%s 的单应剩 task1 进行中，实际没有", who)
+		}
+		// 加签发起人本人 ⇒ 该单进"我的待办"（pta.actor_id）
+		mustOk(t, f.Flow("processTask/addCandidate", map[string]interface{}{
+			"processTaskId": taskID, "actorIds": []interface{}{who},
+		}))
+		// 抄送发起人本人 ⇒ 该单进"我的抄送"（cc.actor_id）
+		mustOk(t, f.Flow("processInstance/createCCInstance", map[string]interface{}{
+			"processInstanceId": instID, "actorIds": []interface{}{who}, "operator": who,
+		}))
+	}
+	start("user1")
+	start("user1")
+	start("userB")
+}
+
+// rowIDSet 行 id 集合（内存仓遍历 map，顺序不定 ⇒ 比集合不比切片）
+func rowIDSet(rows []interface{}) map[string]bool {
+	s := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		s[fmt.Sprintf("%v", r.(map[string]interface{})["id"])] = true
+	}
+	return s
+}
+
+func sameIDSet(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestIssue129BlankOperatorEqualsMissingAndUser1 第一层（门面归一化）× 四个归属出口：
+// {"operator":""} / {"operator":"   "} / 缺键 三档必须与显式 user1 档**同一批行**（不比行数、比行集），
+// 且该批行非空；负向档：userB（另一个有行的用户）与 __nobody__ 不得与空串档同形。
+func TestIssue129BlankOperatorEqualsMissingAndUser1(t *testing.T) {
+	f, repo, _ := setupFacade()
+	issue129Seed(t, f, repo)
+
+	rowsOf := func(action string, args map[string]interface{}) []interface{} {
+		body := map[string]interface{}{"pageSize": 100}
+		for k, v := range args {
+			body[k] = v
+		}
+		r := f.Flow(action, body)
+		mustOk(t, r)
+		rows, _ := r["data"].(map[string]interface{})["rows"].([]interface{})
+		return rows
+	}
+
+	for _, action := range []string{
+		"processInstance/page", "processTask/todoList", "processTask/doneList", "processInstance/ccList",
+	} {
+		user1 := rowsOf(action, map[string]interface{}{"operator": "user1"})
+		blank := rowsOf(action, map[string]interface{}{"operator": ""})
+		ws := rowsOf(action, map[string]interface{}{"operator": "   "})
+		missing := rowsOf(action, map[string]interface{}{})
+		userB := rowsOf(action, map[string]interface{}{"operator": "userB"})
+		nobody := rowsOf(action, map[string]interface{}{"operator": "__nobody__"})
+
+		// 夹具守卫：两侧都非空，否则下面的比较全是 0==0 自等
+		if len(user1) == 0 {
+			t.Fatalf("[%s] 夹具失效：user1 档 0 行，三档相等会退化成自等假绿", action)
+		}
+		if len(userB) == 0 {
+			t.Fatalf("[%s] 夹具失效：userB 档 0 行，无法证伪「空串档读成全库」", action)
+		}
+		// 正向：空串/空白/缺键 == 显式 user1（同一批行）
+		if got := rowIDSet(blank); !sameIDSet(got, rowIDSet(user1)) {
+			t.Fatalf("[%s] 空串档应回落 user1，实际行集 %v ≠ user1 档 %v（空串被当成真实值或整条条件被丢掉）",
+				action, keysOf(got), keysOf(rowIDSet(user1)))
+		}
+		if got := rowIDSet(ws); !sameIDSet(got, rowIDSet(user1)) {
+			t.Fatalf("[%s] 全空白档应回落 user1，实际 %d 行 vs user1 %d 行", action, len(ws), len(user1))
+		}
+		if got := rowIDSet(missing); !sameIDSet(got, rowIDSet(user1)) {
+			t.Fatalf("[%s] 缺键档应与 user1 同档，实际 %d 行 vs %d 行", action, len(missing), len(user1))
+		}
+		// 负向：空串档既不是别人的档，也不是全库
+		if sameIDSet(rowIDSet(blank), rowIDSet(userB)) {
+			t.Fatalf("[%s] 空串档读出的是 userB 的那批行 ⇒ 归属过滤失效", action)
+		}
+		if len(blank) >= len(user1)+len(userB) {
+			t.Fatalf("[%s] 空串档读到全库：%d 行 ≥ user1(%d)+userB(%d) ⇒ 空串条件被整条丢掉",
+				action, len(blank), len(user1), len(userB))
+		}
+		if len(nobody) != 0 {
+			t.Fatalf("[%s] 不存在的用户应 0 行，实际 %d 行", action, len(nobody))
+		}
+	}
+}
+
+func keysOf(s map[string]bool) []string {
+	out := make([]string, 0, len(s))
+	for k := range s {
+		out = append(out, k)
+	}
+	return out
+}
+
+// TestIssue129MemoryRepoBlankOwnershipIsEmptyPage 第二层（仓储兜底）：
+// **绕过门面直接打内存仓**（门面归一化盖不住的那一半），空串/全空白/制表符三种形态的
+// 归属入参都必须得到空页；同时归属列上的空值 EQ 条件也必须得到空页，
+// 而非归属列的空值条件仍按"没填"忽略（可选过滤照旧生效的哨兵）。
+func TestIssue129MemoryRepoBlankOwnershipIsEmptyPage(t *testing.T) {
+	f, repo, _ := setupFacade()
+	issue129Seed(t, f, repo)
+	ctx := context.Background()
+	pq := func(conds ...spi.Condition) spi.PageQuery {
+		q := spi.PageQuery{PageNum: 1, PageSize: 100}
+		if len(conds) > 0 {
+			q.Conditions = conds
+		}
+		return q
+	}
+
+	// 夹具守卫：直连仓储时 user1 真有行（否则"空串⇒0 行"是 0==0 自等）
+	if rows, total, _ := repo.PageInstances(ctx, pq(), "user1"); len(rows) == 0 || total == 0 {
+		t.Fatalf("前置失效：PageInstances(user1) 应非空, rows=%d total=%d", len(rows), total)
+	}
+	if rows, total, _ := repo.PageTodoTasks(ctx, pq(), "user1"); len(rows) == 0 || total == 0 {
+		t.Fatalf("前置失效：PageTodoTasks(user1) 应非空, rows=%d total=%d", len(rows), total)
+	}
+	if rows, total, _ := repo.PageDoneTasks(ctx, pq(), "user1"); len(rows) == 0 || total == 0 {
+		t.Fatalf("前置失效：PageDoneTasks(user1) 应非空, rows=%d total=%d", len(rows), total)
+	}
+	if rows, total, _ := repo.PageCcInstances(ctx, pq(), "user1"); len(rows) == 0 || total == 0 {
+		t.Fatalf("前置失效：PageCcInstances(user1) 应非空, rows=%d total=%d", len(rows), total)
+	}
+
+	for _, blank := range []struct{ name, val string }{{"空串", ""}, {"全空白", "   "}, {"制表符", "\t"}} {
+		if rows, total, err := repo.PageInstances(ctx, pq(), blank.val); err != nil || len(rows) != 0 || total != 0 {
+			t.Fatalf("PageInstances(%s) 应空页, got rows=%d total=%d err=%v ⇒ 归属入参被折叠成了「不过滤」",
+				blank.name, len(rows), total, err)
+		}
+		if rows, total, err := repo.PageTodoTasks(ctx, pq(), blank.val); err != nil || len(rows) != 0 || total != 0 {
+			t.Fatalf("PageTodoTasks(%s) 应空页, got rows=%d total=%d err=%v", blank.name, len(rows), total, err)
+		}
+		if rows, total, err := repo.PageDoneTasks(ctx, pq(), blank.val); err != nil || len(rows) != 0 || total != 0 {
+			t.Fatalf("PageDoneTasks(%s) 应空页, got rows=%d total=%d err=%v", blank.name, len(rows), total, err)
+		}
+		if rows, total, err := repo.PageCcInstances(ctx, pq(), blank.val); err != nil || len(rows) != 0 || total != 0 {
+			t.Fatalf("PageCcInstances(%s) 应空页, got rows=%d total=%d err=%v", blank.name, len(rows), total, err)
+		}
+	}
+
+	// 归属列 + 空值 EQ 条件 ⇒ 空页（三形态：空串/全空白/nil）
+	for _, v := range []interface{}{"", "   ", nil} {
+		if rows, _, _ := repo.PageInstances(ctx, pq(spi.Condition{Column: "t.operator", Operator: "EQ", Value: v}), "user1"); len(rows) != 0 {
+			t.Fatalf("t.operator EQ %v 应空页, got %d 行", v, len(rows))
+		}
+		if rows, _, _ := repo.PageTodoTasks(ctx, pq(spi.Condition{Column: "pta.actor_id", Operator: "EQ", Value: v}), "user1"); len(rows) != 0 {
+			t.Fatalf("pta.actor_id EQ %v 应空页, got %d 行", v, len(rows))
+		}
+	}
+
+	// 哨兵：非归属列的空值条件仍按"没填"忽略 ⇒ 可选过滤照旧生效（不许被本案改成"空值即空页"）
+	// 注：内存仓的通用放行形态是 nil（"" 在内存仓一直是真实值比对，属 issues/129 之前就有的
+	// 跨实现分叉，本案不收，JDBC 侧的 "" 哨兵见 repository/jdbc 的同名 sqlite 用例）。
+	rows, _, err := repo.PageInstances(ctx, pq(spi.Condition{Column: "t.business_no", Operator: "EQ", Value: nil}), "user1")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("非归属列 nil 值条件应被忽略（可选过滤照旧），got rows=%d err=%v ⇒ 通用放行被误改了", len(rows), err)
+	}
+}

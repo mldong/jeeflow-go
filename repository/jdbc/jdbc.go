@@ -660,6 +660,10 @@ func (r *Repository) UpdateCcStatus(ctx context.Context, instanceID int64, actor
 
 // PageCcInstances 我的抄送分页（v1.3.0）：cc 表 join 实例 + 定义，按抄送人过滤（对齐 Java pageCcInstances）
 func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, actorID string) ([]*model.CcInstanceRow, int, error) {
+	// issues/129 案 A 第二层：cc.actor_id 是归属列，归属入参为空 ⇒ 空页（判据同 PageInstances）。
+	if blankOwnership(actorID) {
+		return nil, 0, nil
+	}
 	pageNum, pageSize := query.PageNum, query.PageSize
 	if pageNum <= 0 {
 		pageNum = 1
@@ -756,6 +760,13 @@ func (r *Repository) PageDefines(ctx context.Context, query spi.PageQuery) ([]*m
 
 // PageInstances 我发起的流程实例分页（operator 过滤，join 定义）
 func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, operator string) ([]*model.InstanceRow, int, error) {
+	// issues/129 案 A 第二层：归属入参空 ⇒ 空页。本栈 SQL 侧的归属谓词是**绑定参数**
+	// （WHERE t.operator = ?），不会像 Java 那样被"空值不加条件"整条丢掉 ⇒ 无"读全库"形态，
+	// 但空串会被当成真实值去比对（库里存在 operator='' 的脏行时照样误出）；spec 06 §2.5
+	// 的判据是"归属列为空 ⇒ 空页"，故显式早返回，与 m_ 条件侧的 AND 1=0 同判据。
+	if blankOwnership(operator) {
+		return nil, 0, nil
+	}
 	pageNum, pageSize := normPage(query)
 	condSQL, condArgs := buildWhere(query.Conditions, instanceWhitelist)
 	where := " FROM wf_process_instance t LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id WHERE t.operator = ?" + condSQL
@@ -814,6 +825,11 @@ func (r *Repository) PageDoneTasks(ctx context.Context, query spi.PageQuery, ope
 
 // pageTasks 待办/已办分页（对齐 Java pageTasks：todo 按 actor 过滤、done 按操作人过滤）
 func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bool, filter string) ([]*model.TaskRow, int, error) {
+	// issues/129 案 A 第二层：todo 的 pta.actor_id / done 的 t.operator 都是归属列，
+	// 归属入参为空 ⇒ 空页（判据同 PageInstances，绝不折叠成"不过滤"读全库）。
+	if blankOwnership(filter) {
+		return nil, 0, nil
+	}
 	pageNum, pageSize := normPage(query)
 	condSQL, condArgs := buildWhere(query.Conditions, taskWhitelist)
 	where := " FROM wf_process_task t" +
@@ -898,6 +914,28 @@ var defineWhitelist = map[string]bool{
 	"t.version": true, "t.create_time": true, "t.update_time": true,
 }
 
+// ownershipColumns 归属谓词列（issues/129）：这几列定义"这条记录属于谁"，空值绝不能等于"不过滤"。
+// 逐字对齐 Java JdbcProcessRepository.OWNERSHIP_COLUMNS 与本栈白名单里的实际列名：
+// todoList 用 pta.actor_id、doneList/instancePage 用 t.operator、ccList 用 cc.actor_id、
+// 任务分页带出的实例发起人用 pi.operator。
+var ownershipColumns = map[string]bool{
+	"t.operator": true, "pi.operator": true, "pta.actor_id": true, "cc.actor_id": true,
+}
+
+// blankCondValue 条件值判空（对齐 Java 的 blankVal：null 或全空白串）。
+func blankCondValue(val interface{}) bool {
+	if val == nil {
+		return true
+	}
+	if s, ok := val.(string); ok {
+		return strings.TrimSpace(s) == ""
+	}
+	return false
+}
+
+// blankOwnership 归属入参判空（issues/129 案 A 第二层）：空串与全空白同判"空"⇒ 空页。
+func blankOwnership(s string) bool { return strings.TrimSpace(s) == "" }
+
 // buildWhere m_ 条件 WHERE 构建（白名单 + 参数化）
 func buildWhere(conditions []spi.Condition, whitelist map[string]bool) (string, []interface{}) {
 	var b strings.Builder
@@ -907,6 +945,15 @@ func buildWhere(conditions []spi.Condition, whitelist map[string]bool) (string, 
 			continue // 不在白名单，丢弃
 		}
 		val := c.Value
+		// issues/129 案 A 第二层：归属谓词列拿到空值 ⇒ 空页（AND 1=0），而不是"这条条件不加"。
+		// 门面已把空串归一化成缺省 user1（facade.operatorArg），这一道防的是绕过门面直接调
+		// 仓储的调用方与将来的门面改动——只留门面那半不算修完（Java buildWhere/Rust 1.0.17 同为两层）。
+		// 只收归属列：下面两句"空值当作没填"是 PageQuery 对 m_LIKE_* 等**可选过滤**的通用放行，
+		// 照字面改成"空值即空页"会把可选过滤一起改坏。
+		if blankCondValue(val) && strings.EqualFold(c.Operator, "EQ") && ownershipColumns[c.Column] {
+			b.WriteString(" AND 1=0")
+			continue
+		}
 		if val == nil {
 			continue
 		}

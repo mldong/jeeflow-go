@@ -203,7 +203,7 @@ func (f *Facade) startAndExecute(args map[string]interface{}) (interface{}, erro
 	if err != nil {
 		return nil, fmt.Errorf("processDefineId 缺失或非法: %v", err)
 	}
-	operator := toStr(args["operator"], "user1")
+	operator := operatorArg(args)
 	flowArgs := map[string]interface{}{}
 	for k, v := range args {
 		if k == "processDefineId" || k == "operator" {
@@ -433,7 +433,7 @@ func (f *Facade) execute(args map[string]interface{}) error {
 	if err != nil {
 		return fmt.Errorf("processTaskId 缺失或非法: %v", err)
 	}
-	operator := toStr(args["operator"], "user1")
+	operator := operatorArg(args)
 	submitType, err := toInt(args["submitType"])
 	if err != nil {
 		submitType = 1 // AGREE
@@ -530,7 +530,7 @@ func (f *Facade) designDetail(args map[string]interface{}) (interface{}, error) 
 
 func (f *Facade) designSave(args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
-	operator := toStr(args["operator"], "user1")
+	operator := operatorArg(args)
 	id, _ := toInt64(args["id"])
 	var design *model.ProcessDesign
 	var err error
@@ -872,7 +872,7 @@ func (f *Facade) surrogatePage(args map[string]interface{}) (interface{}, error)
 
 func (f *Facade) surrogateSave(args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
-	operator := toStr(args["operator"], "user1")
+	operator := operatorArg(args)
 	id, _ := toInt64(args["id"])
 	var surrogate *model.ProcessSurrogate
 	var err error
@@ -909,7 +909,7 @@ func (f *Facade) surrogateUpdate(args map[string]interface{}) (interface{}, erro
 	if err != nil || surrogate == nil {
 		return nil, errors.New("委托记录不存在")
 	}
-	operator := toStr(args["operator"], "user1")
+	operator := operatorArg(args)
 	applySurrogateFields(surrogate, args, operator)
 	err = ext.UpdateSurrogate(context.Background(), surrogate)
 	if err != nil {
@@ -1321,7 +1321,7 @@ func (f *Facade) createCCInstance(args map[string]interface{}) error {
 	if err != nil {
 		return fmt.Errorf("processInstanceId 缺失或非法: %v", err)
 	}
-	operator := toStr(args["operator"], "user1")
+	operator := operatorArg(args)
 	actors := toStringSlice2(args["actorIds"])
 	if len(actors) == 0 {
 		return errors.New("actorIds 缺失")
@@ -1343,14 +1343,14 @@ func (f *Facade) updateCCStatus(args map[string]interface{}) error {
 	if err != nil {
 		return fmt.Errorf("processInstanceId 缺失或非法: %v", err)
 	}
-	operator := toStr(args["operator"], "user1")
+	operator := operatorArg(args)
 	return f.repo.UpdateCcStatus(context.Background(), instanceID, operator)
 }
 
 // ccList 我的抄送分页（v1.3.0）：operator 作为抄送人过滤
 func (f *Facade) ccList(args map[string]interface{}) (interface{}, error) {
 	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
-	actorID := toStr(args["operator"], "user1")
+	actorID := operatorArg(args)
 	rows, total, err := f.repo.PageCcInstances(context.Background(), query, actorID)
 	if err != nil {
 		return nil, err
@@ -1367,7 +1367,7 @@ func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 	if err != nil {
 		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
-	operator := toStr(args["operator"], "user1")
+	operator := operatorArg(args)
 	task, err := f.repo.FindTaskByID(context.Background(), taskID)
 	if err != nil || task == nil {
 		return nil, errors.New("任务不存在")
@@ -1944,6 +1944,28 @@ func toStr(v interface{}, def string) string {
 	return fmt.Sprintf("%v", v)
 }
 
+// operatorArg 归属/操作人入参归一化（issues/129 案 A · spec 06-facade.md §2.5）——
+// 与 Java JeeflowFacade.operatorArg 同形，别在这里发明第三种语义。
+//
+// 空串与**缺键同档**：传 ""（或全空白串）视同未传，一并回落 demo 缺省 user1。
+// 以前 toStr(args["operator"], "user1") 只在**键缺失/为 null** 时兜缺省，于是
+// {"operator":""} 原样落进仓储的归属参数 ⇒ 本栈内存仓把"空串"读成"不过滤"
+// （memory/repository.go 的 `if actorID != ""`），"我的实例/我的已办"读出**全库**
+// （实测 25 行 vs user1 的 4 行，行上是别人的 operator）。
+// 门面归一化是第一层，仓储的归属兜底是第二层（memory/repository.go 四条 page +
+// repository/jdbc 的 buildWhere 与四条 page），两层都要在——只修门面那半不算修完。
+//
+// ⚠️ 只归一"归属/操作人"这一族入参；issues/114 立的 operator **硬必填**族
+// （processInstance/withdraw、processTask/transfer）严禁走这里——回落 user1 会把
+// 撤回人/转办人静默记成别人，审计链失真。
+func operatorArg(args map[string]interface{}) string {
+	s := toStr(args["operator"], "")
+	if strings.TrimSpace(s) == "" {
+		return "user1"
+	}
+	return s
+}
+
 func toInt64(v interface{}) (int64, error) {
 	switch t := v.(type) {
 	case int64:
@@ -2026,7 +2048,7 @@ func (f *Facade) defineDetail(args map[string]interface{}) (interface{}, error) 
 // instancePage 我发起的流程实例分页（operator 过滤）
 func (f *Facade) instancePage(args map[string]interface{}) (interface{}, error) {
 	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
-	operator := toStr(args["operator"], "user1")
+	operator := operatorArg(args)
 	rows, total, err := f.repo.PageInstances(context.Background(), query, operator)
 	if err != nil {
 		return nil, err
@@ -2134,7 +2156,7 @@ func firstTaskNodeIDOf(graph map[string]interface{}) string {
 // todoList 我的待办分页（operator 作为抄送…待办人过滤，对齐 Java pta.actor_id EQ）
 func (f *Facade) todoList(args map[string]interface{}) (interface{}, error) {
 	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
-	actorID := toStr(args["operator"], "user1")
+	actorID := operatorArg(args)
 	rows, total, err := f.repo.PageTodoTasks(context.Background(), query, actorID)
 	if err != nil {
 		return nil, err
@@ -2149,7 +2171,7 @@ func (f *Facade) todoList(args map[string]interface{}) (interface{}, error) {
 // doneList 我的已办分页（operator 过滤，非进行中任务）
 func (f *Facade) doneList(args map[string]interface{}) (interface{}, error) {
 	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
-	operator := toStr(args["operator"], "user1")
+	operator := operatorArg(args)
 	rows, total, err := f.repo.PageDoneTasks(context.Background(), query, operator)
 	if err != nil {
 		return nil, err
