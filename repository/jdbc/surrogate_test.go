@@ -165,7 +165,7 @@ func TestSurrogateAutoApplyPersists(t *testing.T) {
 	putSurrogate(t, ext, "zhangsan", "lisi", "surr116", inWindow, ptrOf(now.Add(time.Hour)), 1)
 
 	// Option 装配路（集成方一行开起来）
-	eng := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli() * 1000}, nil,
+	eng := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli()*4000 + testStackSeq*1000}, nil,
 		engine.WithSurrogateRepository(ext))
 	actors := startSurrFlow(t, db, eng, repo)
 	if !hasActor(actors, "zhangsan") {
@@ -202,7 +202,7 @@ func TestSurrogateAutoApplyPersists(t *testing.T) {
 			defer func() {
 				_, _ = db.ExecContext(ctx, ph("DELETE FROM wf_process_surrogate WHERE operator = ? AND surrogate = ?"), n.operator, n.agent)
 			}()
-			eng := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli() * 1000}, nil,
+			eng := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli()*4000 + testStackSeq*1000}, nil,
 				engine.WithSurrogateRepository(ext))
 			actors := startSurrFlow(t, db, eng, repo)
 			if hasActor(actors, "lisi") || len(actors) != 1 || actors[0] != "zhangsan" {
@@ -212,7 +212,7 @@ func TestSurrogateAutoApplyPersists(t *testing.T) {
 	}
 
 	// ③ 未配置扩展仓储 → 建单不被打断（静默跳过，不抛错）
-	engNoExt := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli() * 1000}, nil)
+	engNoExt := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli()*4000 + testStackSeq*1000}, nil)
 	putSurrogate(t, ext, "zhangsan", "lisi", "surr116", ptrOf(now.Add(-time.Hour)), ptrOf(now.Add(time.Hour)), 1)
 	actors = startSurrFlow(t, db, engNoExt, repo)
 	if len(actors) != 1 || actors[0] != "zhangsan" {
@@ -220,7 +220,7 @@ func TestSurrogateAutoApplyPersists(t *testing.T) {
 	}
 
 	// ④ 显式关闭 → 回到"仅台账"
-	engOff := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli() * 1000}, nil,
+	engOff := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli()*4000 + testStackSeq*1000}, nil,
 		engine.WithSurrogateRepository(ext), engine.WithSurrogateAutoApply(false))
 	if engOff.SurrogateAutoApply() {
 		t.Fatalf("④ WithSurrogateAutoApply(false) 后开关仍为开启")
@@ -253,7 +253,7 @@ func TestSurrogateAutoApplyViaFacade(t *testing.T) {
 
 	now := time.Now()
 	putSurrogate(t, ext, "zhangsan", "lisi", "surr116", ptrOf(now.Add(-time.Hour)), ptrOf(now.Add(time.Hour)), 1)
-	eng := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli() * 1000}, nil)
+	eng := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli()*4000 + testStackSeq*1000}, nil)
 	if eng.SurrogateRepository() != nil {
 		t.Fatalf("装配前引擎不应已持有委托仓储")
 	}
@@ -349,7 +349,7 @@ func TestSurrogateIneffectiveExactRowStillFallsBackToAllFlow(t *testing.T) {
 				t.Fatalf("最新一条应落在 surr116 作用域，实际 %q err=%v", newestName, err)
 			}
 
-			eng := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli() * 1000}, nil,
+			eng := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli()*4000 + testStackSeq*1000}, nil,
 				engine.WithSurrogateRepository(ext))
 			actors := startSurrFlow(t, db, eng, repo)
 			if len(actors) != 2 || !hasActor(actors, "zhangsan") || !hasActor(actors, c.wantAgent) {
@@ -422,7 +422,7 @@ func TestSurrogateNewestRowDecidesNoMerge(t *testing.T) {
 				t.Fatalf("%s：台账应有 2 条（更旧生效行 + 最新一条），实际 cnt=%d err=%v", c.name, cnt, err)
 			}
 
-			eng := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli() * 1000}, nil,
+			eng := engine.New(repo, &noopUserProvider{}, &tsIDGen{base: time.Now().UnixMilli()*4000 + testStackSeq*1000}, nil,
 				engine.WithSurrogateRepository(ext))
 			actors := startSurrFlow(t, db, eng, repo)
 			if c.newestMustBeMerged {

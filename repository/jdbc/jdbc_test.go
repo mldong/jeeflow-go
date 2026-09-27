@@ -124,7 +124,7 @@ func insertDefine(t *testing.T, db *sql.DB, name string, content []byte) {
 func newEngine(t *testing.T, repo spi.ProcessRepository) *engine.EngineImpl {
 	t.Helper()
 	userProv := &noopUserProvider{}
-	idGen := &tsIDGen{base: time.Now().UnixMilli() * 1000}
+	idGen := &tsIDGen{base: time.Now().UnixMilli()*4000 + testStackSeq*1000}
 	return engine.New(repo, userProv, idGen, nil)
 }
 
@@ -135,6 +135,12 @@ type noopUserProvider struct{}
 func (*noopUserProvider) GetUser(userID string) (*model.UserInfo, error) {
 	return &model.UserInfo{UserID: userID, RealName: userID}, nil
 }
+
+// testStackSeq 是本栈 T1 测试 id 的栈位（issues/118 §2.5）。
+// 旧式 `ts_ms*1000 + 序号` 在 go/node/python 三栈并行跑真库测试时会撞主键：同一毫秒内
+// 三栈算出的 base 完全相同，而它们连的是同一台 160 上的 MySQL。
+// 统一公式 id = ts_ms*4000 + 栈位*1000 + 序号（序号须 <1000）；python=1 / node=2 / go=3。
+const testStackSeq = 3
 
 // tsIDGen 时间戳+序号生成器（测试用）
 type tsIDGen struct {
