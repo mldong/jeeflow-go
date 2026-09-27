@@ -103,6 +103,11 @@ type Repository struct {
 	db      *sql.DB
 	idGen   spi.IDGenerator
 	phStyle string // "?" 原生 / "$n"（PostgreSQL）
+	// statsClock 逾期判据的时间来源；nil ⇒ time.Now。
+	// issues/125：SQL 里的 NOW() 取的是**数据库会话时区**那把钟（一个 SET time_zone 就平移 8 小时），
+	// 而 expire_time 是引擎钟写进去的裸墙钟 ⇒ 两把钟。这里把 now 收回引擎侧，SQL 文本不再出现时间函数。
+	// 与 memory 仓 `StatsPendingAndOverdueCount` 用的同一把（`time.Now()`）。
+	statsClock func() time.Time
 }
 
 // New 构造仓储（db 由调用方创建，支持连接池）。
@@ -116,6 +121,15 @@ func New(db *sql.DB) *Repository {
 // NewWithIDGen 构造仓储并注入 ID 生成器（占位符风格同样自动检测）。
 func NewWithIDGen(db *sql.DB, idGen spi.IDGenerator) *Repository {
 	return &Repository{db: db, idGen: idGen, phStyle: detectPlaceholder(db)}
+}
+
+// statsNow 取统计判据用的"现在"（引擎进程钟）。默认 time.Now，测试可经 statsClock 注入固定值。
+// 每次统计调用只取一次，pending/overdue 两半用同一个值——同一条 SQL 里混两把钟是 issues/125 的病根。
+func (r *Repository) statsNow() time.Time {
+	if r.statsClock != nil {
+		return r.statsClock()
+	}
+	return time.Now()
 }
 
 // detectPlaceholder 按驱动类型名推断占位符风格（零驱动依赖，字符串匹配）
@@ -1063,12 +1077,14 @@ func (r *Repository) StatsAvgCompletedDurationSeconds(ctx context.Context, start
 }
 
 func (r *Repository) StatsPendingAndOverdueCount(ctx context.Context) (pending int, overdue int, err error) {
+	// issues/125：逾期判据的 now 由引擎侧供给并绑参，SQL 文本里不留 NOW()
+	// （NOW() 走数据库会话时区，与 expire_time 所写的引擎钟可以差一个时区偏移）。
 	query := `SELECT
 		COUNT(*) AS pending,
-		SUM(CASE WHEN t.expire_time IS NOT NULL AND t.expire_time < NOW() THEN 1 ELSE 0 END) AS overdue
+		SUM(CASE WHEN t.expire_time IS NOT NULL AND t.expire_time < ? THEN 1 ELSE 0 END) AS overdue
 	FROM wf_process_task t WHERE t.task_state = 10`
 	var overduePtr sql.NullInt64
-	if err := r.conn(ctx).QueryRowContext(ctx, query).Scan(&pending, &overduePtr); err != nil {
+	if err := r.conn(ctx).QueryRowContext(ctx, query, r.statsNow()).Scan(&pending, &overduePtr); err != nil {
 		return 0, 0, err
 	}
 	if overduePtr.Valid {
