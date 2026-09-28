@@ -358,6 +358,13 @@ func (f *Facade) upAndDown(args map[string]interface{}) error {
 //
 // operator 硬必填：缺失/空串直接报错，**严禁缺省回落 user1**——那会把撤回人静默记成别人，
 // 审计链失真且不报错。归属三判据命中任一放行，全不命中拒绝（失败码统一 99999999，细粒度原因走 msg）。
+//
+// issues/134 案 A：归属判据之后、任何状态改写之前还有**实例状态守卫**——
+// 实例 state != 10(进行中) 一律拒（20 已办结 / 40 已终止 / 30 已撤回 / 45、50、99 同拒），
+// 被拒时实例与任务行一行都不改、不落库。落点选在本函数：聚合根 model.ProcessInstance.Withdraw
+// 是无 error 返回的纯 setter，状态改写序列（doing 任务 → 实例 → UpdateInstance 级联落库）
+// 全在门面里，守卫排在它之前才拦得住。次序与 Java 一致（facade 鉴权 → 聚合根 withdraw 抛错）：
+// 无关第三人撤已办结单先撞归属判据、拿「无权限撤回该流程实例」，不把实例状态递给无权限的人。
 func (f *Facade) withdraw(args map[string]interface{}) error {
 	instanceID, err := toInt64(args["id"])
 	if err != nil {
@@ -382,6 +389,16 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 	}
 	if !f.canWithdrawInstance(inst, doing, operator) {
 		return errors.New("无权限撤回该流程实例")
+	}
+	// issues/134 案 A · 实例状态守卫（八栈同判据，守卫排在任务行层面既有保护之前）：
+	// 撤回只允许作用于**进行中(10)**实例，非 10 一律拒——改前对已办结(20)/已终止(40) 的实例
+	// 调撤回会把它静默改写成 30（已撤回），已办列表/按状态聚合的统计凭空改历史且零报错。
+	// 内部码 20010009：本栈 error 无码位 ⇒ 沿用 20010007/20010008
+	// （engine_impl.go rollbackToParent 的 `const noLineage`/`const guardFail`）的形状定义固定
+	// 中文文案，出口由门面统一成 code=99999999 + msg 逐字，**码值不进 msg**（issues/121 口径）。
+	const notDoing = "流程实例非进行中，无法撤回"
+	if inst.State != model.InstanceStateDoing {
+		return errors.New(notDoing)
 	}
 	// issues/53 E25 补正：改状态后的副本必须同步回聚合（UpdateInstance 级联会用聚合内
 	// 旧任务副本覆盖已撤回状态——先 updateTask 再 updateInstance 会被覆盖回 DOING）

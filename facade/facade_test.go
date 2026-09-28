@@ -2725,6 +2725,116 @@ func TestWithdrawAuthorization(t *testing.T) {
 	}
 }
 
+// TestWithdrawInstanceStateGuard issues/134 案 A（内部码 20010009）：撤回只允许作用于进行中(10)实例
+//
+// 三档各立子测试（摘守卫变异对照时按档报红，一格都不许混在 t.Fatalf 里丢掉）：
+//
+// 负向两档：
+//   - state=20（已办结）——真跑到办结，非手搓；
+//   - state=40（已终止）——本栈引擎不产出 40（issues/134 §5.2 已记"壳侧 gate 造不出 40 档"
+//     ⇒ 按本案纪律走引擎栈内单测钉），夹具直存"已终止实例 + 残留 doing 任务行"的脏数据形状。
+//
+// 两档都断：① code=99999999 ② msg **逐字**等值「流程实例非进行中，无法撤回」（八栈同文案，
+// 码值不进 msg＝issues/121 口径；这里**不用** mustFailWithMsg 的"含"判据，宽松匹配会让
+// "出口拼了码值/前缀"这种跨栈漂移测不出来）③ 实例 state 与任务行**都没被改写**（病灶）。
+// 正向对照钉 state=10：撤回仍 code=0 且落 30（防"守卫写反把正常路径也拦了"的假绿）。
+func TestWithdrawInstanceStateGuard(t *testing.T) {
+	f, repo, _ := setupFacade()
+	ctx := context.Background()
+	const wantMsg = "流程实例非进行中，无法撤回"
+
+	// assertRefused/start 都显式收 t ⇒ 子测试各自 FailNow，一格红不牵连其余档
+	assertRefused := func(t *testing.T, label string, r map[string]interface{}) {
+		t.Helper()
+		if code, _ := r["code"].(int); code != 99999999 {
+			t.Fatalf("%s 应失败且 code=99999999（内部码 20010009 不进出口）, got %v", label, r)
+		}
+		if msg, _ := r["msg"].(string); msg != wantMsg {
+			t.Fatalf("%s msg = %q, want 逐字 %q（禁码值/前缀/宽松包含判据）", label, msg, wantMsg)
+		}
+	}
+
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
+	mustOk(t, r0)
+	defineID := r0["data"].(map[string]interface{})["processDefineId"]
+	// start 并自动完成 apply ⇒ 实例 10 + task1 doing（发起人 zhangsan，参与者 leader）
+	start := func(t *testing.T) int64 {
+		t.Helper()
+		r := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+			"processDefineId": defineID, "operator": "zhangsan",
+		})
+		mustOk(t, r)
+		return mustI64(r["data"].(map[string]interface{})["processInstanceId"])
+	}
+
+	t.Run("负向·已办结20", func(t *testing.T) {
+		doneID := start(t)
+		doneTask := doingTaskID(t, repo, doneID, "task1")
+		if doneTask == 0 {
+			t.Fatalf("前置：task1 应进行中")
+		}
+		mustOk(t, f.Flow("processTask/execute", map[string]interface{}{
+			"processTaskId": doneTask, "operator": "leader", "submitType": 1,
+		}))
+		if inst, _ := repo.FindInstanceByID(ctx, doneID); inst.State != model.InstanceStateDone {
+			t.Fatalf("前置被破坏：办结后实例态 = %d, want 20", inst.State)
+		}
+		// 用发起人撤 ⇒ 归属判据 1 命中，拦点只能是实例状态守卫（不是鉴权）
+		assertRefused(t, "已办结(20)撤回", f.Flow("processInstance/withdraw",
+			map[string]interface{}{"id": doneID, "operator": "zhangsan"}))
+		if inst, _ := repo.FindInstanceByID(ctx, doneID); inst.State != model.InstanceStateDone {
+			t.Fatalf("已办结实例被撤回改写: state = %d, want 仍 20（病灶＝静默改成 30）", inst.State)
+		}
+		if tk, _ := repo.FindTaskByID(ctx, doneTask); tk.TaskState != model.TaskStateDone || tk.UpdateUser != "leader" {
+			t.Fatalf("已办结任务行被撤回改写: state=%d update_user=%q, want 仍 20/leader", tk.TaskState, tk.UpdateUser)
+		}
+	})
+
+	t.Run("负向·已终止40", func(t *testing.T) {
+		mustSave := func(err error) {
+			t.Helper()
+			if err != nil {
+				t.Fatalf("夹具入库失败: %v", err)
+			}
+		}
+		const intID, intTaskID = int64(900100), int64(900101)
+		mustSave(repo.SaveInstance(ctx, &model.ProcessInstance{
+			ID: intID, DefineID: 1, State: model.InstanceStateInterrupt, Operator: "zhangsan",
+			Variables: map[string]interface{}{},
+		}))
+		mustSave(repo.SaveTask(ctx, &model.ProcessTask{
+			ID: intTaskID, ProcessInstanceID: intID, TaskName: "task1", DisplayName: "部门经理审批",
+			TaskState: model.TaskStateDoing, ActorIDs: []string{"leader"},
+			Variables: map[string]interface{}{},
+		}))
+		assertRefused(t, "已终止(40)撤回", f.Flow("processInstance/withdraw",
+			map[string]interface{}{"id": intID, "operator": "zhangsan"}))
+		if inst, _ := repo.FindInstanceByID(ctx, intID); inst.State != model.InstanceStateInterrupt {
+			t.Fatalf("已终止实例被撤回改写: state = %d, want 仍 40", inst.State)
+		}
+		if tk, _ := repo.FindTaskByID(ctx, intTaskID); tk.TaskState != model.TaskStateDoing {
+			t.Fatalf("已终止实例的残留 doing 任务行被改写: state = %d, want 仍 10（守卫须排在改写任务行之前）", tk.TaskState)
+		}
+	})
+
+	t.Run("正向对照·进行中10", func(t *testing.T) {
+		doingID := start(t)
+		doingTk := doingTaskID(t, repo, doingID, "task1")
+		if doingTk == 0 {
+			t.Fatalf("前置：正向对照实例应有 doing 任务")
+		}
+		mustOk(t, f.Flow("processInstance/withdraw", map[string]interface{}{
+			"id": doingID, "operator": "zhangsan",
+		}))
+		if inst, _ := repo.FindInstanceByID(ctx, doingID); inst.State != model.InstanceStateWithdraw {
+			t.Fatalf("进行中实例撤回后 state = %d, want 30（守卫写反会拦掉正常路径）", inst.State)
+		}
+		if tk, _ := repo.FindTaskByID(ctx, doingTk); tk.TaskState != model.TaskStateWithdraw || tk.UpdateUser != "zhangsan" {
+			t.Fatalf("撤回后任务行 state=%d update_user=%q, want 30/zhangsan", tk.TaskState, tk.UpdateUser)
+		}
+	})
+}
+
 // TestTaskTransfer spec 08 用例 25：转办（摘原人一行 + 换新人 + submitType=7 留痕 + 四条明确报错）
 func TestTaskTransfer(t *testing.T) {
 	f, repo, _ := setupFacade()
