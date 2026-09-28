@@ -239,6 +239,40 @@ func TestExpireTimeSequentialCountersignFirstMember(t *testing.T) {
 	expMustDelta(t, rows[0], 2*time.Hour)
 }
 
+// TestExpireTimeParallelCountersignUnconfiguredKeepsNull 会签节点**没配**到期表达式 ⇒ 行要建齐（两位
+// 成员都在待办里），但这一列必须保持空：不造默认值、不写 now()。
+// 与 TestExpireTimeParallelCountersignEveryMember 成对——只有正向档时，"接线整条没跑"和
+// "跑了但算成空值"两种实现都能绿；配上这一档才分得开。
+func TestExpireTimeParallelCountersignUnconfiguredKeepsNull(t *testing.T) {
+	eng, repo, defID := expHarness(t, "exp126_parnc", expFlowWith("exp126_parnc",
+		expSpec{"cs", `"assignee":"zhangsan,wangwu","performType":"1","countersignType":"PARALLEL"`}))
+	inst := expStart(t, eng, defID, map[string]interface{}{"BUSINESS_NO": "B126PN"})
+	rows := expMustDoing(t, repo, inst.ID, "cs", 2) // 行必须在，否则"空"是"没建行"混过去的
+	for _, r := range rows {
+		expMustNull(t, r, "并行会签：节点未配到期表达式")
+	}
+}
+
+// TestExpireTimeSequentialUnconfiguredKeepsBothRowsNull 串行会签的**两个**写点（首成员建单 +
+// 推进出的下一位）在未配表达式时都必须留空——推进那一支是独立接线点，只测首成员等于没测它。
+func TestExpireTimeSequentialUnconfiguredKeepsBothRowsNull(t *testing.T) {
+	eng, repo, defID := expHarness(t, "exp126_seqnc", expFlowWith("exp126_seqnc",
+		expSpec{"cs", `"assignee":"zhangsan,wangwu","performType":"1","countersignType":"SEQUENTIAL"`}))
+	inst := expStart(t, eng, defID, map[string]interface{}{"BUSINESS_NO": "B126SN"})
+	first := expMustDoing(t, repo, inst.ID, "cs", 1)[0]
+	expMustNull(t, first, "串行会签：首成员行（节点未配到期表达式）")
+
+	if _, err := eng.ExecuteProcessTask(context.Background(), first.ID, "zhangsan",
+		map[string]interface{}{"submitType": 1}); err != nil {
+		t.Fatalf("首位成员办结失败: %v", err)
+	}
+	rows, err := repo.FindDoingTasks(context.Background(), inst.ID, []string{"cs"})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("推进后 DOING 行 = %d err=%v, want 1", len(rows), err)
+	}
+	expMustNull(t, rows[0], "串行会签：推进出的第二成员行")
+}
+
 // 会签分支的 default（countersignType 既非 PARALLEL 也非 SEQUENTIAL，如 RATIO 系）也是逐人建单，
 // 同一个写点形状——单独一格，否则这条分支的接线没有测试覆盖（变异对照实测发现的缺口）
 func TestExpireTimeOtherCountersignTypeEveryMember(t *testing.T) {
