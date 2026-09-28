@@ -5,12 +5,17 @@
 // ② 表达式是个变量名 ⇒ 取该变量的值；③ 未配（属性缺键 / null / 空串三档）⇒ 该列必须空；
 // ④ 解析不出 ⇒ 空，而不是 now。
 // 在此之上把四处写点各自的格子补齐（普通建单 / 串行会签首位 / 串行会签推进位 / 并行会签全员 /
-// 回退新建），并额外钉住**变量源两档**：建单用实例变量、回退新建用随行拷贝那份变量。
+// 回退新建），并额外钉住两档易混事实：
+//   - **变量源两档**：建单用实例变量、回退新建用随行拷贝那份变量；
+//   - **表达式来源两档**：回退新建取的是"被回退掉的那个节点"（boot2 的 current），
+//     不是复活行落地的节点（prev）——所以回退那几格的夹具给成**两个节点两份表达式**
+//     （落地 1d / 当前 3h），只配一个节点时取错节点也照样绿，判不出来。
 //
 // 判据一律落在**内存仓读回的持久行**上（不是引擎返回的聚合对象），issues/113 教训：
 // 只有读回值能证明"这一列真进了库"。
 //
-// ⚠️ 本文件只新增断言，没动任何既有断言的期望值。
+// ⚠️ 本文件对更早的既有用例只新增断言，没改它们的期望值；上面"表达式来源两档"那几格
+//    属于 issues/126 本批自己的用例，09-28 二轮按基准把夹具改成双节点不同表达式。
 package engine_test
 
 import (
@@ -247,22 +252,28 @@ func TestExpireTimeOtherCountersignTypeEveryMember(t *testing.T) {
 
 // ─── ④ 回退/跳转新建（engine.rollbackToParent）─────────────────────────────────
 
-// expRollbackFlow 回退夹具：apply（配到期表达式）→ approve → end，全由 zhangsan 办
-func expRollbackFlow(name, applyProps string) string {
+// expRollbackFlow 回退夹具：apply → approve → end，全由 zhangsan 办。
+// 两个节点的 properties **各配各的**（applyProps＝复活行落地的节点＝prev，
+// approveProps＝被回退掉的那个节点＝boot2 的 current）：写点④的到期表达式取的是**后者**，
+// 前者在这几格里只当"取错节点"的对照——只给一个节点配表达式时取错节点也照样绿（没牙），
+// 所以两档必须配成不同的值。
+func expRollbackFlow(name, applyProps, approveProps string) string {
 	return expFlowWith(name,
 		expSpec{"apply", applyProps},
-		expSpec{"approve", `"assignee":"zhangsan"`})
+		expSpec{"approve", approveProps})
 }
 
 // expRollbackToApply 发起(boss1) → 办结 apply(zhangsan) → 从 still-DOING 的 approve 上
-// ROLLBACK（target 空＝退回上一步，issues/121 P2 血缘版），返回**复活出来的那条 apply 行**。
+// ROLLBACK（target 空＝退回上一步，issues/121 P2 血缘版），返回**复活出来的那条 apply 行**
+// 和**办结前的原始 apply 行**（原始行走写点①、按 apply 节点自己的表达式赋值，
+// 正好当复活行该走写点④（approve 那份表达式）的对照）。
 // 注意：回退的当前行必须还在 DOING（先把它办结再回退会得到 "task not doing"）。
 func expRollbackToApply(t *testing.T, eng *engine.EngineImpl, repo repoReader, defID int64,
-	startArgs, applyArgs map[string]interface{}) *model.ProcessTask {
+	startArgs, applyArgs map[string]interface{}) (revived, original *model.ProcessTask) {
 	t.Helper()
 	inst := expStart(t, eng, defID, startArgs)
-	apply := expMustDoing(t, repo, inst.ID, "apply", 1)[0]
-	if _, err := eng.ExecuteProcessTask(context.Background(), apply.ID, "zhangsan", applyArgs); err != nil {
+	original = expMustDoing(t, repo, inst.ID, "apply", 1)[0]
+	if _, err := eng.ExecuteProcessTask(context.Background(), original.ID, "zhangsan", applyArgs); err != nil {
 		t.Fatalf("办结 apply 失败: %v", err)
 	}
 	approve := expMustDoing(t, repo, inst.ID, "approve", 1)[0]
@@ -271,51 +282,71 @@ func expRollbackToApply(t *testing.T, eng *engine.EngineImpl, repo repoReader, d
 		t.Fatalf("回退上一步失败: %v", err)
 	}
 	// 回退后 approve 行已办结，该节点的 DOING 只剩复活的那条 apply
-	return expMustDoing(t, repo, inst.ID, "apply", 1)[0]
+	return expMustDoing(t, repo, inst.ID, "apply", 1)[0], original
 }
 
+// 写点④取的是**被回退掉的那个节点**（approve，配 "3h"），不是复活行落地的 apply（配 "1d"）。
+// 同一条 apply 节点的两行给出两个不同到期值——原始行由写点①按 apply 自己的 1d 赋值，
+// 复活行由写点④按 approve 的 3h 赋值：哪天表达式来源错接回 prev，复活行会算出 ≈1d，
+// 这格当场红（变异对照实测的红样就是"实得 24h0m0s / 期望 3h"这种量级差）。
 func TestExpireTimeRollbackCreateRelativeExpression(t *testing.T) {
-	eng, repo, defID := expHarness(t, "exp126_rb2h", expRollbackFlow("exp126_rb2h",
-		`"assignee":"zhangsan","expireTime":"2h"`))
-	row := expRollbackToApply(t, eng, repo, defID,
+	eng, repo, defID := expHarness(t, "exp126_rb3h", expRollbackFlow("exp126_rb3h",
+		`"assignee":"zhangsan","expireTime":"1d"`, `"assignee":"zhangsan","expireTime":"3h"`))
+	revived, original := expRollbackToApply(t, eng, repo, defID,
 		map[string]interface{}{"BUSINESS_NO": "B126R1"}, map[string]interface{}{})
-	expMustDelta(t, row, 2*time.Hour)
+	expMustDelta(t, original, 24*time.Hour) // 对照：落地节点的表达式只管常规建单那一行
+	expMustDelta(t, revived, 3*time.Hour)   // 判点：复活行取被回退掉的那个节点
+}
+
+// 反向钉（取错节点最直接的判据）：**被回退掉的节点没配**、复活行落地的 apply 配了 "1d"
+// ⇒ 复活行的 expire_time 必须留空（写点④只认 current 那份表达式）。
+// 错接成 prev 就会算出 ≈1d（不是空），这格立刻红。
+func TestExpireTimeRollbackCreateIgnoresLandingNodeExpression(t *testing.T) {
+	eng, repo, defID := expHarness(t, "exp126_rbcurnone", expRollbackFlow("exp126_rbcurnone",
+		`"assignee":"zhangsan","expireTime":"1d"`, `"assignee":"zhangsan"`))
+	revived, original := expRollbackToApply(t, eng, repo, defID,
+		map[string]interface{}{"BUSINESS_NO": "B126R4"}, map[string]interface{}{})
+	expMustDelta(t, original, 24*time.Hour) // 前置：1d 确实配在落地节点上（常规建单读得到它）
+	expMustNull(t, revived, "被回退掉的节点（approve）没配表达式，落地节点（apply）配了 1d")
 }
 
 // 回退新建的变量源＝**随行拷贝那份变量**（boot2 的 hisVariable）：
-// 表达式 "dueAt" 在 apply 那条历史行的变量里 ⇒ 复活行取到它
+// 表达式 "dueAt" 配在**被回退掉的 approve 节点**上，值在 apply 那条历史行的变量里 ⇒ 复活行取到它
+// （落地节点同时配 "1d" 当"取错节点"的对照：错接 prev 会得到 ≈1d 而非那个绝对时刻）
 func TestExpireTimeRollbackCreateUsesCarriedVariables(t *testing.T) {
 	eng, repo, defID := expHarness(t, "exp126_rbvar", expRollbackFlow("exp126_rbvar",
-		`"assignee":"zhangsan","expireTime":"dueAt"`))
-	row := expRollbackToApply(t, eng, repo, defID,
+		`"assignee":"zhangsan","expireTime":"1d"`, `"assignee":"zhangsan","expireTime":"dueAt"`))
+	revived, _ := expRollbackToApply(t, eng, repo, defID,
 		map[string]interface{}{"BUSINESS_NO": "B126R2"},
 		map[string]interface{}{"dueAt": "2026-12-31 10:00:00"})
-	if row.ExpireTime == nil {
+	if revived.ExpireTime == nil {
 		t.Fatalf("表达式 dueAt 在随行变量里，复活行的 expire_time 却是空")
 	}
-	if !row.ExpireTime.Equal(expAt(t, "2026-12-31 10:00:00")) {
-		t.Errorf("expire_time = %v，期望随行变量值 %v", *row.ExpireTime, expAt(t, "2026-12-31 10:00:00"))
+	if !revived.ExpireTime.Equal(expAt(t, "2026-12-31 10:00:00")) {
+		t.Errorf("expire_time = %v，期望随行变量值 %v（≈1d 说明表达式来源错接成了落地节点 prev）",
+			*revived.ExpireTime, expAt(t, "2026-12-31 10:00:00"))
 	}
 }
 
 // 两档变量源的正面对撞（"搞混会让变量名这一档跨栈给出不同答案"的钉子）：
-// 表达式 u_userId 在**两份变量里都有、值不同**——
+// 表达式 u_userId 配在**被回退掉的 approve 节点**上，且在**两份变量里都有、值不同**——
 //   - 随行拷贝那份（apply 行）＝本次办结人 zhangsan 的 ⇒ 2029-02-02 02:02:02 ← 契约要这个
 //   - 实例变量那份 ＝发起人的（prepareExecuteTask 的 mergeExecIntoInstance 不把操作人 u_*
 //     写回实例，issues/97）⇒ 2028-01-01 01:01:01
 //
-// 哪天把回退新建的变量源错接成 inst.Variables，这一格立刻红。
+// 哪天把回退新建的变量源错接成 inst.Variables，这一格立刻红
+// （落地节点 apply 也配了 "1d"，错接成 prev 同样红——实得 ≈1d）。
 func TestExpireTimeRollbackCreateReadsCarriedNotInstanceVariables(t *testing.T) {
 	eng, repo, defID := expHarness(t, "exp126_rbsrc", expRollbackFlow("exp126_rbsrc",
-		`"assignee":"zhangsan","expireTime":"u_userId"`))
-	row := expRollbackToApply(t, eng, repo, defID,
+		`"assignee":"zhangsan","expireTime":"1d"`, `"assignee":"zhangsan","expireTime":"u_userId"`))
+	revived, _ := expRollbackToApply(t, eng, repo, defID,
 		map[string]interface{}{"BUSINESS_NO": "B126R3"}, map[string]interface{}{})
-	if row.ExpireTime == nil {
+	if revived.ExpireTime == nil {
 		t.Fatalf("表达式 u_userId 两份变量里都有值，复活行却是空")
 	}
-	if !row.ExpireTime.Equal(expAt(t, "2029-02-02 02:02:02")) {
+	if !revived.ExpireTime.Equal(expAt(t, "2029-02-02 02:02:02")) {
 		t.Errorf("expire_time = %v，期望随行那份（办结人 zhangsan）%v；取到 %v 就说明变量源错接成了实例变量",
-			*row.ExpireTime, expAt(t, "2029-02-02 02:02:02"), expAt(t, "2028-01-01 01:01:01"))
+			*revived.ExpireTime, expAt(t, "2029-02-02 02:02:02"), expAt(t, "2028-01-01 01:01:01"))
 	}
 }
 

@@ -355,10 +355,15 @@ func (e *EngineImpl) rollbackToParent(ctx context.Context, flow *model.FlowModel
 	// 复活行只带数据类键：tf_*/csv_*/submitType/taskName/会签簿记都是"上次提交"的残留
 	nt.Variables = lineageVars(his.Variables)
 	putTaskVars(nt, map[string]interface{}{model.IsFirstTaskNodeKey: isFirst})
-	// issues/126 案 A 写点（回退/跳转新建）：到期时间按"被回退掉的那个"节点（＝prev）的表达式重算，
+	// issues/126 案 A 写点（回退/跳转新建）：到期时间按**被回退掉的那个节点**（＝当前行所属节点
+	// task.TaskName，boot2 里的 current）的表达式重算，**不是**复活行落地的节点（prev＝历史行所属
+	// 节点；form 等数据类字段仍照 prev 走，boot2 就是这个形状）。基准逐字：
+	// ProcessTaskServiceImpl.rejectTask :363 current = model.getNode(currentTask.getTaskName())
+	// → :385 expireTime = ((TaskModel)current).getExpireTime()
+	// → :387 task.setExpireTime(FlowUtil.processTime(expireTime, hisVariable))（java/php/csharp/rust 同此）
 	// 变量源用**随行拷贝那份变量** nt.Variables（＝boot2 的 hisVariable），不是实例变量——
 	// 两档搞混会让"表达式是个变量名"这一档跨栈给出不同答案
-	applyExpireTime(nt, expireExprOf(prev), nt.Variables)
+	applyExpireTime(nt, expireExprOf(findNode(flow, task.TaskName)), nt.Variables)
 	pn := e.surrogateProcessName(flow, inst)
 	e.saveNewTask(ctx, nt, pn)
 	e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID,
