@@ -127,6 +127,9 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 						prefixKey("loopCounter", curNode.ID):   lc + 1,
 						prefixKey("operatorList", curNode.ID):  actors,
 					})
+					// issues/126 案 A 写点：串行会签**推进到的那一位**同样按节点表达式算到期时间
+					// （变量源＝实例变量 inst.Variables，对齐 Java createCountersignTasks 走 this.variables）
+					applyExpireTime(nt, expireExprOf(curNode), inst.Variables)
 					// issues/116：顺序会签推进的新任务同样在建单期并入生效委托代理人
 					e.saveNewTask(ctx, nt, e.surrogateProcessName(flow, inst))
 					// TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
@@ -352,6 +355,10 @@ func (e *EngineImpl) rollbackToParent(ctx context.Context, flow *model.FlowModel
 	// 复活行只带数据类键：tf_*/csv_*/submitType/taskName/会签簿记都是"上次提交"的残留
 	nt.Variables = lineageVars(his.Variables)
 	putTaskVars(nt, map[string]interface{}{model.IsFirstTaskNodeKey: isFirst})
+	// issues/126 案 A 写点（回退/跳转新建）：到期时间按"被回退掉的那个"节点（＝prev）的表达式重算，
+	// 变量源用**随行拷贝那份变量** nt.Variables（＝boot2 的 hisVariable），不是实例变量——
+	// 两档搞混会让"表达式是个变量名"这一档跨栈给出不同答案
+	applyExpireTime(nt, expireExprOf(prev), nt.Variables)
 	pn := e.surrogateProcessName(flow, inst)
 	e.saveNewTask(ctx, nt, pn)
 	e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID,
@@ -423,6 +430,8 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 	ct, _ := stringFromProps(node.Properties, "countersignType")
 	now := time.Now()
 	form := formKeyOf(node)
+	// issues/126 案 A：节点到期表达式一次读好复用（未配 → ""，四处写点各自保持该列 NULL）
+	expr := expireExprOf(node)
 	pn := e.surrogateProcessName(flow, inst)
 	// 建单不变量 ②：判据沿用现成的 isFirstTaskNode（start 直接后继），同一次建单只算一次
 	isFirst := e.isFirstTaskNode(flow, node)
@@ -431,6 +440,8 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 		case "PARALLEL", "":
 			for _, actor := range actors {
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
+				// issues/126 案 A 写点：并行会签**全员**逐条按节点表达式算到期时间
+				applyExpireTime(nt, expr, inst.Variables)
 				e.saveNewTask(ctx, nt, pn)
 				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
@@ -442,11 +453,15 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 				prefixKey("loopCounter", node.ID):   0,
 				prefixKey("operatorList", node.ID):  actors,
 			})
+			// issues/126 案 A 写点：串行会签**首位成员**按节点表达式算到期时间
+			applyExpireTime(nt, expr, inst.Variables)
 			e.saveNewTask(ctx, nt, pn)
 			e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 		default:
 			for _, actor := range actors {
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
+				// issues/126 案 A 写点：未知 countersignType 兜底分支也按逐人建单，同样要算
+				applyExpireTime(nt, expr, inst.Variables)
 				e.saveNewTask(ctx, nt, pn)
 				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
@@ -457,6 +472,8 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 	if len(actors) > 1 {
 		nt.ActorIDs = actors
 	}
+	// issues/126 案 A 写点：普通建单（显式参与者入口）按节点表达式算到期时间
+	applyExpireTime(nt, expr, inst.Variables)
 	e.saveNewTask(ctx, nt, pn)
 	e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 	return nil
@@ -614,6 +631,8 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 	ct, _ := stringFromProps(node.Properties, "countersignType")
 	now := time.Now()
 	form := formKeyOf(node)
+	// issues/126 案 A：节点到期表达式一次读好复用（未配 → ""，四处写点各自保持该列 NULL）
+	expr := expireExprOf(node)
 	pn := e.surrogateProcessName(flow, inst)
 	// 建单不变量 ②（issues/121 P1）：判据沿用现成的 isFirstTaskNode（start 直接后继），一次算好复用
 	isFirst := e.isFirstTaskNode(flow, node)
@@ -624,6 +643,8 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 		case "PARALLEL":
 			for _, actor := range actors {
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
+				// issues/126 案 A 写点：并行会签**全员**逐条按节点表达式算到期时间
+				applyExpireTime(nt, expr, inst.Variables)
 				e.saveNewTask(ctx, nt, pn)
 				// TASK_CREATE：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
 				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
@@ -637,11 +658,15 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 				prefixKey("loopCounter", node.ID):   0,
 				prefixKey("operatorList", node.ID):  actors,
 			})
+			// issues/126 案 A 写点：串行会签**首位成员**按节点表达式算到期时间
+			applyExpireTime(nt, expr, inst.Variables)
 			e.saveNewTask(ctx, nt, pn)
 			e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 		default:
 			for _, actor := range actors {
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
+				// issues/126 案 A 写点：未知 countersignType 兜底分支也按逐人建单，同样要算
+				applyExpireTime(nt, expr, inst.Variables)
 				e.saveNewTask(ctx, nt, pn)
 				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
 			}
@@ -653,6 +678,9 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 	if len(actors) > 1 {
 		nt.ActorIDs = actors
 	}
+	// issues/126 案 A 写点：普通建单（引擎主建单入口）按节点表达式算到期时间；
+	// 节点没配 ⇒ 这一列保持 NULL（不写 now()、不写 ''、不写 0）
+	applyExpireTime(nt, expr, inst.Variables)
 	// issues/116：委托代理在**参与者落库前**并入（见 engine/surrogate.go），随任务一起落库
 	e.saveNewTask(ctx, nt, pn)
 	e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
