@@ -213,31 +213,55 @@ func TestIssue137BApplicantToken(t *testing.T) {
 	}, []string{"boss137"})
 }
 
-// TestIssue137BEmptyActorsIsNoop 空参与者集合：直调不建单、不报错（与主路径"解析不到参与者"同判），
-// 且不许 panic。这一档单独测，因为 c137Compare 的"至少建一行"护栏对它不适用。
-func TestIssue137BEmptyActorsIsNoop(t *testing.T) {
+// TestIssue137BEmptyActorsCreatesRowInstead 空参与者集合这一档**已于 2026-09-30 改判**：
+//
+// 旧格叫 TestIssue137BEmptyActorsIsNoop，钉的是"空参与者 ⇒ 不建单、不报错"——
+// 那正是 spec 02 §6.1/§6.2 第 3 条点名要拆掉的**死锁黑洞**形状
+// （实例停在 state=10 却一条可办行都没有，谁也办不动）。
+// owner 09-30 拍「任务类零参与者必须建单」⇒ 现在直调与主路径都必须建**一条 task_state=10 的行**，
+// 参与者为空集；空集的落库形状是 `wf_process_task_actor` **一行都不插**
+// （不是插一条 actor_id 空串——那是 issues/129/141 B 表"空归属值读全库"的上游进水口）。
+// 本格保留旧格另外两半判据（不 panic、不报错），只把"该不该建这一行"翻过来。
+func TestIssue137BEmptyActorsCreatesRowInstead(t *testing.T) {
 	flow, node := c137Node(map[string]interface{}{"assignee": "", "performType": 0})
 	e, repo := c137Harness(nil)
 	inst := c137Inst()
 	if err := e.createTaskWithActors(context.Background(), flow, node, inst, "boss137",
 		map[string]interface{}{}, nil, 9001); err != nil {
-		t.Fatalf("空参与者应返回 nil，实得 %v", err)
+		t.Fatalf("空参与者不该报错，实得 %v", err)
 	}
 	if err := e.createTaskWithActors(context.Background(), flow, node, inst, "boss137",
 		map[string]interface{}{}, []string{}, 9001); err != nil {
-		t.Fatalf("空切片参与者应返回 nil，实得 %v", err)
+		t.Fatalf("空切片参与者不该报错，实得 %v", err)
 	}
-	if got := c137Snapshot(t, repo, inst.ID); len(got) != 0 {
-		t.Fatalf("空参与者不该建出任务，实得 %v", got)
+	got := c137Snapshot(t, repo, inst.ID)
+	if len(got) != 2 {
+		t.Fatalf("两次空参与者调用应各建一行（改判后），实得 %d 行 %v", len(got), got)
 	}
-	// 主路径同档：解析不到参与者也不建单、不报错
+	for _, line := range got {
+		if !strings.Contains(line, "actors=[]") {
+			t.Fatalf("行的参与者必须是空集，实得 %v", line)
+		}
+		if !strings.Contains(line, "state=10") {
+			t.Fatalf("改判后要建的是 DOING 行，实得 %v", line)
+		}
+	}
+	// 主路径同档：解析不到参与者也照样建这一行
 	e2, repo2 := c137Harness(nil)
 	inst2 := c137Inst()
 	if err := e2.createTask(context.Background(), flow, node, inst2, "boss137", map[string]interface{}{}, 9001); err != nil {
-		t.Fatalf("主路径空参与者应返回 nil，实得 %v", err)
+		t.Fatalf("主路径空参与者不该报错，实得 %v", err)
 	}
-	if got := c137Snapshot(t, repo2, inst2.ID); len(got) != 0 {
-		t.Fatalf("主路径空参与者也不该建出任务，实得 %v", got)
+	if got2 := c137Snapshot(t, repo2, inst2.ID); len(got2) != 1 || !strings.Contains(got2[0], "actors=[]") {
+		t.Fatalf("主路径也要建一行零参与者的 DOING 行，实得 %v", got2)
+	}
+	// 落库形状：参与者**零行**（不是插一条空串）
+	tasks, err := repo2.FindDoingTasks(context.Background(), inst2.ID, nil)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("应恰有一行 DOING，实得 %d 行 err=%v", len(tasks), err)
+	}
+	if actors, _ := repo2.FindTaskActors(context.Background(), tasks[0].ID); len(actors) != 0 {
+		t.Fatalf("零参与者行不得往 wf_process_task_actor 插任何一行（含空串），实得 %v", actors)
 	}
 }
 

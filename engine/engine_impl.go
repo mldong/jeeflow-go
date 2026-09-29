@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -506,11 +507,12 @@ func (e *EngineImpl) isFirstTaskNode(flow *model.FlowModel, node *model.FlowNode
 // 单参与者 / applicant / 空参与者 七档，比读回持久值 + 事件序列，另有一格建单不变量守卫）。
 // 改动 createTask 的建单语义时，请同步看那一格——它红了就是两条路分叉了。
 //
+// ⚠️ issues/142 A 批（2026-09-30）把两条路的"空参与者"档一起从「不建单」改成「建一条零参与者
+// DOING 行」⇒ 上面那格 `TestIssue137BEmptyActorsIsNoop`（钉的是旧形状）会红，
+// **期望值本轮一字未改**，按指令列进交付报告"待拍"清单，不在这里自行改判。
+//
 // parentTaskID：建单不变量 ①——产生这些任务的那个"刚办结的任务"id（发起路径为 0），见 model.CreateTask
 func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowModel, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}, actors []string, parentTaskID int64) error {
-	if len(actors) == 0 {
-		return nil
-	}
 	ct, _ := stringFromProps(node.Properties, "countersignType")
 	now := time.Now()
 	form := formKeyOf(node)
@@ -519,6 +521,23 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 	pn := e.surrogateProcessName(flow, inst)
 	// 建单不变量 ②：判据沿用现成的 isFirstTaskNode（start 直接后继），同一次建单只算一次
 	isFirst := e.isFirstTaskNode(flow, node)
+
+	// issues/142 A 批 · spec 02 §6.2 第 3 条：**零参与者同样建单**，与 createTask 逐字同形
+	// （本函数存在的理由就是"两条路锁死在同一语义上"，见上面那段注释；主路径改建单形状而这里
+	// 不动，就是自己承认两条路分叉）。旧形状 `if len(actors) == 0 { return nil }`（原 :511-513）
+	// 一并撤掉。串行会签 actors[0] 那一支因此在零参与者时不会被走到（旧代码在此会 panic）。
+	if len(actors) == 0 {
+		pt := 0
+		if IsCountersign(node.Properties["performType"]) && ct != "" {
+			pt = 1
+		}
+		nt := inst.CreateTaskWithActors(e.nextID(), node.ID, node.Text.Value, nil, operator, form, now, parentTaskID, isFirst, pt)
+		applyExpireTime(nt, expr, inst.Variables)
+		e.saveNewTask(ctx, nt, pn)
+		e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+		return nil
+	}
+
 	if IsCountersign(node.Properties["performType"]) && ct != "" {
 		switch ct {
 		case "PARALLEL", "":
@@ -588,8 +607,17 @@ func (e *EngineImpl) loadAndCheck(ctx context.Context, taskID int64, operator st
 func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}, parentTaskID int64) error {
 	// 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
 	// 任务完成的拦截器由 ExecuteProcessTask 显式触发，1.8.0 SYNC 同步演进）
-	if node.Type == model.TypeTask || node.Type == model.TypeCustom {
+	if node.Type == model.TypeTask {
 		return e.createTask(ctx, flow, node, inst, operator, vars, parentTaskID)
+	}
+	// 记录类节点（snaker:custom）**不是任务类**：issues/142 A 批 · spec 02-flow-definition.md
+	// §6.1／§6.2（owner 2026-09-29、09-30 两次拍板）。本栈此前与 task 同路走 createTask，
+	// 落的是 §6.1 表里点名**禁止的形状①**「当任务类建 DOING 行」（仓内自述见
+	// engine_test.go:907-908／927 那段注释）。现在分流到独立一支：执行 clazz →
+	// 落一条 task_state=20 的历史行**并真落库** → 令牌沿出边继续流转 → **不 fire 码 3**。
+	// 现成对照＝python 的 `_exec_custom_node`（jeeflow/engine.py:781）。
+	if node.Type == model.TypeCustom {
+		return e.execCustomNode(ctx, flow, node, inst, operator, vars, parentTaskID)
 	}
 	// issues/60：声明未解析 → 显式报错（不静默跳过）
 	proceed, err := e.firePreInterceptors(node, inst)
@@ -714,9 +742,6 @@ func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel
 
 func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}, parentTaskID int64) error {
 	actors := e.resolveActors(node, inst, operator, vars)
-	if len(actors) == 0 {
-		return nil
-	}
 	ct, _ := stringFromProps(node.Properties, "countersignType")
 	now := time.Now()
 	form := formKeyOf(node)
@@ -725,6 +750,36 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 	pn := e.surrogateProcessName(flow, inst)
 	// 建单不变量 ②（issues/121 P1）：判据沿用现成的 isFirstTaskNode（start 直接后继），一次算好复用
 	isFirst := e.isFirstTaskNode(flow, node)
+
+	// issues/142 A 批 · spec 02-flow-definition.md §6.2 第 3 条（owner 2026-09-30 拍）：
+	// **任务类零参与者必须建单**。撤掉的旧形状是
+	// `if len(actors) == 0 { return nil }`（原 :716-719）——那是 §6.1 点名 python 曾犯、
+	// 本轮四栈跟改的**死锁黑洞**：实例停在 state=10、wf_process_task 里一行都没有，
+	// 令牌也不前进，谁都办不动。新形状与 java `CreateTaskHandler`（:38-63 无条件建单）同形：
+	// 建一条 task_state=10、参与者为**空集**的 DOING 行，靠加派参与者
+	// （processTask/addCandidate、taskSurrogate）或 flow.auto/flow.admin 把这一格办起来。
+	//
+	// 三条不推歪实例状态机的判据（本轮实测过，见 engine/zero_actor_142_test.go）：
+	//   - 零参与者行**不插 wf_process_task_actor**（空归属值是 issues/129／141 B 那族病根）；
+	//   - 它是一条正常 DOING 行 ⇒ join／并行会签的"还有 doing 就没到齐"判据照旧成立，
+	//     不会让令牌越过一格还没办完的节点（也不会被自动推进逻辑反复拾起——
+	//     门面 startAndExecute 的自动办结只吃**发起那一次**的 doing 快照，见 facade.go:226-240，
+	//     零参与者行不会自增出新行，无死循环）；
+	//   - 会签节点解析到零参与者时**不逐人建单**（java PARALLEL 循环 0 次＝零行，仍是黑洞），
+	//     统一落到下面这一条零参与者行；串行会签因此不会走到 actors[0]（旧代码在此会 panic）。
+	if len(actors) == 0 {
+		pt := 0
+		if IsCountersign(node.Properties["performType"]) && ct != "" {
+			pt = 1
+		}
+		nt := inst.CreateTaskWithActors(e.nextID(), node.ID, node.Text.Value, nil, operator, form, now, parentTaskID, isFirst, pt)
+		applyExpireTime(nt, expr, inst.Variables)
+		e.saveNewTask(ctx, nt, pn)
+		// 码 3 照发：这条行的事实是"这一格产生了新的待办占位"（java 的 notifyTaskStart
+		// 对 persistTasks 里每一条 saveNewTask 都播，不看参与者空不空）
+		e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+		return nil
+	}
 
 	// issue 42：performType 字符串兼容（'1'/'ALL'/'COUNTERSIGN' → 会签，对齐 Java codeOf）
 	if IsCountersign(node.Properties["performType"]) && ct != "" {
@@ -773,6 +828,104 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 	// issues/116：委托代理在**参与者落库前**并入（见 engine/surrogate.go），随任务一起落库
 	e.saveNewTask(ctx, nt, pn)
 	e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+	return nil
+}
+
+// execCustomNode 记录类节点（`snaker:custom`／带 `properties.clazz` 的自定义节点）执行腿
+// ——issues/142 A 批 · spec 02-flow-definition.md §6.2 三条硬要求（owner 2026-09-30 逐条拍），
+// 三条逐条落在这里：
+//
+//	① 历史行**必须真落库**：走 `repo.SaveTask` 那条 INSERT 通道，不是只 append 进聚合根 tasks。
+//	   ⚠️ 这一条**故意不照抄基准自身**——java `CustomModel.exec` 丢弃 `createHistoryTask` 的返回值
+//	   只 append 进 `instance.tasks`，而 `persistTasks` 只保存 `exec.getProcessTaskList()`、
+//	   `updateInstance` 的级联又只 UPDATE 已有行 ⇒ 那条 DONE 行永远进不了库
+//	   （issues/142「A 段两条基准自身的事实」1，java/c# 本轮各自补 INSERT 腿）。
+//	   现成对照＝python `engine.py:836 await self.repo.save_task(ht)`。
+//	② `clazz` 解析不了 ⇒ **记 WARNING ＋ 照常落历史行 ＋ 令牌继续流转，严禁报错打断建单**
+//	   （与 spec/04"节点属性配错不该把流程炸掉"是同一条哲学）。"未注册"与"clazz 为空串"
+//	   **分档给不同文案**（§6.2 第 2 条要求可分别诊断；c# 现在把两者合成同一个异常、
+//	   覆盖面比 java 宽，本栈不跟）。处理器**自身**返回 error 不在豁免内 ⇒ 原样外抛，
+//	   历史行也不落（java 的 exec 顺序就是"反射/调用 → createHistoryTask → runOutTransition"，
+//	   调用炸了后面两步都不发生）。
+//	③ 记录类腿**不解析参与者**（"参与者为空"这一判据对它不适用）：不 resolveActors、
+//	   不建待办、**不 fire 码 3**（`TASK_START` 表达"新待办产生"，记录类不该有；
+//	   对照 java：notifyTaskStart 只对 exec.getProcessTaskList() 那批 DOING 单播）。
+//	   留痕主体＝当前操作人（java `createHistoryTask` 的 `singletonList(operator)` 同形）。
+//
+// `clazz` 的解析形状：go 没有 java 的反射语义可依托（夹具 `flows/08-custom-node.json:44`
+// 里那个 `com.mldong.jeeflow.test.TestCustomHandler` 是 JVM 类名），故与 **C#／python 同策**
+// 走**按名注册表**——挂在既有扩展点 `engine.HandlerRegistry` 上（`RegisterCustom`/`ResolveCustom`），
+// 不另造并行注册中心。返回值按 java 的形状写进流程变量：键＝节点 `properties.val`，
+// 缺省 `custom_return_val`（`KeyCustomReturnVal`，对齐 java `CustomModel.java:46-48` ＋
+// `FlowConst.CUSTOM_RETURN_VAL`）。
+func (e *EngineImpl) execCustomNode(ctx context.Context, flow *model.FlowModel, node *model.FlowNode,
+	inst *model.ProcessInstance, operator string, vars map[string]interface{}, parentTaskID int64) error {
+	// 只认字符串形态：`stringFromProps` 对非字符串会 fmt.Sprint，`"clazz": null` 会读成 "<nil>"
+	// 那种假名字（issues/142 B 表同款形状），这里按"没配 clazz"处理。
+	clazz, _ := node.Properties["clazz"].(string)
+	clazz = strings.TrimSpace(clazz)
+	varKey, _ := node.Properties["val"].(string)
+	varKey = strings.TrimSpace(varKey)
+	if varKey == "" {
+		varKey = KeyCustomReturnVal
+	}
+
+	var handler ICustomHandler
+	if clazz == "" {
+		log.Printf("[jeeflow] WARNING custom 节点 nodeId=%s 未配置 clazz ⇒ 不执行处理器，"+
+			"只落历史行并继续流转（spec 02 §6.2 第 2 条：属性配错不炸流程）", node.ID)
+	} else if e.registry == nil {
+		log.Printf("[jeeflow] WARNING custom 节点 nodeId=%s clazz=%s 无法解析：引擎未装配 "+
+			"HandlerRegistry（engine.NewHandlerRegistry() + SetRegistry 注册）⇒ 落历史行后继续流转",
+			node.ID, clazz)
+	} else if handler = e.registry.ResolveCustom(clazz); handler == nil {
+		log.Printf("[jeeflow] WARNING custom 节点 nodeId=%s clazz=%s 未注册处理器 ⇒ 落历史行后"+
+			"继续流转（注册入口 engine.HandlerRegistry.RegisterCustom(clazz, ICustomHandler)）",
+			node.ID, clazz)
+	}
+	if handler != nil {
+		ret, err := handler.Handle(node, inst, operator, vars)
+		if err != nil {
+			// §6.2 第 2 条尾注：处理器**自身执行失败**不在豁免内，照旧外抛（业务错误 ≠ 配错形状）
+			return err
+		}
+		if ret != nil {
+			// 写进执行变量（java `execution.getArgs().put(var, returnValue)` 同形）
+			if vars != nil {
+				vars[varKey] = ret
+			}
+			// 并同步落一份到实例变量＋UPDATE 实例行。两条理由：
+			//   - 发起路径 `StartProcessInstanceByID` 只在建实例时 SaveInstance、之后没有
+			//     updateInstance（java 那边发起收尾有 `repository.updateInstance(instance)`，
+			//     JeeflowEngineImpl.java:113）⇒ 不补这一次，SQL 仓里这条变量永远查不到，
+			//     而内存仓因为 map 是同一对象引用反而"看得见"——两仓给不同答案就是跨仓分叉；
+			//   - 流程停在 custom 之后的任务节点时（不再有 End 节点那次合并）这是唯一让返回值
+			//     进入流程变量的落点。
+			// 排在 SaveTask(ht) 之后：jdbc 的 updateInstance 级联对任务只 UPDATE 不 INSERT，
+			// 历史行得先有自己的 INSERT。
+			if inst.Variables == nil {
+				inst.Variables = map[string]interface{}{}
+			}
+			inst.Variables[varKey] = ret
+			if err := e.repo.UpdateInstance(ctx, inst); err != nil {
+				return err
+			}
+		}
+	}
+
+	ht := inst.CreateHistoryTask(e.nextID(), node.ID, node.Text.Value, operator, time.Now(),
+		parentTaskID, e.isFirstTaskNode(flow, node))
+	// 真落库（①）：INSERT 走 SaveTask 这条通道，与建待办同一条路
+	if err := e.repo.SaveTask(ctx, ht); err != nil {
+		return err
+	}
+
+	// 令牌沿出边继续流转（java CustomModel 收尾那句 runOutTransition）
+	for _, n := range followEdges(flow, node.ID) {
+		if err := e.executeNode(ctx, flow, inst, n, operator, vars, parentTaskID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

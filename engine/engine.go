@@ -40,4 +40,8 @@ const (
 	// issues/121 P1：行级首任务节点标记（引擎建单时落库，对齐 Java FlowConst.IS_FIRST_TASK_NODE）
 	// 值与 model.IsFirstTaskNodeKey 同——建单写入在 model.CreateTask（唯一工厂），此处供引擎/门面读出口引用
 	KeyIsFirstTaskNode = model.IsFirstTaskNodeKey
+	// KeyCustomReturnVal 记录类（snaker:custom）节点处理器返回值缺省写入的变量键
+	// （issues/142 A 批 · spec 02 §6.2 第 2 条，逐字对齐 Java `FlowConst.CUSTOM_RETURN_VAL`
+	// ＝"custom_return_val"，enums/FlowConst.java:107；节点 `properties.val` 给了名字时用名字）。
+	KeyCustomReturnVal = "custom_return_val"
 )

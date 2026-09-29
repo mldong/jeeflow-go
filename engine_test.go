@@ -923,8 +923,15 @@ const customFirstFlow = `{
   ]
 }`
 
-// Test154CreateWritesLineageCustomNode 自定义节点建单同样兑现两条不变量：它是 start 直接后继 ⇒
-// 首节点标记 true（Java 的历史行在 Go 里是这条 DOING 行），且发起路径 parent 落 0。
+// Test154CreateWritesLineageCustomNode 记录类节点的留痕行同样兑现两条血缘不变量。
+//
+// ⚠️ 本格的读法于 2026-09-30 按 issues/142 §5 第 2 条**改判**（owner 拍「记录类落 DONE 历史行」）：
+// 旧形状是"Go 的 TypeCustom 建单复用 createTask ⇒ 一条 DOING 行，测试再把它办掉"，
+// 那既是 §6.1 表里点名禁止的形状①（把记录类当任务类建待办），也与 java
+// `CustomModel.exec` → `createHistoryTask`（task_state=20）不同形。
+// 现在 cust1 出生即 DONE、没人能办它，令牌由 custom 腿自己沿出边走到 task1——
+// **血缘两不变量的断言一字未改**（parent 与行级 isFirstTaskNode 仍然要随行落库），
+// 改的是"从哪张脸读这一行"（FindHistoryTasks 而不是 doingByName）与"下一步该谁动"。
 func Test154CreateWritesLineageCustomNode(t *testing.T) {
 	eng, repo := setup()
 	def := &model.ProcessDefine{Name: "custom-first", DisplayName: "custom-first", Type: "test",
@@ -934,14 +941,33 @@ func Test154CreateWritesLineageCustomNode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	cust := doingByName(t, repo, inst.ID, "cust1")
-	wantParent(t, cust, 0)
-	wantFirstFlag(t, cust, true)
-	approve(t, eng, repo, cust, "ext-sys")
 
+	history, err := repo.FindHistoryTasks(context.Background(), inst.ID)
+	if err != nil {
+		t.Fatalf("读历史行: %v", err)
+	}
+	var cust *model.ProcessTask
+	for _, tk := range history {
+		if tk.TaskName == "cust1" {
+			cust = tk
+		}
+	}
+	if cust == nil {
+		t.Fatalf("记录类节点的留痕行必须落库（spec 02 §6.2 第 1 条），历史行里没有 cust1：%+v", history)
+	}
+	if !cust.IsFinished() {
+		t.Fatalf("cust1 留痕行该是 DONE(20)，实得 TaskState=%d", cust.TaskState)
+	}
+	wantParent(t, cust, 0)      // 发起路径无当前任务 ⇒ parent 落 0
+	wantFirstFlag(t, cust, true) // cust1 是 start 直接后继
+
+	// 令牌自己走过 custom 落到 task1：task1 才是这条流上唯一那条待办
 	task1 := doingByName(t, repo, inst.ID, "task1")
-	wantParent(t, task1, cust.ID)
+	wantParent(t, task1, 0)      // 与 java 同形：这一支的当前任务仍是"发起时那条"，无 ⇒ 0
 	wantFirstFlag(t, task1, false)
+	if doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil); len(doing) != 1 {
+		t.Fatalf("记录类节点不得产生第二条待办，实得 %v", doing154Names(doing))
+	}
 }
 
 // Test154RollbackLineageNegatives issues/121 P2 两格负向：
@@ -949,6 +975,14 @@ func Test154CreateWritesLineageCustomNode(t *testing.T) {
 // ② 血缘前驱跨不过 fork（boot2 canRejected 遇 fork/join/start 是跳过该入边、不再深入）
 //
 //	⇒ 20010008。夹具 04-fork-join：分支行的 parent 是 fork 之前的 apply。
+func doing154Names(ts []*model.ProcessTask) []string {
+	var out []string
+	for _, t := range ts {
+		out = append(out, t.TaskName)
+	}
+	return out
+}
+
 func Test154RollbackLineageNegatives(t *testing.T) {
 	ctx := context.Background()
 
