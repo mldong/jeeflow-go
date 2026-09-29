@@ -68,7 +68,8 @@ func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int6
 	// 聚合根工厂创建实例
 	inst := model.NewProcessInstance(e.nextID(), defineID, operator, vars, now)
 	e.repo.SaveInstance(ctx, inst)
-	e.fireEvent(ProcessEvent{Type: EventProcessStart, InstanceID: inst.ID, Operator: operator})
+	// PROCESS_INSTANCE_START(1)：实例行 insert 之后 fire（§11.3 触发时机列）
+	e.fireEvent(ProcessEvent{Type: EventProcessInstanceStart, InstanceID: inst.ID, Operator: operator})
 
 	startNode := findNodeByType(&flow, model.TypeStart)
 	if startNode == nil {
@@ -88,7 +89,20 @@ func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int6
 // ─── Execute ───────────────────────────────────────────────────────────────────
 
 func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args)
+	// issues/127 / spec 11-events §11.7 办理时抄送（tf_ccActors）：本栈此前整条腿缺失。
+	// 覆盖面按 §11.7 边界 2 收窄到**只有 executeProcessTask 这一条路径**建 cc——基准＝Java
+	// JeeflowEngineImpl 里 handleCcActors 的唯一调用点就在 executeProcessTask，
+	// executeAndJumpTask / jumpToEnd / rollbackToOperator 三档都没有这条腿
+	// （go 第一轮把漏斗挂在 prepareExecuteTask 上 ⇒ 四档全建，属"单栈超集"跨栈分叉，已纠）。
+	//
+	// 漏斗挂在"任务行 update 落库之后、TASK_COMPLETE(5) fire 之前"这个钩子位上：
+	// ① 与任务更新同一个 ctx（jdbc 仓 WithTx 绑 ctx，集成层包事务即同事务）＝§11.7 边界 1；
+	// ② "建 cc 行落库 → 逐人 fire 码 4"的单一漏斗形状不变（HandleCcActors 一条路）。
+	// 不带 tf_ccActors ⇒ parseCcActors 给空集，零写入零 fire，行为与历史一致。
+	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args,
+		func(ctx context.Context, instanceID int64) error {
+			return e.HandleCcActors(ctx, instanceID, operator, args[KeyCcActors])
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -132,8 +146,9 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 					applyExpireTime(nt, expireExprOf(curNode), inst.Variables)
 					// issues/116：顺序会签推进的新任务同样在建单期并入生效委托代理人
 					e.saveNewTask(ctx, nt, e.surrogateProcessName(flow, inst))
-					// TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
-					e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: curNode.ID, Operator: operator})
+					// PROCESS_TASK_START：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
+					e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID,
+						NodeID: curNode.ID, Operator: operator, Actors: nt.ActorIDs})
 					inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
 					return inst, nil
 				}
@@ -186,14 +201,22 @@ func syncTaskToAggregate(inst *model.ProcessInstance, task *model.ProcessTask) {
 // ─── Reject ────────────────────────────────────────────────────────────────────
 
 func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	_, inst, _, _, err := e.prepareExecuteTask(ctx, taskID, operator, args)
+	// §11.7 边界 2：跳转·回退档不挂抄送钩子（cc 钩子传 nil）——tf_ccActors 在这一档不建 cc、
+	// 不发 CC_CREATE，与 Java executeAndJumpToEnd（无 handleCcActors）同形。
+	_, inst, _, _, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
 	if err != nil {
 		return nil, err
 	}
 	// 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
 	inst.Reject(time.Now())
-	e.repo.UpdateInstance(ctx, inst)
-	e.fireEvent(ProcessEvent{Type: EventProcessReject, InstanceID: inst.ID, TaskID: taskID, Operator: operator})
+	if err := e.repo.UpdateInstance(ctx, inst); err != nil {
+		return nil, err
+	}
+	// 实例终态统一 PROCESS_INSTANCE_END(2)，靠载荷 state 分（§11.6：旧 EventProcessReject
+	// 那一支"实例级拒绝"并入 2；任务级退回在 prepareExecuteTask 已发 TASK_REJECT(6)）。
+	// 任务退回(6) 与本支(2) 不互斥——两个事实：任务被拒 + 实例进终态。
+	e.fireEvent(ProcessEvent{Type: EventProcessInstanceEnd, InstanceID: inst.ID,
+		TaskID: taskID, Operator: operator, State: int(inst.State)})
 	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
 	return inst, nil
 }
@@ -201,7 +224,8 @@ func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, oper
 // ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）─────
 
 func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
-	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args)
+	// §11.7 边界 2：JUMP/ROLLBACK 两档都不建 cc（cc 钩子传 nil），与 Java executeAndJumpTask 同形
+	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +261,8 @@ func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, opera
 // ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）──────────────
 
 func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args)
+	// §11.7 边界 2：退发起人档不建 cc（cc 钩子传 nil），与 Java executeAndJumpToFirstTaskNode 同形
+	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +292,13 @@ func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID i
 // 过滤 → 完成任务（子实体状态转换 + 实例变量合并，经 UpdateInstance 级联落库）→ 返回
 // 流程模型 + 合并后执行变量。Java jump 路径不废弃其余 DOING 任务（会签兄弟任务不受影响），
 // 此处保持一致。
-func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessTask, *model.ProcessInstance, *model.FlowModel, map[string]interface{}, error) {
+//
+// onTaskUpdated 是"任务行已 update 落库、TASK_COMPLETE(5)/TASK_REJECT(6) 尚未 fire"时刻的
+// 可选钩子，签名收实例 id（钩子要同 ctx、要 inst.ID）。**只有 ExecuteProcessTask 传它**
+// （传的是抄送漏斗 HandleCcActors），跳转·回退三档传 nil —— spec §11.7 边界 2 要求
+// "办理抄送只算 executeProcessTask 一条"，把钩子做成调用方注入而不是写死在公共序言里，
+// 覆盖面就钉在类型上：新加一条走 prepareExecuteTask 的动作默认不带 cc。
+func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, onTaskUpdated func(ctx context.Context, instanceID int64) error) (*model.ProcessTask, *model.ProcessInstance, *model.FlowModel, map[string]interface{}, error) {
 	task, inst, err := e.loadAndCheck(ctx, taskID, operator)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -293,16 +324,54 @@ func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, opera
 	now := time.Now()
 	// 聚合根：完成任务（子实体状态转换 + 实例变量合并）
 	inst.CompleteTask(task, operator, vars, now)
-	e.repo.UpdateTask(ctx, task)
+	// spec §11.2 原则 3：任务行 update **成功**之后才 fire（失败直接传播，不发假事件）
+	if err := e.repo.UpdateTask(ctx, task); err != nil {
+		return nil, nil, nil, nil, err
+	}
 	// v1.0.1：updateInstance 级联持久化依赖聚合内任务副本为最新状态，
 	// CompleteTask 改的是外部任务对象，需同步回聚合根
 	syncTaskToAggregate(inst, task)
-	e.fireEvent(ProcessEvent{Type: EventTaskComplete, InstanceID: inst.ID, TaskID: task.ID, NodeID: task.TaskName, Operator: operator})
+
+	// issues/127 / spec §11.7：办理时抄送不在公共序言里无条件跑——由调用方按路径注入钩子
+	// （只有 ExecuteProcessTask 注入 cc 漏斗；跳转·回退三档注入 nil ⇒ 本轮不建 cc、不发码 4）。
+	// 排在任务行 update 之后、任务事件 fire 之前：与任务更新同一个 ctx（jdbc 仓 WithTx 绑 ctx，
+	// 集成层包事务即同事务），且 cc 行落库后才逐人 fire CC_CREATE（§11.2 原则 3）。
+	if onTaskUpdated != nil {
+		if err := onTaskUpdated(ctx, inst.ID); err != nil {
+			return nil, nil, nil, nil, err
+		}
+	}
+
+	// 任务被办掉这件事：TASK_COMPLETE(5) 与 TASK_REJECT(6) **互斥**（§11.3 码 5/6 注），
+	// 退回/拒绝族动作只发 6，具体退法靠载荷 submitType 分（§11.2 原则 2「码粗、载荷细」）。
+	submit := toIntOf(vars[KeySubmitType])
+	evt := ProcessEvent{
+		Type: EventTaskComplete, InstanceID: inst.ID, TaskID: task.ID,
+		NodeID: task.TaskName, Operator: operator, SubmitType: &submit,
+	}
+	if isRejectSubmitType(vars[KeySubmitType]) {
+		evt.Type = EventTaskReject
+	}
+	e.fireEvent(evt)
 
 	// issues/97：实例变量写回排除操作人 u_*，保留 start 注入的发起人 u_*（u_realName 恒为发起人）
 	inst.Variables = mergeExecIntoInstance(baseVars, vars)
 	e.repo.UpdateInstance(ctx, inst)
 	return task, inst, &flow, vars, nil
+}
+
+// isRejectSubmitType 办理动作是否属"退回/拒绝"族 ⇒ 走 TASK_REJECT(6) 而非 TASK_COMPLETE(5)。
+// 2 REJECT（拒绝即结束）/ 3 ROLLBACK 退回上一步 / 6 ROLLBACK_TO_OPERATOR 退发起人 /
+// 20 COUNTERSIGN_DISAGREE 软拒绝——§11.3 码 6 事实列点名"含退发起人、软拒绝、跳转回退"。
+// 未提交 submitType（toIntOf 给 -1，引擎直调路径常见）⇒ 不算退回，维持 5 的既有语义。
+// ⚠️ 4 JUMP 是"跳到指定节点"，可能是正向跳转，按 5 处理（本轮唯一存疑档，见收口报告）。
+func isRejectSubmitType(v interface{}) bool {
+	switch toIntOf(v) {
+	case int(model.SubmitTypeReject), int(model.SubmitTypeRollback),
+		int(model.SubmitTypeRollbackToOperator), int(model.SubmitTypeCountersignDisagree):
+		return true
+	}
+	return false
 }
 
 // rollbackToParent 退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的
@@ -366,8 +435,8 @@ func (e *EngineImpl) rollbackToParent(ctx context.Context, flow *model.FlowModel
 	applyExpireTime(nt, expireExprOf(findNode(flow, task.TaskName)), nt.Variables)
 	pn := e.surrogateProcessName(flow, inst)
 	e.saveNewTask(ctx, nt, pn)
-	e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID,
-		NodeID: prev.ID, Operator: operator})
+	e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID,
+		NodeID: prev.ID, Operator: operator, Actors: nt.ActorIDs})
 	return nil
 }
 
@@ -448,7 +517,7 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 				// issues/126 案 A 写点：并行会签**全员**逐条按节点表达式算到期时间
 				applyExpireTime(nt, expr, inst.Variables)
 				e.saveNewTask(ctx, nt, pn)
-				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
+				e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 			}
 		case "SEQUENTIAL":
 			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, parentTaskID, isFirst, 1)
@@ -461,14 +530,14 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 			// issues/126 案 A 写点：串行会签**首位成员**按节点表达式算到期时间
 			applyExpireTime(nt, expr, inst.Variables)
 			e.saveNewTask(ctx, nt, pn)
-			e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
+			e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 		default:
 			for _, actor := range actors {
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
 				// issues/126 案 A 写点：未知 countersignType 兜底分支也按逐人建单，同样要算
 				applyExpireTime(nt, expr, inst.Variables)
 				e.saveNewTask(ctx, nt, pn)
-				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
+				e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 			}
 		}
 		return nil
@@ -480,7 +549,7 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 	// issues/126 案 A 写点：普通建单（显式参与者入口）按节点表达式算到期时间
 	applyExpireTime(nt, expr, inst.Variables)
 	e.saveNewTask(ctx, nt, pn)
-	e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
+	e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 	return nil
 }
 
@@ -557,8 +626,13 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 		}
 		// issues/97：结束节点写回同样排除操作人 u_*（保留发起人 u_*，与 prepareExecuteTask 一致）
 		inst.Variables = mergeExecIntoInstance(inst.Variables, vars)
-		e.repo.UpdateInstance(ctx, inst)
-		e.fireEvent(ProcessEvent{Type: EventProcessFinish, InstanceID: inst.ID, Operator: operator})
+		if err := e.repo.UpdateInstance(ctx, inst); err != nil {
+			return err
+		}
+		// PROCESS_INSTANCE_END(2)：实例 state 落库（20 办结 / 45 拒绝）之后 fire，
+		// state 进载荷——§11.6「实例终态统一 2，办结/拒绝靠 state 分」
+		e.fireEvent(ProcessEvent{Type: EventProcessInstanceEnd, InstanceID: inst.ID,
+			NodeID: node.ID, Operator: operator, State: int(inst.State)})
 		return nil
 	}
 	return nil
@@ -652,7 +726,7 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 				applyExpireTime(nt, expr, inst.Variables)
 				e.saveNewTask(ctx, nt, pn)
 				// TASK_CREATE：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
-				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
+				e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 			}
 		case "SEQUENTIAL":
 			// 顺序会签任务也是会签任务（issues/57 E29 修正：仅普通分支默认 0）
@@ -666,14 +740,14 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 			// issues/126 案 A 写点：串行会签**首位成员**按节点表达式算到期时间
 			applyExpireTime(nt, expr, inst.Variables)
 			e.saveNewTask(ctx, nt, pn)
-			e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
+			e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 		default:
 			for _, actor := range actors {
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
 				// issues/126 案 A 写点：未知 countersignType 兜底分支也按逐人建单，同样要算
 				applyExpireTime(nt, expr, inst.Variables)
 				e.saveNewTask(ctx, nt, pn)
-				e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
+				e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 			}
 		}
 		return nil
@@ -688,7 +762,7 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 	applyExpireTime(nt, expr, inst.Variables)
 	// issues/116：委托代理在**参与者落库前**并入（见 engine/surrogate.go），随任务一起落库
 	e.saveNewTask(ctx, nt, pn)
-	e.fireEvent(ProcessEvent{Type: EventTaskCreate, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator})
+	e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 	return nil
 }
 

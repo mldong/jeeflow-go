@@ -79,7 +79,7 @@ func New(e *engine.EngineImpl, repo spi.ProcessRepository, ext spi.ProcessExtRep
 	return &Facade{engine: e, repo: repo, extRepo: ext}
 }
 
-// Flow 统一入口（action 清单见 spec §11.2）
+// Flow 统一入口（action 清单见规范 06-facade；事件契约见规范 11-events）
 func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]interface{}) {
 	// 扩展仓储未配置等内部 panic 收敛为业务错误
 	defer func() {
@@ -215,33 +215,12 @@ func (f *Facade) startAndExecute(args map[string]interface{}) (interface{}, erro
 	if err != nil {
 		return nil, err
 	}
-	// issues/56 E28：发起时抄送（f_ccActors）创建 cc 实例（对齐 Java enableCcActors 语义）
-	if cc, ok := flowArgs["f_ccActors"]; ok {
-		var actors []string
-		switch v := cc.(type) {
-		case []interface{}:
-			for _, a := range v {
-				actors = append(actors, fmt.Sprintf("%v", a))
-			}
-		case string:
-			for _, a := range strings.Split(v, ",") {
-				if a = strings.TrimSpace(a); a != "" {
-					actors = append(actors, a)
-				}
-			}
-		}
-		if len(actors) > 0 {
-			if err := f.repo.CreateCcInstance(context.Background(), inst.ID, operator, actors...); err != nil {
-				return nil, err
-			}
-			// issues/102：cc 实例落库后逐抄送人 fire CC_CREATE（ccActorId 直传，对齐
-			// PHP/Java；接收人过滤归集成层监听器）。无监听器时 FireEvent 零副作用。
-			for _, actor := range actors {
-				f.engine.FireEvent(engine.ProcessEvent{
-					Type: engine.EventCCCreate, InstanceID: inst.ID, CcActorID: actor,
-				})
-			}
-		}
+	// issues/56 E28 / spec 11-events §11.7：发起时抄送（f_ccActors）。
+	// 与办理腿（tf_ccActors）、手动腿（createCCInstance）共用引擎侧单一漏斗 HandleCcActors：
+	// 建 wf_process_cc_instance 行 → **落库后**逐抄送人 fire CC_CREATE（基准＝Java handleCcActors
+	// → notifyCcCreate，ccActorId 直传事件体）。不带 f_ccActors ⇒ 零写入零 fire，行为与历史一致。
+	if err := f.engine.HandleCcActors(context.Background(), inst.ID, operator, flowArgs[engine.KeyCcActorsStart]); err != nil {
+		return nil, err
 	}
 	// startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
 	doing, err := f.repo.FindDoingTasks(context.Background(), inst.ID, nil)
@@ -412,7 +391,27 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 	inst.Withdraw(now) // 撤回状态 Withdraw(30) 而非 Reject(45)
 	inst.UpdateUser = operator
 	inst.Tasks = doing
-	return f.repo.UpdateInstance(context.Background(), inst)
+	if err := f.repo.UpdateInstance(context.Background(), inst); err != nil {
+		return err
+	}
+	// TASK_WITHDRAW(8) / spec §11.3 码 8：撤回把实例 state 写 30 **落库之后** fire，
+	// 且**每轮撤回只 fire 一次**（不逐被撤回任务）——否则监听器按事件条数发站内信会翻倍。
+	//
+	// R2-2 契约改判（规范 11 §11.3 码 2 触发时机列原句）：
+	//
+	//	「实例 `state` 落库为 20/45 这类"走到终点"的状态之后。**`30`(撤回)/`40`(终止) 不由本支表达**
+	//	——各有专属码 8/9；一场撤回同时发 8＋2 会让下游收到"流程已办结"的错通知（node 首版即此形状，已纠）」
+	//
+	// 加上码 8 行自己的「**撤回只发 8，不补发 2**——2 的语义是"流程走到终点"，撤回不是」与规范 08
+	// 场景 32「**撤回(30)/终止(40) 不发 2**，各发 8/9；同轮既发 8 又发 2 ⇒ 红」⇒ 撤回这一支
+	// **只 fire 8**。第一轮在此处补发的 PROCESS_INSTANCE_END(state=30) 按裁定摘除：双发会让下游
+	// 监听器（站内信/待办清理）按"办结"给发起人推一条错通知。
+	// 办结（executeNode TypeEnd → state 20/45）与拒绝（ExecuteAndJumpToEnd → state 45）两支的码 2
+	// 是"流程自己走到终点"，本轮不动。
+	f.engine.FireEvent(engine.ProcessEvent{
+		Type: engine.EventTaskWithdraw, InstanceID: instanceID, Operator: operator,
+	})
+	return nil
 }
 
 // canWithdrawInstance 撤回归属判据（issues/114）——命中任一即放行：
@@ -1346,7 +1345,8 @@ func (f *Facade) createCCInstance(args map[string]interface{}) error {
 	if err := f.repo.CreateCcInstance(context.Background(), instanceID, operator, actors...); err != nil {
 		return err
 	}
-	// issues/102：手动补抄送同样逐抄送人 fire CC_CREATE（与发起路径同粒度，对齐 PHP/Java）
+	// issues/102 / spec §11.2 原则 1：手动补抄送与引擎自动路径共用同一个码——
+	// "新增了一条抄送记录"这个事实成立即 fire，逐抄送人（与发起/办理腿同粒度，对齐 PHP/Java）
 	for _, actor := range actors {
 		f.engine.FireEvent(engine.ProcessEvent{
 			Type: engine.EventCCCreate, InstanceID: instanceID, CcActorID: actor,
@@ -1676,7 +1676,16 @@ func (f *Facade) taskTransfer(args map[string]interface{}) error {
 	// 否则上面的摘人/加人被旧副本回滚（SQL 仓 UpdateTask 不碰参与者表，同值回写无害）
 	task.ActorIDs = dedupStrs(append(
 		removeStr(participants, fromActor), toActor))
-	return f.repo.UpdateTask(ctx, task)
+	if err := f.repo.UpdateTask(ctx, task); err != nil {
+		return err
+	}
+	// TASK_TRANSFER(7) / spec §11.3：任务参与者被替换并**落库之后** fire 一次
+	// （fromActor/toActor/operator 直传载荷，监听器免反查参与者表）。
+	f.engine.FireEvent(engine.ProcessEvent{
+		Type: engine.EventTaskTransfer, InstanceID: task.ProcessInstanceID, TaskID: task.ID,
+		NodeID: task.TaskName, Operator: operator, FromActor: fromActor, ToActor: toActor,
+	})
+	return nil
 }
 
 // transferComment 转办末跳可读文案（tf_approvalComment 槽位，前端审批意见的既有读取位 issues/15）：

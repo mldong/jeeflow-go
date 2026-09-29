@@ -3,6 +3,7 @@ package jeeflow_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1018,5 +1019,498 @@ func errRollback(ctx context.Context, t *testing.T, eng *engine.EngineImpl, task
 	}
 	if !strings.Contains(err.Error(), wantMsg) || strings.Contains(err.Error(), "2001000") {
 		t.Fatalf("msg 应为固定文案且不含引擎内部码（期望 %s），实得 %v", wantMsg, err)
+	}
+}
+
+// ═══ 规范 11-events 事件代码腿（issues/127＋132）═══════════════════════════════
+//
+// 观测点＝监听器入站序列（与镜像门禁 L2-30 的 sink 同口径）：断**按顺序**，不是"出现过"
+// ——顺序与缺支正是 issues/132 §5.3 点名的两个病灶。
+
+// recordEvents 挂一支"把事件按到达顺序记下来"的监听器（§11.5 订阅形状＝列表）。
+func recordEvents(eng *engine.EngineImpl, sink *[]engine.ProcessEvent) {
+	eng.SetExtensions(&engine.Extensions{
+		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+			*sink = append(*sink, evt)
+		}},
+	})
+}
+
+func eventNames(evts []engine.ProcessEvent) []string {
+	out := make([]string, 0, len(evts))
+	for _, e := range evts {
+		out = append(out, e.Type.SpecName())
+	}
+	return out
+}
+
+func eventCodes(evts []engine.ProcessEvent) []int {
+	out := make([]int, 0, len(evts))
+	for _, e := range evts {
+		out = append(out, int(e.Type))
+	}
+	return out
+}
+
+// firstOccurrence 首现去重（保序）——§11.8 的 [1,3,5,2] 判"这四类事实依次出现过"，
+// 多任务流里 3/5 各会多次出现，故按首现去重比对。
+func firstOccurrence(in []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, s := range in {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func eqNames(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func eqInts(got, want []int) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestEventSequenceStartToFinish 规范 §11.8：一条流从发起到办结**按顺序**的规范名序列
+// [PROCESS_INSTANCE_START, PROCESS_TASK_START, TASK_COMPLETE, PROCESS_INSTANCE_END]。
+// 逐事件全序列一并钉死（01-simple：apply 自动办结 + task1 同意 → 结束）。
+func TestEventSequenceStartToFinish(t *testing.T) {
+	ctx := context.Background()
+	eng, repo := setup()
+	def := registerFlow(repo, "01-simple.json")
+
+	var evts []engine.ProcessEvent
+	recordEvents(eng, &evts)
+
+	inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
+	t1 := firstDoing(t, repo, ctx, inst.ID, "task1")
+	if err := repo.AddTaskActor(ctx, t1.ID, []string{"leader"}); err != nil {
+		t.Fatalf("加参与者: %v", err)
+	}
+	if _, err := eng.ExecuteProcessTask(ctx, t1.ID, "leader",
+		map[string]interface{}{"submitType": int(model.SubmitTypeAgree)}); err != nil {
+		t.Fatalf("办结 task1: %v", err)
+	}
+
+	want := []string{
+		"PROCESS_INSTANCE_START", // 实例行 insert 之后
+		"PROCESS_TASK_START",     // apply 行落库后
+		"TASK_COMPLETE",          // apply 被办掉
+		"PROCESS_TASK_START",     // task1 行落库后
+		"TASK_COMPLETE",          // task1 被办掉
+		"PROCESS_INSTANCE_END",   // 实例 state 落库（20）之后
+	}
+	if got := eventNames(evts); !eqNames(got, want) {
+		t.Fatalf("事件序列（规范名）错位\n got=%v\nwant=%v", got, want)
+	}
+	if got := eventCodes(evts); !eqInts(got, []int{1, 3, 5, 3, 5, 2}) {
+		t.Fatalf("A 套码值序列错位（§11.6 整表重排回退？）\n got=%v\nwant=[1 3 5 3 5 2]", got)
+	}
+	if got := firstOccurrence(eventNames(evts)); !eqNames(got, []string{
+		"PROCESS_INSTANCE_START", "PROCESS_TASK_START", "TASK_COMPLETE", "PROCESS_INSTANCE_END"}) {
+		t.Fatalf("首现去重序列应为 §11.8 的四支，实得 %v", got)
+	}
+	// 抄送支缺席必须红（本案病灶之一）：本流没带任何 ccActors ⇒ 不得混进 CC_CREATE
+	for _, e := range evts {
+		if e.Type == engine.EventCCCreate {
+			t.Fatalf("未带 ccActors 的流不得 fire CC_CREATE: %+v", e)
+		}
+	}
+	// 终态载荷 state ＝ 落库后的实例状态整数（§11.3 码 2 注）
+	end := evts[len(evts)-1]
+	if end.State != int(model.InstanceStateDone) {
+		t.Fatalf("PROCESS_INSTANCE_END 载荷 state 应为 20，实得 %d", end.State)
+	}
+	if reloaded, _ := repo.FindInstanceByID(ctx, inst.ID); reloaded.State != model.InstanceStateDone {
+		t.Fatalf("终态事件早于实例落库发出？实得 state=%d", reloaded.State)
+	}
+	// 载荷必备键逐支核（§11.3 表：直传键必须拿得到）
+	for _, e := range evts {
+		p := e.Payload()
+		if _, ok := p["instanceId"]; !ok {
+			t.Errorf("%s 载荷缺 instanceId: %v", e.Type.SpecName(), p)
+		}
+		switch e.Type {
+		case engine.EventProcessTaskStart:
+			if _, ok := p["taskId"]; !ok {
+				t.Errorf("PROCESS_TASK_START 载荷缺 taskId: %v", p)
+			}
+			if a, ok := p["actors"].([]string); !ok || len(a) == 0 {
+				t.Errorf("PROCESS_TASK_START 载荷 actors 必须非空（监听器据此发待办）: %v", p)
+			}
+		case engine.EventTaskComplete:
+			for _, k := range []string{"taskId", "operator", "submitType"} {
+				if _, ok := p[k]; !ok {
+					t.Errorf("TASK_COMPLETE 载荷缺 %s: %v", k, p)
+				}
+			}
+		case engine.EventProcessInstanceEnd:
+			if _, ok := p["state"]; !ok {
+				t.Errorf("PROCESS_INSTANCE_END 载荷缺 state: %v", p)
+			}
+		}
+	}
+}
+
+// TestCcCreateOnExecuteLeg issues/127 病灶：本栈此前全仓没有 tf_ccActors 的读取——
+// 办理时抄送既不建 cc 行也不发 CC_CREATE，只能由集成层"主动补发"（§11.1 禁止的降级态）。
+// 正向：办理带 tf_ccActors（逗号串 / 数组两种入参形态）⇒ 建 cc 行 + 逐抄送人 fire，
+// 且 fire 那一刻 cc 行**已可反查**（§11.2 原则 3「只在落库之后 fire」，空火骗不过这一格）。
+// 负向：不带 tf_ccActors / 空抄送集合 ⇒ 零 cc 行零事件（守卫被摘掉即此档报红）。
+func TestCcCreateOnExecuteLeg(t *testing.T) {
+	ctx := context.Background()
+
+	// run 返回（CC_CREATE 序列, 每条 fire 时反查到的 cc 行数）；-1 ＝ fire 早于落库
+	run := func(t *testing.T, ccArg interface{}) ([]engine.ProcessEvent, []int) {
+		t.Helper()
+		eng, repo := setup()
+		def := registerFlow(repo, "01-simple.json")
+		var ccEvts []engine.ProcessEvent
+		var rowsAtFire []int
+		eng.SetExtensions(&engine.Extensions{
+			Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+				if evt.Type != engine.EventCCCreate {
+					return
+				}
+				_, total, err := repo.PageCcInstances(ctx, spi.PageQuery{PageNum: 1, PageSize: 10}, evt.CcActorID)
+				if err != nil || total == 0 {
+					rowsAtFire = append(rowsAtFire, -1)
+				} else {
+					rowsAtFire = append(rowsAtFire, total)
+				}
+				ccEvts = append(ccEvts, evt)
+			}},
+		})
+		inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
+		t1 := firstDoing(t, repo, ctx, inst.ID, "task1")
+		repo.AddTaskActor(ctx, t1.ID, []string{"leader"})
+		args := map[string]interface{}{"submitType": int(model.SubmitTypeAgree)}
+		if ccArg != nil {
+			args[engine.KeyCcActors] = ccArg
+		}
+		if _, err := eng.ExecuteProcessTask(ctx, t1.ID, "leader", args); err != nil {
+			t.Fatalf("办理失败: %v", err)
+		}
+		for i := range ccEvts {
+			if ccEvts[i].InstanceID != inst.ID {
+				t.Fatalf("CC_CREATE[%d] sourceId 应指向实例 %d，实得 %d", i, inst.ID, ccEvts[i].InstanceID)
+			}
+		}
+		return ccEvts, rowsAtFire
+	}
+
+	t.Run("正向-逗号串两个抄送人", func(t *testing.T) {
+		evts, rowsAtFire := run(t, "cc_a, cc_b")
+		if len(evts) != 2 {
+			t.Fatalf("两个抄送人应逐人 fire CC_CREATE，实得 %d 条: %+v", len(evts), evts)
+		}
+		want := []string{"cc_a", "cc_b"}
+		for i, e := range evts {
+			if e.CcActorID != want[i] {
+				t.Errorf("CC_CREATE[%d] ccActorId=%q want %q（逐人 fire 顺序须与入参一致）", i, e.CcActorID, want[i])
+			}
+			p := e.Payload()
+			if p["ccActorId"] != want[i] {
+				t.Errorf("CC_CREATE[%d] 载荷缺/错 ccActorId: %v", i, p)
+			}
+			if _, ok := p["instanceId"]; !ok {
+				t.Errorf("CC_CREATE[%d] 载荷缺 instanceId（sourceId 指向实例）: %v", i, p)
+			}
+		}
+		for i, n := range rowsAtFire {
+			if n < 1 {
+				t.Fatalf("CC_CREATE[%d] fire 时 cc 行还查得到 0 条 ⇒ fire 早于落库（§11.2 原则 3）", i)
+			}
+		}
+	})
+
+	t.Run("正向-数组形态", func(t *testing.T) {
+		evts, _ := run(t, []interface{}{"cc_c"})
+		if len(evts) != 1 || evts[0].CcActorID != "cc_c" {
+			t.Fatalf("数组形态 tf_ccActors 应建 1 条 cc 并 fire 1 次，实得 %+v", evts)
+		}
+	})
+
+	t.Run("负向-不带 tf_ccActors 不得抄送", func(t *testing.T) {
+		evts, _ := run(t, nil)
+		if len(evts) != 0 {
+			t.Fatalf("不带 tf_ccActors 的办理不得 fire CC_CREATE（守卫摘掉即此档红）: %+v", evts)
+		}
+	})
+
+	t.Run("负向-空串/空数组零写入", func(t *testing.T) {
+		for _, empty := range []interface{}{"", "  ", []interface{}{}, []string{""}, []interface{}{" "}} {
+			evts, _ := run(t, empty)
+			if len(evts) != 0 {
+				t.Fatalf("空抄送人集合 %v 不得 fire CC_CREATE，实得 %+v", empty, evts)
+			}
+		}
+	})
+}
+
+// TestCcLegCoverageNarrowedToExecuteProcessTask spec 11-events §11.7 边界 2 原文：
+//
+//	「**覆盖面以 Java 基准为准，只算 `executeProcessTask` 一条**。`executeAndJumpTask` / `jumpToEnd` /
+//	 `rollbackToOperator` 这类跳转·回退 action 带的 `tf_ccActors` **本轮不建 cc、不发 `CC_CREATE`**；
+//	 要扩得先改 java 基准再逐栈传播并另立案，**单栈自行放宽＝跨栈分叉**（go 第一轮就是这种超集）」
+//
+// R2-6 裁定＝以 java 基准（JeeflowEngineImpl 里 handleCcActors 的唯一调用点在 executeProcessTask）
+// 收窄，故本栈 cc 腿不再挂在四档共用的 prepareExecuteTask 上。三条判据：
+//   - ① executeProcessTask＋tf_ccActors ⇒ 仍建 cc 行 + 逐人 fire CC_CREATE(4)；
+//   - ② jump/rollback 类四档带同一份 tf_ccActors ⇒ **不建 cc、不 fire**
+//     （这条负向是把"与基准一致"钉住的唯一办法：cc 腿挪回 prepareExecuteTask 即此档红）；
+//   - ③ jump 档主流程本身不受影响（动作成功、事件序列照常，只是没有 4）。
+//     发起腿/手动腿的等价断言在门面层（facade_test.go TestCcLegStartAndManualLegsUnaffectedByNarrowing）。
+func TestCcLegCoverageNarrowedToExecuteProcessTask(t *testing.T) {
+	ctx := context.Background()
+	const ccActor = "cc_narrow_probe"
+
+	// run 起一条 01-simple 流（apply 已由 startAndExecute 自动办结、task1 待办在 leader 手上），
+	// 清空发起段事件后在 task1 上执行一次动作，返回：
+	// 本次 CC_CREATE 序列 / 动作后该抄送人的 cc 行数 / 本次事件规范名序列
+	run := func(t *testing.T, action func(t *testing.T, eng *engine.EngineImpl, taskID int64, args map[string]interface{})) ([]engine.ProcessEvent, int, []string) {
+		t.Helper()
+		eng, repo := setup()
+		def := registerFlow(repo, "01-simple.json")
+		var evts []engine.ProcessEvent
+		recordEvents(eng, &evts)
+		inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
+		t1 := firstDoing(t, repo, ctx, inst.ID, "task1")
+		if err := repo.AddTaskActor(ctx, t1.ID, []string{"leader"}); err != nil {
+			t.Fatalf("加参与者: %v", err)
+		}
+		t1 = firstDoing(t, repo, ctx, inst.ID, "task1") // 回读带参与者的行
+		evts = nil                                     // 只观察这一次动作
+		args := map[string]interface{}{engine.KeyCcActors: ccActor}
+		action(t, eng, t1.ID, args)
+		var cc []engine.ProcessEvent
+		for _, e := range evts {
+			if e.Type == engine.EventCCCreate {
+				cc = append(cc, e)
+			}
+		}
+		_, total, err := repo.PageCcInstances(ctx, spi.PageQuery{PageNum: 1, PageSize: 10}, ccActor)
+		if err != nil {
+			t.Fatalf("查 cc 行: %v", err)
+		}
+		return cc, total, eventNames(evts)
+	}
+
+	// ①正向：executeProcessTask 这一条路径照旧建 cc + fire 4（收窄不能把基准内的那条腿一起摘掉）
+	t.Run("①executeProcessTask 带 tf_ccActors 仍建 cc＋fire 4", func(t *testing.T) {
+		cc, total, names := run(t, func(t *testing.T, eng *engine.EngineImpl, taskID int64, args map[string]interface{}) {
+			args["submitType"] = int(model.SubmitTypeAgree)
+			if _, err := eng.ExecuteProcessTask(ctx, taskID, "leader", args); err != nil {
+				t.Fatalf("办结失败: %v", err)
+			}
+		})
+		if len(cc) != 1 || cc[0].CcActorID != ccActor {
+			t.Fatalf("executeProcessTask 应逐抄送人 fire 1 支 CC_CREATE，实得 %d 条，事件序列 %v", len(cc), names)
+		}
+		if total != 1 {
+			t.Fatalf("executeProcessTask 应建 1 条 cc 行（数据腿），实得 %d 行", total)
+		}
+		if cc[0].InstanceID == 0 {
+			t.Fatalf("CC_CREATE sourceId 应指向实例: %+v", cc[0])
+		}
+	})
+
+	// ②负向＋③主流程：jump/rollback 四档一律不建 cc、不 fire 4，但动作本身照常
+	jumpCases := []struct {
+		name   string
+		action func(t *testing.T, eng *engine.EngineImpl, taskID int64, args map[string]interface{})
+	}{
+		{"jumpToEnd / REJECT=2", func(t *testing.T, eng *engine.EngineImpl, taskID int64, args map[string]interface{}) {
+			args["submitType"] = int(model.SubmitTypeReject)
+			if _, err := eng.ExecuteAndJumpToEnd(ctx, taskID, "leader", args); err != nil {
+				t.Fatalf("jumpToEnd 失败: %v", err)
+			}
+		}},
+		{"jumpTask / ROLLBACK=3 空 target", func(t *testing.T, eng *engine.EngineImpl, taskID int64, args map[string]interface{}) {
+			args["submitType"] = int(model.SubmitTypeRollback)
+			if _, err := eng.ExecuteAndJumpTask(ctx, taskID, "leader", args, ""); err != nil {
+				t.Fatalf("rollback 失败: %v", err)
+			}
+		}},
+		{"jumpTask / JUMP=4 命名 target", func(t *testing.T, eng *engine.EngineImpl, taskID int64, args map[string]interface{}) {
+			args["submitType"] = int(model.SubmitTypeJump)
+			if _, err := eng.ExecuteAndJumpTask(ctx, taskID, "leader", args, "apply"); err != nil {
+				t.Fatalf("jump 失败: %v", err)
+			}
+		}},
+		{"jumpToFirstTaskNode / 退发起人=6", func(t *testing.T, eng *engine.EngineImpl, taskID int64, args map[string]interface{}) {
+			args["submitType"] = int(model.SubmitTypeRollbackToOperator)
+			if _, err := eng.ExecuteAndJumpToFirstTaskNode(ctx, taskID, "leader", args); err != nil {
+				t.Fatalf("退发起人失败: %v", err)
+			}
+		}},
+	}
+	for _, tc := range jumpCases {
+		t.Run("②"+tc.name+" 带 tf_ccActors 不建 cc 不 fire", func(t *testing.T) {
+			cc, total, names := run(t, tc.action)
+			if len(cc) != 0 {
+				t.Fatalf("%s 属 §11.7 边界 2 排除档，不得 fire CC_CREATE（cc 腿挪回 prepareExecuteTask 即此档红），实得 %d 条，事件序列 %v",
+					tc.name, len(cc), names)
+			}
+			if total != 0 {
+				t.Fatalf("%s 不该建 cc 行（与 java 基准不一致＝单栈超集），实得 %d 行", tc.name, total)
+			}
+			// ③该档自身的既有事件腿照常（收窄只摘 4，不动任务事件/终态事件）
+			if len(names) == 0 {
+				t.Fatalf("%s 主流程没 fire 任何事件，收窄把动作本身打断了吗", tc.name)
+			}
+			t.Logf("%s 事件序列=%v cc 行数=%d", tc.name, names, total)
+		})
+	}
+}
+
+// TestListenerPanicDoesNotBreakMainFlow §11.5 异常隔离：单个监听器 panic 只记日志，
+// ① 不回滚/不打断引擎主流程（建单、办结、状态落库照常，引擎返回零错误），
+// ② 不中断后续监听器（第二支仍被回调）。
+func TestListenerPanicDoesNotBreakMainFlow(t *testing.T) {
+	ctx := context.Background()
+	eng, repo := setup()
+	def := registerFlow(repo, "01-simple.json")
+	var secondCalled int
+	eng.SetExtensions(&engine.Extensions{Listeners: []engine.ProcessEventListener{
+		func(evt engine.ProcessEvent) { panic("listener boom") },
+		func(evt engine.ProcessEvent) { secondCalled++ },
+	}})
+
+	inst, err := eng.StartProcessInstanceByID(ctx, def.ID, "applicant", nil)
+	if err != nil {
+		t.Fatalf("监听器 panic 不得打断发起: %v", err)
+	}
+	apply := firstDoing(t, repo, ctx, inst.ID, "apply")
+	if err := repo.AddTaskActor(ctx, apply.ID, []string{"applicant"}); err != nil {
+		t.Fatalf("加参与者: %v", err)
+	}
+	if _, err := eng.ExecuteProcessTask(ctx, apply.ID, "applicant",
+		map[string]interface{}{"submitType": int(model.SubmitTypeApply)}); err != nil {
+		t.Fatalf("监听器 panic 不得打断办理: %v", err)
+	}
+	if _, err := firstDoingErr(repo, ctx, inst.ID, "task1"); err != nil {
+		t.Fatalf("监听器 panic 后主流程应照常建出 task1: %v", err)
+	}
+	if secondCalled == 0 {
+		t.Fatalf("panic 的监听器之后的监听器必须仍被回调")
+	}
+}
+
+func firstDoingErr(repo *memory.Repository, ctx context.Context, instID int64, node string) (*model.ProcessTask, error) {
+	tasks, err := repo.FindDoingTasks(ctx, instID, []string{node})
+	if err != nil {
+		return nil, err
+	}
+	if len(tasks) == 0 {
+		return nil, fmt.Errorf("节点 %s 无进行中任务", node)
+	}
+	return tasks[0], nil
+}
+
+// TestTaskRejectMutexAndTerminalState §11.3 码 5/6 **互斥**：同一次动作走 reject 就不再 fire
+// complete；实例终态另立一支 PROCESS_INSTANCE_END(2)，靠 state 分办结/拒绝（§11.6 收敛）。
+func TestTaskRejectMutexAndTerminalState(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("REJECT 动作走 6 不走 5", func(t *testing.T) {
+		eng, repo := setup()
+		def := registerFlow(repo, "01-simple.json")
+		inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
+		t1 := firstDoing(t, repo, ctx, inst.ID, "task1")
+		repo.AddTaskActor(ctx, t1.ID, []string{"leader"})
+		var evts []engine.ProcessEvent
+		recordEvents(eng, &evts) // 只观察这一次动作
+		if _, err := eng.ExecuteAndJumpToEnd(ctx, t1.ID, "leader",
+			map[string]interface{}{"submitType": int(model.SubmitTypeReject)}); err != nil {
+			t.Fatalf("REJECT 办理失败: %v", err)
+		}
+		got := eventNames(evts)
+		want := []string{"TASK_REJECT", "PROCESS_INSTANCE_END"}
+		if !eqNames(got, want) {
+			t.Fatalf("REJECT 这一动作的事件序列错位\n got=%v\nwant=%v", got, want)
+		}
+		end := evts[1]
+		if end.State != int(model.InstanceStateReject) {
+			t.Fatalf("被拒实例的终态事件 state 应为 45，实得 %d", end.State)
+		}
+		if reloaded, _ := repo.FindInstanceByID(ctx, inst.ID); reloaded.State != model.InstanceStateReject {
+			t.Fatalf("终态事件早于实例落库发出？实得 state=%d", reloaded.State)
+		}
+		p := evts[0].Payload()
+		for _, k := range []string{"instanceId", "taskId", "operator", "submitType"} {
+			if _, ok := p[k]; !ok {
+				t.Fatalf("TASK_REJECT 载荷缺 %s: %v", k, p)
+			}
+		}
+		if p["submitType"] != int(model.SubmitTypeReject) {
+			t.Fatalf("TASK_REJECT 载荷 submitType 应透传本次动作（监听器靠它分退法），实得 %v", p["submitType"])
+		}
+	})
+
+	t.Run("AGREE 只发 5 不发 6", func(t *testing.T) {
+		eng, repo := setup()
+		def := registerFlow(repo, "01-simple.json")
+		inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
+		t1 := firstDoing(t, repo, ctx, inst.ID, "task1")
+		repo.AddTaskActor(ctx, t1.ID, []string{"leader"})
+		var evts []engine.ProcessEvent
+		recordEvents(eng, &evts)
+		if _, err := eng.ExecuteProcessTask(ctx, t1.ID, "leader",
+			map[string]interface{}{"submitType": int(model.SubmitTypeAgree)}); err != nil {
+			t.Fatalf("AGREE 办理失败: %v", err)
+		}
+		if got := eventNames(evts); !eqNames(got, []string{"TASK_COMPLETE", "PROCESS_INSTANCE_END"}) {
+			t.Fatalf("AGREE 这一动作应 [TASK_COMPLETE, PROCESS_INSTANCE_END]，实得 %v", got)
+		}
+	})
+
+	// 退回上一步(3) / 退发起人(6) 同属 reject 族（§11.3 码 6 事实列点名"含退发起人"）
+	for _, st := range []int{int(model.SubmitTypeRollback), int(model.SubmitTypeRollbackToOperator)} {
+		t.Run(fmt.Sprintf("退回族 submitType=%d 走 6", st), func(t *testing.T) {
+			eng, repo := setup()
+			def := registerFlow(repo, "02-multi-task.json")
+			inst := startAndExecute(eng, repo, def.ID, "applicant", nil)
+			t1 := firstDoing(t, repo, ctx, inst.ID, "task1")
+			repo.AddTaskActor(ctx, t1.ID, []string{"leader"})
+			var evts []engine.ProcessEvent
+			recordEvents(eng, &evts)
+			if _, err := eng.ExecuteAndJumpTask(ctx, t1.ID, "leader",
+				map[string]interface{}{"submitType": st}, ""); err != nil {
+				t.Fatalf("退回动作失败 submitType=%d: %v", st, err)
+			}
+			var sawReject bool
+			for _, e := range evts {
+				if e.Type == engine.EventTaskReject {
+					sawReject = true
+				}
+				if e.Type == engine.EventTaskComplete {
+					t.Fatalf("submitType=%d 又发了 TASK_COMPLETE，违反 5/6 互斥", st)
+				}
+			}
+			if !sawReject {
+				t.Fatalf("submitType=%d 应 fire TASK_REJECT，实得 %v", st, eventNames(evts))
+			}
+		})
 	}
 }

@@ -3485,3 +3485,463 @@ func TestIssue129MemoryRepoBlankOwnershipIsEmptyPage(t *testing.T) {
 		t.Fatalf("非归属列 nil 值条件应被忽略（可选过滤照旧），got rows=%d err=%v ⇒ 通用放行被误改了", len(rows), err)
 	}
 }
+
+// ═══ 规范 11-events 事件代码腿 · 门面端到端（issues/127＋132）═══════════════════
+//
+// 判据与镜像门禁 L2-30 逐条同形（runner.judge_event_seq）：首支必须是 1；
+// 1→3→5→2 按顺序成链；抄送支 4 必须出现且排在终态 2 之前；不得出现契约外码值。
+// "只断出现过不算过"——顺序与缺支正是本案两个病灶。
+
+func gateEvtNames(evts []engine.ProcessEvent) []string {
+	out := make([]string, 0, len(evts))
+	for _, e := range evts {
+		out = append(out, e.Type.SpecName())
+	}
+	return out
+}
+
+func gateEvtCodes(evts []engine.ProcessEvent) []int {
+	out := make([]int, 0, len(evts))
+	for _, e := range evts {
+		out = append(out, int(e.Type))
+	}
+	return out
+}
+
+// gateFirstOccurrence 首现去重保序（§11.8 的 [1,3,5,2] 是"四类事实依次出现"）
+func gateFirstOccurrence(in []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, s := range in {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func gateEqStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// gateEqInts 码值序列比对（规范名由符号导出、码值由本表钉；只查名会漏掉"4/5 互换"这类重排回退）
+func gateEqInts(got, want []int) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// gateSubsequenceOrdered 依次找 want 的下一个位置（允许中间穿插同码重复，多任务流 3 会多次出现）
+func gateSubsequenceOrdered(codes []int, want []int) bool {
+	pos := -1
+	for _, w := range want {
+		next := -1
+		for i := pos + 1; i < len(codes); i++ {
+			if codes[i] == w {
+				next = i
+				break
+			}
+		}
+		if next < 0 {
+			return false
+		}
+		pos = next
+	}
+	return true
+}
+
+// TestGateEventSequenceWithCcLeg 一条流走门面：发起 → 办理带 tf_ccActors（数组形态，与
+// contract_runner 的入参形状一致）→ 办结。事件序列按 L2-30 判据核，并核 127 的**数据腿**
+// （抄送账号的 ccList 里必须有这条实例——否则"事件 fire 了但没建 cc 行"的空火也能骗过序列断言）。
+func TestGateEventSequenceWithCcLeg(t *testing.T) {
+	repo := memory.New()
+	extRepo := memory.NewExt()
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	f := facade.New(eng, repo, extRepo)
+
+	var evts []engine.ProcessEvent
+	eng.SetExtensions(&engine.Extensions{
+		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+			evts = append(evts, evt)
+		}},
+	})
+
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
+	mustOk(t, r0)
+	defineID := mustI64(r0["data"].(map[string]interface{})["processDefineId"])
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": defineID, "operator": "user1",
+	})
+	mustOk(t, r1)
+	instID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	t1 := doingTaskID(t, repo, instID, "task1")
+	if t1 == 0 {
+		t.Fatalf("前置条件：应有 task1 待办")
+	}
+
+	r2 := f.Flow("processTask/execute", map[string]interface{}{
+		"processTaskId": t1, "operator": "leader", "submitType": 1,
+		"tf_ccActors": []interface{}{"cc_gate"},
+	})
+	mustOk(t, r2)
+
+	codes := gateEvtCodes(evts)
+	names := gateEvtNames(evts)
+	// 全序列逐支钉死：发起(1) → apply 待办(3) → apply 办结(5) → task1 待办(3)
+	// → 办理抄送落库(4) → task1 办结(5) → 实例终态(2)
+	if got, want := names, []string{
+		"PROCESS_INSTANCE_START", "PROCESS_TASK_START", "TASK_COMPLETE",
+		"PROCESS_TASK_START", "CC_CREATE", "TASK_COMPLETE", "PROCESS_INSTANCE_END",
+	}; !gateEqStrings(got, want) {
+		t.Fatalf("门面端到端事件全序列错位\n got=%v\nwant=%v", got, want)
+	}
+	if got := gateEvtCodes(evts); !gateEqInts(got, []int{1, 3, 5, 3, 4, 5, 2}) {
+		t.Fatalf("A 套码值全序列错位（§11.6 重排回退，如 4/5 互换）\n got=%v\nwant=[1 3 5 3 4 5 2]", got)
+	}
+	if codes[0] != 1 {
+		t.Fatalf("首支不是 1(PROCESS_INSTANCE_START)，实得首支=%d 全序列=%v", codes[0], names)
+	}
+	if !gateSubsequenceOrdered(codes, []int{1, 3, 5, 2}) {
+		t.Fatalf("顺序链断：要求 1→3→5→2 依次出现，实得 %v", names)
+	}
+	i4 := -1
+	i2 := -1
+	for i, c := range codes {
+		if c == 4 && i4 < 0 {
+			i4 = i
+		}
+		if c == 2 && i2 < 0 {
+			i2 = i
+		}
+	}
+	if i4 < 0 {
+		t.Fatalf("抄送支 4(CC_CREATE) 从未出现 ⇒ issues/127 病灶（办理带 tf_ccActors 没建 cc / 没 fire）: %v", names)
+	}
+	if i4 > i2 {
+		t.Fatalf("4 出现在终态 2 之后：cc 应在办结之前落库并 fire")
+	}
+	for _, c := range codes {
+		if c < 1 || c > 9 {
+			t.Fatalf("出现契约外码值 %d（本轮只发 1..9，10+ 仅占号）: %v", c, codes)
+		}
+	}
+	// §11.8 四支规范名（首现去重；抄送支另按 §11.8 的 [4] 单独核，不混进主干序列）
+	var trunk []engine.ProcessEvent
+	for _, e := range evts {
+		if e.Type != engine.EventCCCreate {
+			trunk = append(trunk, e)
+		}
+	}
+	if got := gateFirstOccurrence(gateEvtNames(trunk)); !gateEqStrings(got, []string{
+		"PROCESS_INSTANCE_START", "PROCESS_TASK_START", "TASK_COMPLETE", "PROCESS_INSTANCE_END"}) {
+		t.Fatalf("首现去重规范名序列错位\n got=%v\nwant=[PROCESS_INSTANCE_START PROCESS_TASK_START TASK_COMPLETE PROCESS_INSTANCE_END]", got)
+	}
+	// 抄送支规范名序列（§11.8 的 [4]）
+	var ccNames []string
+	for _, e := range evts {
+		if e.Type == engine.EventCCCreate {
+			ccNames = append(ccNames, e.Type.SpecName())
+			if e.CcActorID != "cc_gate" {
+				t.Errorf("CC_CREATE.ccActorId 应为抄送人本人，实得 %q", e.CcActorID)
+			}
+		}
+	}
+	if !gateEqStrings(ccNames, []string{"CC_CREATE"}) {
+		t.Fatalf("抄送支应正好一支 CC_CREATE，实得 %v", ccNames)
+	}
+	// 数据腿：cc 行真建了（抄送账号 ccList 能读到这条实例）
+	r3 := f.Flow("processInstance/ccList", map[string]interface{}{
+		"operator": "cc_gate", "pageNum": 1, "pageSize": 100,
+	})
+	mustOk(t, r3)
+	rows := r3["data"].(map[string]interface{})["rows"].([]interface{})
+	seen := false
+	for _, raw := range rows {
+		row := raw.(map[string]interface{})
+		if mustI64(row["id"]) == instID {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("ccList 里没有这条实例的抄送行 ⇒ 127 数据腿没建 cc（事件即便 fire 也是空火）: %v", rows)
+	}
+	// §11.2 原则 1：手动 processInstance/createCCInstance 与引擎自动路径共用同一个码
+	// （"新增了一条抄送记录"这个事实成立即 fire，路径不进事件名）——形状与办理腿一致
+	before := len(evts)
+	mustOk(t, f.Flow("processInstance/createCCInstance", map[string]interface{}{
+		"processInstanceId": instID, "operator": "user1", "actorIds": "cc_manual",
+	}))
+	if len(evts) != before+1 || evts[before].Type != engine.EventCCCreate || evts[before].CcActorID != "cc_manual" {
+		t.Fatalf("手动 createCCInstance 应 fire 恰好一支 CC_CREATE（ccActorId 直传事件体），实得 %v",
+			gateEvtNames(evts)[before:])
+	}
+	if p := evts[before].Payload(); p["ccActorId"] != "cc_manual" || p["instanceId"] != instID {
+		t.Fatalf("手动 CC_CREATE 载荷必备键 ccActorId/instanceId 错位: %v", p)
+	}
+}
+
+// TestCcLegStartAndManualLegsUnaffectedByNarrowing R2-6 收窄（spec §11.7 边界 2「覆盖面以 Java
+// 基准为准，只算 executeProcessTask 一条」）只动**办理腿**的覆盖面，另两条腿必须原样成立 ⇒
+// 这里把"不受影响"钉住：
+//   - 发起腿 f_ccActors（processInstance/startAndExecute）：建 cc 行 + 逐人 fire CC_CREATE(4)；
+//   - 手动腿 processInstance/createCCInstance：建 cc 行 + 逐人 fire 4（§11.2 原则 1 同一条码）；
+//   - 门面跳转·回退档（submitType 2/3/4/6 → 引擎 ExecuteAndJump* 三档）带 tf_ccActors：
+//     零 cc 行、零 fire 4，且动作本身照常（拒绝档仍 fire 6＋2，办结/拒绝两支未被顺手改掉）。
+//
+// 门面层再钉一遍负向的原因：收窄落在引擎路径上（cc 钩子由 ExecuteProcessTask 注入），
+// 若有人把判断挪回门面 submitType 分发处或干脆取消钩子注入，这两档都会立刻红。
+func TestCcLegStartAndManualLegsUnaffectedByNarrowing(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	extRepo := memory.NewExt()
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	f := facade.New(eng, repo, extRepo)
+
+	var evts []engine.ProcessEvent
+	eng.SetExtensions(&engine.Extensions{
+		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) { evts = append(evts, evt) }},
+	})
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
+	mustOk(t, r0)
+	defineID := mustI64(r0["data"].(map[string]interface{})["processDefineId"])
+
+	ccEvents := func() []engine.ProcessEvent {
+		var out []engine.ProcessEvent
+		for _, e := range evts {
+			if e.Type == engine.EventCCCreate {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
+	ccRows := func(t *testing.T, actor string) int {
+		t.Helper()
+		_, total, err := repo.PageCcInstances(ctx, spi.PageQuery{PageNum: 1, PageSize: 50}, actor)
+		if err != nil {
+			t.Fatalf("查 %s 的 cc 行: %v", actor, err)
+		}
+		return total
+	}
+
+	// ── ③-a 发起腿：f_ccActors 仍建 cc ＋ 逐人 fire 4 ──
+	evts = nil
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": defineID, "operator": "zhangsan", "f_ccActors": "cc_start_a, cc_start_b",
+	})
+	mustOk(t, r1)
+	instID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+	got := ccEvents()
+	if len(got) != 2 || got[0].CcActorID != "cc_start_a" || got[1].CcActorID != "cc_start_b" {
+		t.Fatalf("发起腿应逐人 fire 2 支 CC_CREATE，实得 %v（事件序列 %v）", got, gateEvtNames(evts))
+	}
+	for _, a := range []string{"cc_start_a", "cc_start_b"} {
+		if ccRows(t, a) != 1 {
+			t.Fatalf("发起腿 %s 应建 1 条 cc 行（数据腿），实得 %d", a, ccRows(t, a))
+		}
+	}
+
+	// ── ③-b 手动腿：createCCInstance 仍建 cc ＋ fire 4 ──
+	evts = nil
+	mustOk(t, f.Flow("processInstance/createCCInstance", map[string]interface{}{
+		"processInstanceId": instID, "operator": "zhangsan", "actorIds": "cc_manual_leg",
+	}))
+	if got := ccEvents(); len(got) != 1 || got[0].CcActorID != "cc_manual_leg" || got[0].InstanceID != instID {
+		t.Fatalf("手动腿应 fire 恰好 1 支 CC_CREATE，实得 %v", got)
+	}
+	if ccRows(t, "cc_manual_leg") != 1 {
+		t.Fatalf("手动腿应建 1 条 cc 行，实得 %d", ccRows(t, "cc_manual_leg"))
+	}
+
+	// ── ②门面跳转·回退档：带 tf_ccActors 不建 cc、不 fire 4；动作本身照常 ──
+	type jumpCase struct {
+		label      string
+		submitType int
+		taskName   string
+		// 该档自身仍应出现的规范名（证明只摘了 4，没顺手改动任务/终态事件腿）
+		wantNames []string
+	}
+	for i, c := range []jumpCase{
+		{"REJECT=2 → jumpToEnd", 2, "", []string{"TASK_REJECT", "PROCESS_INSTANCE_END"}},
+		{"ROLLBACK=3 → jumpTask 空 target", 3, "", []string{"TASK_REJECT", "PROCESS_TASK_START"}},
+		{"JUMP=4 → jumpTask 命名 target", 4, "apply", []string{"TASK_COMPLETE", "PROCESS_TASK_START"}},
+		{"ROLLBACK_TO_OPERATOR=6 → jumpToFirstTaskNode", 6, "", []string{"TASK_REJECT", "PROCESS_TASK_START"}},
+	} {
+		t.Run(c.label+" 带 tf_ccActors 不建 cc 不 fire", func(t *testing.T) {
+			actor := fmt.Sprintf("cc_neg_%d", i)
+			r := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+				"processDefineId": defineID, "operator": "zhangsan",
+			})
+			mustOk(t, r)
+			nid := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
+			t1 := doingTaskID(t, repo, nid, "task1")
+			if t1 == 0 {
+				t.Fatalf("前置条件：应有 task1 待办")
+			}
+			evts = nil
+			args := map[string]interface{}{
+				"processTaskId": t1, "operator": "leader", "submitType": c.submitType,
+				"tf_ccActors": actor,
+			}
+			if c.taskName != "" {
+				args["taskName"] = c.taskName
+			}
+			mustOk(t, f.Flow("processTask/execute", args))
+			if n := len(ccEvents()); n != 0 {
+				t.Fatalf("%s 属 §11.7 边界 2 排除档，不得 fire CC_CREATE，实得 %d 支，事件序列 %v",
+					c.label, n, gateEvtNames(evts))
+			}
+			if n := ccRows(t, actor); n != 0 {
+				t.Fatalf("%s 不该建 cc 行（与 java 基准不一致＝单栈超集），实得 %d 行", c.label, n)
+			}
+			// 该档既有事件腿原样（只缺 4）：wantNames 逐支核——拒绝档的 6＋2、跳转档的 3 都还在
+			for _, n := range c.wantNames {
+				found := false
+				for _, e := range evts {
+					if e.Type.SpecName() == n {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Fatalf("%s 应仍有 %s 这支（收窄只摘 4），实得 %v", c.label, n, gateEvtNames(evts))
+				}
+			}
+		})
+	}
+}
+
+// TestTransferAndWithdrawEventLegs 新增的两支：
+//   - TASK_TRANSFER(7)：参与者被替换并**落库之后** fire（监听器入站时反查参与者已是 toActor）；
+//   - TASK_WITHDRAW(8)：撤回把实例写 30 落库之后 fire，且**每轮只 fire 一次**（不逐任务），
+//     **且不补发 PROCESS_INSTANCE_END(2)**——§11.3 码 2 只表达"流程自己走到终点"（20/45），
+//     撤回(30) 不是（R2-2 契约改判，依据见下方断言处的 spec 原句；办结/拒绝两支的 2 不动）。
+func TestTransferAndWithdrawEventLegs(t *testing.T) {
+	ctx := context.Background()
+	repo := memory.New()
+	extRepo := memory.NewExt()
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	f := facade.New(eng, repo, extRepo)
+
+	var evts []engine.ProcessEvent
+	var transferActors []string
+	eng.SetExtensions(&engine.Extensions{
+		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+			if evt.Type == engine.EventTaskTransfer {
+				// fire 时机核（§11.2 原则 3）：此刻参与者表应已是 toActor、不再是 fromActor
+				transferActors, _ = repo.FindTaskActors(ctx, evt.TaskID)
+			}
+			evts = append(evts, evt)
+		}},
+	})
+
+	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "02-multi-task.json"))})
+	mustOk(t, r0)
+	r1 := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": r0["data"].(map[string]interface{})["processDefineId"], "operator": "zhangsan",
+	})
+	mustOk(t, r1)
+	instID := mustI64(r1["data"].(map[string]interface{})["processInstanceId"])
+
+	// ── 转办 ──
+	evts = evts[:0]
+	t1 := doingTaskID(t, repo, instID, "task1")
+	mustOk(t, f.Flow("processTask/transfer", map[string]interface{}{
+		"processTaskId": t1, "operator": "leader", "fromActor": "leader", "toActor": "leader9", "reason": "休假",
+	}))
+	var transfer []engine.ProcessEvent
+	for _, e := range evts {
+		if e.Type == engine.EventTaskTransfer {
+			transfer = append(transfer, e)
+		}
+	}
+	if len(transfer) != 1 {
+		t.Fatalf("一次转办应 fire 恰好一支 TASK_TRANSFER，实得 %d 条（序列 %v）", len(transfer), gateEvtNames(evts))
+	}
+	p := transfer[0].Payload()
+	for _, k := range []string{"instanceId", "taskId", "fromActor", "toActor", "operator"} {
+		if _, ok := p[k]; !ok {
+			t.Fatalf("TASK_TRANSFER 载荷缺 §11.3 必备键 %s: %v", k, p)
+		}
+	}
+	if p["fromActor"] != "leader" || p["toActor"] != "leader9" {
+		t.Fatalf("TASK_TRANSFER 载荷两造错位: %v", p)
+	}
+	if transfer[0].InstanceID != instID || transfer[0].TaskID != t1 {
+		t.Fatalf("TASK_TRANSFER sourceId/instanceId 错位: %+v", transfer[0])
+	}
+	if len(transferActors) != 1 || transferActors[0] != "leader9" {
+		t.Fatalf("TASK_TRANSFER 应在参与者落库后 fire，入站时反查实得 %v", transferActors)
+	}
+
+	// ── 撤回（实例进行中，发起人可撤）──
+	evts = evts[:0]
+	mustOk(t, f.Flow("processInstance/withdraw", map[string]interface{}{"id": instID, "operator": "zhangsan"}))
+	var withdraw, ends []engine.ProcessEvent
+	for _, e := range evts {
+		switch e.Type {
+		case engine.EventTaskWithdraw:
+			withdraw = append(withdraw, e)
+		case engine.EventProcessInstanceEnd:
+			ends = append(ends, e)
+		}
+	}
+	if len(withdraw) != 1 {
+		t.Fatalf("每轮撤回只 fire 一次 TASK_WITHDRAW（逐任务发会让站内信按事件条数翻倍），实得 %d 条: %v",
+			len(withdraw), gateEvtNames(evts))
+	}
+	wp := withdraw[0].Payload()
+	if wp["instanceId"] != instID || wp["operator"] != "zhangsan" {
+		t.Fatalf("TASK_WITHDRAW 载荷必备键 instanceId/operator 错位: %v", wp)
+	}
+	// ── R2-2 契约改判：撤回一轮的事件序列**恰好只有 8 一支**，不补发 2 ──
+	// 依据（jeeflow-doc/docs/spec/11-events.md §11.3 码 8 行「触发时机」列原句）：
+	//   「**撤回只发 8，不补发 2**——2 的语义是"流程走到终点"，撤回不是。撤回把实例 `state`
+	//    写 30 落库之后；被撤回任务行更新完成后 fire 一次」
+	// 同文件码 2 行原句：
+	//   「**`30`(撤回)/`40`(终止) 不由本支表达**——各有专属码 8/9；一场撤回同时发 8＋2 会让
+	//    下游收到"流程已办结"的错通知（node 首版即此形状，已纠）」
+	// 规范 08-compliance.md 场景 32 末句：「**撤回(30)/终止(40) 不发 2**，各发 8/9；
+	// 同轮既发 8 又发 2 ⇒ 红」；场景 34 的 TASK_WITHDRAW 一档同样写「**且不补发 2**」。
+	// 这是规范本身改判（node 侧同裁定已落地：src/facade.ts 删 notifyInstanceEnd ＋
+	// __tests__/spec.test.ts 序列 [8,2]→[8]），不是为了让断言通过才改期望值。
+	if got := gateEvtNames(evts); !gateEqStrings(got, []string{"TASK_WITHDRAW"}) {
+		t.Fatalf("撤回一轮＝只 fire 8 一支（§11.3 码 8／场景 32·34），实得 %v", got)
+	}
+	if got := gateEvtCodes(evts); !gateEqInts(got, []int{8}) {
+		t.Fatalf("撤回一轮的码值序列应为 [8]，实得 %v", got)
+	}
+	// 负向断言：同轮不得出现 PROCESS_INSTANCE_END(2)（撤回 state=30 不由码 2 表达）
+	if len(ends) != 0 {
+		t.Fatalf("撤回不得补发 PROCESS_INSTANCE_END(2)——同轮既发 8 又发 2 ⇒ 场景 32 判红，"+
+			"下游监听器会给发起人推一条\"流程已办结\"的错通知，实得 %+v", ends)
+	}
+	if _, ok := wp["taskId"]; ok {
+		t.Fatalf("TASK_WITHDRAW 的 sourceId 指向实例，不该带 taskId: %v", wp)
+	}
+	// 撤回落库后才有撤回事件（反查实例 state 已 30）
+	if reloaded, _ := repo.FindInstanceByID(ctx, instID); reloaded.State != model.InstanceStateWithdraw {
+		t.Fatalf("撤回事件早于实例落库发出？实得 state=%d", reloaded.State)
+	}
+	// 已撤回实例不得再冒出 TASK_COMPLETE / PROCESS_TASK_START
+	for _, e := range evts {
+		if e.Type == engine.EventTaskComplete || e.Type == engine.EventProcessTaskStart {
+			t.Fatalf("撤回不该发任务类事件: %v", gateEvtNames(evts))
+		}
+	}
+}

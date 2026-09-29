@@ -32,6 +32,11 @@ const (
 	// v1.0.1：系统代执行 / 超级管理员（对齐 boot3 FlowConst）
 	KeyAutoExecute = "flow.auto"
 	KeyAdminID     = "flow.admin"
+	// spec 11-events §11.7 / issues/127 抄送入参键（对齐 Java FlowConst.CC_ACTORS_START / CC_ACTORS）：
+	// 发起时抄送 f_ccActors、办理时抄送 tf_ccActors，两条腿共用 EngineImpl.HandleCcActors
+	// （同 Java「handleCcActors → notifyCcCreate 单一漏斗」的形状）。
+	KeyCcActorsStart = "f_ccActors"
+	KeyCcActors      = "tf_ccActors"
 	// issues/121 P1：行级首任务节点标记（引擎建单时落库，对齐 Java FlowConst.IS_FIRST_TASK_NODE）
 	// 值与 model.IsFirstTaskNodeKey 同——建单写入在 model.CreateTask（唯一工厂），此处供引擎/门面读出口引用
 	KeyIsFirstTaskNode = model.IsFirstTaskNodeKey

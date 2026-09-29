@@ -1090,3 +1090,104 @@ func TestWithTx(t *testing.T) {
 	_ = db.QueryRowContext(ctx, ph("DELETE FROM wf_process_instance WHERE id = 900002")).Scan(&n)
 	_, _ = db.ExecContext(ctx, ph("DELETE FROM wf_process_cc_instance WHERE process_instance_id = 900002"))
 }
+
+// TestCcOnExecuteLegPersistsRowsAndEvents issues/127（spec 11-events §11.7）· T1 真库档：
+// 办理带 tf_ccActors ⇒ 真 MySQL 里建 wf_process_cc_instance 行 + 逐抄送人 fire CC_CREATE，
+// 并且 **fire 那一刻行已可直查**（§11.2 原则 3「只在落库之后 fire」；直查走的是另一条连接，
+// 看得见就说明行已提交，不是事务里的空火）。内存仓档见 engine_test.go 的 TestCcCreateOnExecuteLeg，
+// 这一档证 SQL 写路径与写入语义（actor_id＝被抄送人、create_user＝发起抄送的人）同样成立。
+func TestCcOnExecuteLegPersistsRowsAndEvents(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	cleanup(t, db)
+	defer cleanup(t, db)
+
+	content := loadFlow(t, "01-simple.json")
+	insertDefine(t, db, "go-simple", content)
+
+	ctx := context.Background()
+	repo := jdbc.New(db)
+	eng := newEngine(t, repo)
+	f := facade.New(eng, repo, nil)
+
+	var ccEvts []engine.ProcessEvent
+	var rowsAtFire []int
+	eng.SetExtensions(&engine.Extensions{
+		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+			if evt.Type != engine.EventCCCreate {
+				return
+			}
+			var n int
+			_ = db.QueryRowContext(ctx, ph(
+				"SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = ? AND actor_id = ?"),
+				evt.InstanceID, evt.CcActorID).Scan(&n)
+			rowsAtFire = append(rowsAtFire, n)
+			ccEvts = append(ccEvts, evt)
+		}},
+	})
+
+	instID := facadeStartSimple(t, f)
+	taskID := taskIDOfNode(t, repo, instID, "task1")
+	if r := f.Flow("processTask/execute", map[string]interface{}{
+		"processTaskId": taskID, "operator": "leader", "submitType": 1,
+		"tf_ccActors": []interface{}{"cc_sql_a", "cc_sql_b"},
+	}); r["code"].(int) != 0 {
+		t.Fatalf("办理带 tf_ccActors 应成功: %v", r)
+	}
+
+	if len(ccEvts) != 2 {
+		t.Fatalf("两个抄送人应逐人 fire CC_CREATE，实得 %d 条: %+v", len(ccEvts), ccEvts)
+	}
+	for i, want := range []string{"cc_sql_a", "cc_sql_b"} {
+		if ccEvts[i].CcActorID != want {
+			t.Errorf("CC_CREATE[%d].ccActorId = %q, want %q", i, ccEvts[i].CcActorID, want)
+		}
+		if rowsAtFire[i] == 0 {
+			t.Fatalf("CC_CREATE[%d] fire 时 %s 的 cc 行还查不到 ⇒ fire 早于落库（§11.2 原则 3）", i, want)
+		}
+	}
+	// 库内行核对：正好 2 行，且写入语义 actor_id＝被抄送人 / create_user＝发起抄送的人（§11.7）
+	rows, err := db.QueryContext(ctx, ph(
+		"SELECT actor_id, create_user FROM wf_process_cc_instance WHERE process_instance_id = ? ORDER BY actor_id"), instID)
+	if err != nil {
+		t.Fatalf("直查 cc 行: %v", err)
+	}
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var a, u string
+		if err := rows.Scan(&a, &u); err != nil {
+			t.Fatalf("scan cc 行: %v", err)
+		}
+		got[a] = u
+	}
+	if len(got) != 2 || got["cc_sql_a"] != "leader" || got["cc_sql_b"] != "leader" {
+		t.Fatalf("cc 行写入语义错位（want 两行 actor_id=cc_sql_a/b、create_user=leader），实得 %v", got)
+	}
+	// 同一次办理仍要正常办结（抄送腿不得打断主流程）
+	var state int
+	if err := db.QueryRowContext(ctx, ph("SELECT state FROM wf_process_instance WHERE id = ?"), instID).Scan(&state); err != nil {
+		t.Fatalf("读实例 state: %v", err)
+	}
+	if state != int(model.InstanceStateDone) {
+		t.Fatalf("带抄送的办结后实例 state = %d, want 20", state)
+	}
+
+	// 负向：另起一单不带 tf_ccActors ⇒ 零 cc 行零 CC_CREATE（守卫摘掉即此档红）
+	before := len(ccEvts)
+	inst2 := facadeStartSimple(t, f)
+	task2 := taskIDOfNode(t, repo, inst2, "task1")
+	if r := f.Flow("processTask/execute", map[string]interface{}{
+		"processTaskId": task2, "operator": "leader", "submitType": 1,
+	}); r["code"].(int) != 0 {
+		t.Fatalf("不带抄送的办理应成功: %v", r)
+	}
+	if len(ccEvts) != before {
+		t.Fatalf("不带 tf_ccActors 不得 fire CC_CREATE，新增 %d 条", len(ccEvts)-before)
+	}
+	var n2 int
+	_ = db.QueryRowContext(ctx, ph("SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = ?"), inst2).Scan(&n2)
+	if n2 != 0 {
+		t.Fatalf("不带 tf_ccActors 不该建 cc 行，实得 %d 行", n2)
+	}
+}
