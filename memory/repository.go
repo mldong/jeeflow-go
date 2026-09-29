@@ -315,11 +315,17 @@ func (r *Repository) RemoveTaskActor(ctx context.Context, taskID int64, actors [
 // 同一条判据：同一 (实例, 被抄送人) 已有 cc 行 ⇒ **跳过**——不新增行、不重置未读（state 保持
 // 原值）、不更新原行时间（CreateTime/UpdateTime 逐字不变）；同一次调用里的重复也折叠成一行。
 // 判重在写侧，查询侧不引入去重（历史重复行不清理）。
+//
+// issues/141 G10「空抄送人不建 cc 行」（spec 06 §2.10）**写侧兜底层**：入参先过
+// [spi.NormalizeCcActors]——空串/纯空白丢弃、值取 trim 后的串。判据必须落在这一层而不只在
+// 引擎漏斗里：绕过引擎/门面直连仓储的调用方（集成层、第三方仓储消费者）同样不得把空归属值
+// 灌进 actor_id（issues/129 那族"空 operator 读全库"的病根）；不 trim 还会让" 123 "与"123"
+// 落两行，把 G2 的判重打穿。与 JDBC 仓同判据、两仓必须同答案（issues/117 场景 27）。
 func (r *Repository) CreateCcInstance(ctx context.Context, instanceID int64, creator string, actorIDs ...string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rows := r.ccInstances[instanceID]
-	for _, actorID := range actorIDs {
+	for _, actorID := range spi.NormalizeCcActors(actorIDs...) {
 		if ccRowOf(rows, actorID) != nil {
 			continue // 已有行：①不新增 ②不重置 state ③不刷时间
 		}
@@ -339,12 +345,16 @@ func (r *Repository) FindCcActorIDs(ctx context.Context, instanceID int64) ([]st
 
 // CreateCcInstanceIfAbsent 写侧幂等建 cc 行，返回**实际新建**的 actor 子集（issues/141 G2）。
 // 子集为空 ⇒ 没有任何"创建"发生 ⇒ 调用方整支不得 fire CC_CREATE（spec 11.2 原则 1「码=事实」）。
+//
+// issues/141 G10：返回的子集**不得含空值、也不得含未 trim 的值**——子集是直接拿去逐人 fire 码 4
+// 的入参，漏一个空值就等于"为空归属值发了一次提醒"。判据与 [Repository.CreateCcInstance] 同一支
+// （[spi.NormalizeCcActors]）。
 func (r *Repository) CreateCcInstanceIfAbsent(ctx context.Context, instanceID int64, creator string, actorIDs ...string) ([]string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rows := r.ccInstances[instanceID]
 	var fresh []string
-	for _, actorID := range actorIDs {
+	for _, actorID := range spi.NormalizeCcActors(actorIDs...) {
 		if ccRowOf(rows, actorID) != nil || containsStr(fresh, actorID) {
 			continue // 已有行 / 同一次调用内已排进新建集 ⇒ 折叠
 		}

@@ -9,7 +9,10 @@ import (
 	"strings"
 )
 
-import "github.com/mldong/jeeflow-go/model"
+import (
+	"github.com/mldong/jeeflow-go/model"
+	"github.com/mldong/jeeflow-go/spi"
+)
 
 // ─── Interceptor ───────────────────────────────────────────────────────────────
 
@@ -334,6 +337,12 @@ func (e *EngineImpl) FireEvent(evt ProcessEvent) {
 // 同一 (实例, 人) 已有 cc 行时跳过（不新增行、不重置未读、不刷原行时间）；**逐人 fire 的入参
 // 是实际新建的子集**而不是原始请求（spec §11.2 原则 1「码=事实」——没发生"创建"就不得发码 4），
 // 子集为空整支不 fire（不空转、也不照旧全量 fire）。
+//
+// issues/141 G10「空抄送人不建 cc 行」（spec 06 §2.10）：入参解析（parseCcActors）归一后
+// **丢完为空 ⇒ 整支不执行**——不建任何 cc 行、也不 fire 码 4。逗号串与数组两种形态同判据，
+// 落库/比较值一律取 trim 后的串（" 123 " 与 "123" 是同一个人，与 G2 判重咬合）。
+// 判据的**唯一落点**是 [spi.NormalizeCcActors]，写侧另有两层兜底（两仓的 CreateCcInstance
+// 各自再挡一次）——只修本漏斗不算修完，绕过引擎/门面直连仓储的调用方照样能灌进空归属值。
 func (e *EngineImpl) HandleCcActors(ctx context.Context, instanceID int64, operator string, ccActors interface{}) error {
 	actors := parseCcActors(ccActors)
 	if len(actors) == 0 {
@@ -361,39 +370,32 @@ func (e *EngineImpl) notifyCcCreate(instanceID int64, actors []string) {
 
 // parseCcActors 抄送人入参归一：逗号串 / []string / []interface{}（JSON body 数组形态）
 // → []string；逐元素 trim，空元素剔除；nil / 空串 / 空数组 → nil。
+//
+// issues/141 G10「空不创建行」（spec 06 §2.10）漏斗层的落点：本函数的输出**一律过
+// [spi.NormalizeCcActors]**（逗号串与数组两种形态同判据，判据只有一个落点、不抄第二份），
+// 丢完为空时 HandleCcActors 直接返回、不建行也不 fire 码 4。写侧另有两层兜底
+// （内存仓/JDBC 仓的 CreateCcInstance 各自再挡一次），只修漏斗不算修完。
 func parseCcActors(v interface{}) []string {
 	switch t := v.(type) {
 	case nil:
 		return nil
 	case string:
-		var out []string
-		for _, s := range strings.Split(t, ",") {
-			if s = strings.TrimSpace(s); s != "" {
-				out = append(out, s)
-			}
-		}
-		return out
+		return spi.NormalizeCcActors(strings.Split(t, ",")...)
 	case []string:
-		var out []string
-		for _, s := range t {
-			if s = strings.TrimSpace(s); s != "" {
-				out = append(out, s)
-			}
-		}
-		return out
+		return spi.NormalizeCcActors(t...)
 	case []interface{}:
-		var out []string
+		raw := make([]string, 0, len(t))
 		for _, a := range t {
-			s := strings.TrimSpace(fmt.Sprintf("%v", a))
-			if s != "" {
-				out = append(out, s)
+			if a == nil {
+				// 数组里的 nil 元素就是"空元素"（JSON body `[null]` 的真实形状）：以前会
+				// 被 Sprintf 成字面量 "<nil>" 当成一个正常抄送人落库＋fire，既是空归属值
+				// 那一族（issues/129 病根）的变体，又是本漏斗唯一没被归一吃掉的空形。
+				continue
 			}
+			raw = append(raw, fmt.Sprintf("%v", a))
 		}
-		return out
+		return spi.NormalizeCcActors(raw...)
 	default:
-		if s := strings.TrimSpace(fmt.Sprintf("%v", v)); s != "" {
-			return []string{s}
-		}
-		return nil
+		return spi.NormalizeCcActors(fmt.Sprintf("%v", t))
 	}
 }

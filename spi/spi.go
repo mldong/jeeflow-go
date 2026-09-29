@@ -42,6 +42,12 @@ type ProcessRepository interface {
 	//
 	// ⚠️ 需要"实际新建了谁"的调用方（引擎/门面的三条抄送入口）一律改用
 	// [ProcessRepository.CreateCcInstanceIfAbsent]，拿返回的子集去 fire CC_CREATE。
+	//
+	// issues/141 G10「空抄送人不建 cc 行」（spec 06 §2.10）：入参里的**空串、纯空白一律丢弃**，
+	// 落库值取 trim 后的串（" 123 " 与 "123" 是同一个人）。这条义务要落在**实现方自己身上**
+	// 而不只落在引擎漏斗里——绕过引擎/门面直连仓储的调用方同样不得把空归属值灌进 actor_id
+	// （issues/129 那族"空 operator 读全库"的病根）。判据的单点＝[NormalizeCcActors]，
+	// 本仓内存仓与 JDBC 仓都调它，第三方仓储实现请同样复用它而不是各写一份。
 	CreateCcInstance(ctx context.Context, instanceID int64, creator string, actorIDs ...string) error
 
 	// FindCcActorIDs 读某实例**已存在**的 cc 行 actor id（issues/141 G2 写侧判重的读侧，

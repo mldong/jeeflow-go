@@ -1341,7 +1341,12 @@ func (f *Facade) createCCInstance(args map[string]interface{}) error {
 		return fmt.Errorf("processInstanceId 缺失或非法: %v", err)
 	}
 	operator := operatorArg(args)
-	actors := toStringSlice2(args["actorIds"])
+	// issues/141 G10「空抄送人不建 cc 行」（spec 06 §2.10）：手动腿与引擎腿（f_/tf_ 两条）
+	// 走同一条归一判据 [spi.NormalizeCcActors]——空串/纯空白/数组里的空元素一律丢弃，落库与
+	// 比较值取 trim 后的串。归一后**丢完为空 ⇒ 与上面"空 actorIds"档同判**（沿用既有
+	// `actorIds 缺失`，不新造错误码或文案）：不建行、不 fire 码 4。
+	// ⚠️ 反向哨兵：只吃空值，"0" 这类"看起来像空"的正常 id 不得被丢掉。
+	actors := spi.NormalizeCcActors(toStringSlice2(args["actorIds"])...)
 	if len(actors) == 0 {
 		return errors.New("actorIds 缺失")
 	}
@@ -1767,6 +1772,14 @@ func (f *Facade) taskLatest(args map[string]interface{}) (interface{}, error) {
 }
 
 // toStringSlice2 把 actorIds（数组或逗号串）转列表
+//
+// issues/141 G10 附带的一档：[]interface{} 里的 **nil 元素**在这里就丢掉——以前
+// fmt.Sprintf("%v", nil) 得到字面量 "<nil>"，归一判据（它只吃空串/纯空白）认不出来，
+// 于是 `[null]` 这种 JSON 形状能带出一条 actor_id='<nil>' 的抄送行。nil 元素本身就是
+// "空元素"，与空串同档；引擎漏斗（engine.parseCcActors）同判。
+//
+// ⚠️ 入参形态策略不变：只收数组与逗号串，裸标量（例如 JSON 数字解析成的 float64）仍返回
+// 空集 ⇒ 调用方按"参数缺失"报错，不静默 Sprintf 成 "1.2345e+04" 这种花名。
 func toStringSlice2(v interface{}) []string {
 	var list []string
 	switch t := v.(type) {
@@ -1774,6 +1787,9 @@ func toStringSlice2(v interface{}) []string {
 		list = append(list, t...)
 	case []interface{}:
 		for _, s := range t {
+			if s == nil {
+				continue
+			}
 			list = append(list, fmt.Sprintf("%v", s))
 		}
 	case string:
