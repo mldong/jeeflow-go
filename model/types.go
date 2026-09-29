@@ -185,33 +185,37 @@ type UserInfo struct {
 }
 
 // CcInstanceRow 抄送实例行数据（ccList 分页，v1.3.0，对齐 Java InstanceRow 字段）
+// BusinessNo/Operator 为可空列、DefineName/DefineDisplayName 走 LEFT JOIN pd：
+// *string 让 SQL NULL 投成 JSON null 而非 ""（spec 06 §2.4 · issues/141 G3，与 InstanceRow 同口径）。
 type CcInstanceRow struct {
 	ID                int64
 	ParentID          *int64
 	DefineID          int64
 	State             InstanceState
 	ParentNodeName    string
-	BusinessNo        string
-	Operator          string
+	BusinessNo        *string
+	Operator          *string
 	ExpireTime        *time.Time
 	Variables         map[string]interface{}
 	CreateTime        time.Time
 	CreateUser        string
 	UpdateTime        time.Time
 	UpdateUser        string
-	DefineName        string
-	DefineDisplayName string
+	DefineName        *string
+	DefineDisplayName *string
 	DefineVersion     int
 }
 
 // ─── 核心表分页行数据（v1.5.0，对齐 Java DefineRow/InstanceRow/TaskRow） ─────
 
 // DefineRow 流程定义行数据（pageDefines 分页）
+// Type 可空（wf_process_define.type NULL）：用 *string 让 SQL NULL 投成 JSON null，
+// 而非空串 ""（spec 06 §2.4 · issues/141 G3——可空列合法出口为 null/缺键，"" 违规）。
 type DefineRow struct {
 	ID          int64     `json:"id"`
 	Name        string    `json:"name"`
 	DisplayName string    `json:"displayName"`
-	Type        string    `json:"type"`
+	Type        *string   `json:"type"`
 	State       int       `json:"state"`
 	Version     int       `json:"version"`
 	CreateTime  time.Time `json:"createTime"`
@@ -221,26 +225,30 @@ type DefineRow struct {
 }
 
 // InstanceRow 流程实例行数据（pageInstances 分页）
+// BusinessNo/Operator 为可空列、DefineName/DefineDisplayName 走 LEFT JOIN pd（定义缺失即 NULL）：
+// 用 *string 让 SQL NULL 投成 JSON null 而非空串 ""（spec 06 §2.4 · issues/141 G3）。
 type InstanceRow struct {
 	ID                int64                  `json:"id"`
 	ParentID          *int64                 `json:"parentId"`
 	DefineID          int64                  `json:"processDefineId"`
 	State             InstanceState          `json:"state"`
 	ParentNodeName    string                 `json:"parentNodeName"`
-	BusinessNo        string                 `json:"businessNo"`
-	Operator          string                 `json:"operator"`
+	BusinessNo        *string                `json:"businessNo"`
+	Operator          *string                `json:"operator"`
 	ExpireTime        *time.Time             `json:"expireTime"`
 	Variables         map[string]interface{} `json:"variables"`
 	CreateTime        time.Time              `json:"createTime"`
 	CreateUser        string                 `json:"createUser"`
 	UpdateTime        time.Time              `json:"updateTime"`
 	UpdateUser        string                 `json:"updateUser"`
-	DefineName        string                 `json:"defineName"`
-	DefineDisplayName string                 `json:"defineDisplayName"`
+	DefineName        *string                `json:"defineName"`
+	DefineDisplayName *string                `json:"defineDisplayName"`
 	DefineVersion     int                    `json:"defineVersion"`
 }
 
 // TaskRow 任务行数据（pageTodoTasks / pageDoneTasks 分页）
+// Operator/FormKey 为可空列、ProcessDefineName/ProcessDefineDisplayName 走 LEFT JOIN pd（定义缺失即 NULL）：
+// 用 *string 让 SQL NULL 投成 JSON null 而非空串 ""（issues/141 G3 主案：pageTasks 裸 string 扫 NULL 直接报错）。
 type TaskRow struct {
 	ID                       int64                  `json:"id"`
 	ProcessInstanceID        int64                  `json:"processInstanceId"`
@@ -249,18 +257,18 @@ type TaskRow struct {
 	TaskType                 int                    `json:"taskType"`
 	PerformType              int                    `json:"performType"`
 	TaskState                TaskState              `json:"taskState"`
-	Operator                 string                 `json:"operator"`
+	Operator                 *string                `json:"operator"`
 	FinishTime               *time.Time             `json:"finishTime"`
 	ExpireTime               *time.Time             `json:"expireTime"`
-	FormKey                  string                 `json:"formKey"`
+	FormKey                  *string                `json:"formKey"`
 	TaskParentID             *int64                 `json:"taskParentId"`
 	Variables                map[string]interface{} `json:"variables"`
 	CreateTime               time.Time              `json:"createTime"`
 	CreateUser               string                 `json:"createUser"`
 	UpdateTime               time.Time              `json:"updateTime"`
 	UpdateUser               string                 `json:"updateUser"`
-	ProcessDefineName        string                 `json:"processDefineName"`
-	ProcessDefineDisplayName string                 `json:"processDefineDisplayName"`
+	ProcessDefineName        *string                `json:"processDefineName"`
+	ProcessDefineDisplayName *string                `json:"processDefineDisplayName"`
 	DefineVersion            int                    `json:"defineVersion"`
 	InstanceVariable         string                 `json:"instanceVariable"`
 	InstanceCreateTime       time.Time              `json:"instanceCreateTime"`

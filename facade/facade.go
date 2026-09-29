@@ -2297,11 +2297,21 @@ func fmtTimeV(t time.Time) string {
 // defineRowToMap 定义行：时间格式化
 func defineRowToMap(r *model.DefineRow) map[string]interface{} {
 	return map[string]interface{}{
-		"id": r.ID, "name": r.Name, "displayName": r.DisplayName, "type": r.Type,
+		"id": r.ID, "name": r.Name, "displayName": r.DisplayName, "type": nullOut(r.Type),
 		"state": r.State, "version": r.Version,
 		"createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
 		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
 	}
+}
+
+// nullOut 把分页行 DTO 的可空字符串列（*string）投成出口值：nil → JSON null，
+// 有值 → 原串（与改动前逐字节一致）。遵 spec 06 §2.4「可空列合法出口为 null/缺键，'' 违规」，
+// 绝不把 SQL NULL 伪造成空串或 Go 零值串化（"<nil>"）（issues/141 G3）。
+func nullOut(p *string) interface{} {
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 // designRowToMap 设计行：时间格式化（issues/63）
@@ -2318,13 +2328,13 @@ func designRowToMap(r *model.ProcessDesign) map[string]interface{} {
 func instanceRowToMap(r *model.InstanceRow) map[string]interface{} {
 	return map[string]interface{}{
 		"id": r.ID, "parentId": r.ParentID, "processDefineId": r.DefineID,
-		"state": r.State, "parentNodeName": r.ParentNodeName, "businessNo": r.BusinessNo,
-		"operator": r.Operator, "expireTime": fmtTime(r.ExpireTime),
+		"state": r.State, "parentNodeName": r.ParentNodeName, "businessNo": nullOut(r.BusinessNo),
+		"operator": nullOut(r.Operator), "expireTime": fmtTime(r.ExpireTime),
 		"createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
 		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
-		"processDefineName": r.DefineName, "processDefineDisplayName": r.DefineDisplayName,
+		"processDefineName": nullOut(r.DefineName), "processDefineDisplayName": nullOut(r.DefineDisplayName),
 		"processDefineVersion": r.DefineVersion,
-		"ext":                  r.Variables, "displayName": r.DefineDisplayName, "version": r.DefineVersion,
+		"ext":                  r.Variables, "displayName": nullOut(r.DefineDisplayName), "version": r.DefineVersion,
 	}
 }
 
@@ -2340,11 +2350,11 @@ func taskRowToMap(r *model.TaskRow) map[string]interface{} {
 	return map[string]interface{}{
 		"id": r.ID, "processInstanceId": r.ProcessInstanceID, "taskName": r.TaskName,
 		"displayName": r.DisplayName, "taskType": r.TaskType, "performType": r.PerformType,
-		"taskState": r.TaskState, "operator": r.Operator, "finishTime": fmtTime(r.FinishTime),
-		"expireTime": fmtTime(r.ExpireTime), "formKey": r.FormKey, "taskParentId": r.TaskParentID,
+		"taskState": r.TaskState, "operator": nullOut(r.Operator), "finishTime": fmtTime(r.FinishTime),
+		"expireTime": fmtTime(r.ExpireTime), "formKey": nullOut(r.FormKey), "taskParentId": r.TaskParentID,
 		"createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
 		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
-		"processDefineName": r.ProcessDefineName, "processDefineDisplayName": r.ProcessDefineDisplayName,
+		"processDefineName": nullOut(r.ProcessDefineName), "processDefineDisplayName": nullOut(r.ProcessDefineDisplayName),
 		"instanceCreateTime": fmtTimeV(r.InstanceCreateTime),
 		"ext":                ext, "instanceExt": instanceExt, "version": r.DefineVersion,
 		"taskFormData": formDataOf(r.Variables, "tf_"), // issues/15
@@ -2355,13 +2365,13 @@ func taskRowToMap(r *model.TaskRow) map[string]interface{} {
 func ccRowToMap(r *model.CcInstanceRow) map[string]interface{} {
 	return map[string]interface{}{
 		"id": r.ID, "parentId": r.ParentID, "processDefineId": r.DefineID,
-		"state": r.State, "parentNodeName": r.ParentNodeName, "businessNo": r.BusinessNo,
-		"operator": r.Operator, "expireTime": fmtTime(r.ExpireTime),
+		"state": r.State, "parentNodeName": r.ParentNodeName, "businessNo": nullOut(r.BusinessNo),
+		"operator": nullOut(r.Operator), "expireTime": fmtTime(r.ExpireTime),
 		"createTime": fmtTimeV(r.CreateTime), "createUser": r.CreateUser,
 		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
-		"processDefineName": r.DefineName, "processDefineDisplayName": r.DefineDisplayName,
+		"processDefineName": nullOut(r.DefineName), "processDefineDisplayName": nullOut(r.DefineDisplayName),
 		"processDefineVersion": r.DefineVersion,
-		"ext":                  r.Variables, "displayName": r.DefineDisplayName, "version": r.DefineVersion,
+		"ext":                  r.Variables, "displayName": nullOut(r.DefineDisplayName), "version": r.DefineVersion,
 	}
 }
 

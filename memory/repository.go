@@ -348,8 +348,8 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 			DefineID:       inst.DefineID,
 			State:          inst.State,
 			ParentNodeName: inst.ParentNodeName,
-			BusinessNo:     inst.BusinessNo,
-			Operator:       inst.Operator,
+			BusinessNo:     sp(inst.BusinessNo),
+			Operator:       sp(inst.Operator),
 			ExpireTime:     inst.ExpireTime,
 			Variables:      inst.Variables,
 			CreateTime:     inst.CreateTime,
@@ -358,8 +358,8 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 			UpdateUser:     inst.UpdateUser,
 		}
 		if def, ok := r.defines[inst.DefineID]; ok {
-			row.DefineName = def.Name
-			row.DefineDisplayName = def.DisplayName
+			row.DefineName = sp(def.Name)
+			row.DefineDisplayName = sp(def.DisplayName)
 			row.DefineVersion = def.Version
 		}
 		rows = append(rows, row)
@@ -422,7 +422,7 @@ func (r *Repository) PageDefines(ctx context.Context, query spi.PageQuery) ([]*m
 	var rows []*model.DefineRow
 	for _, d := range r.defines {
 		row := &model.DefineRow{
-			ID: d.ID, Name: d.Name, DisplayName: d.DisplayName, Type: d.Type,
+			ID: d.ID, Name: d.Name, DisplayName: d.DisplayName, Type: sp(d.Type),
 			State: d.State, Version: d.Version,
 			CreateTime: d.CreateTime, CreateUser: d.CreateUser,
 			UpdateTime: d.UpdateTime, UpdateUser: d.UpdateUser,
@@ -449,14 +449,14 @@ func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, ope
 		}
 		row := &model.InstanceRow{
 			ID: inst.ID, ParentID: inst.ParentID, DefineID: inst.DefineID, State: inst.State,
-			ParentNodeName: inst.ParentNodeName, BusinessNo: inst.BusinessNo, Operator: inst.Operator,
+			ParentNodeName: inst.ParentNodeName, BusinessNo: sp(inst.BusinessNo), Operator: sp(inst.Operator),
 			ExpireTime: inst.ExpireTime, Variables: inst.Variables,
 			CreateTime: inst.CreateTime, CreateUser: inst.CreateUser,
 			UpdateTime: inst.UpdateTime, UpdateUser: inst.UpdateUser,
 		}
 		if def, ok := r.defines[inst.DefineID]; ok {
-			row.DefineName = def.Name
-			row.DefineDisplayName = def.DisplayName
+			row.DefineName = sp(def.Name)
+			row.DefineDisplayName = sp(def.DisplayName)
 			row.DefineVersion = def.Version
 		}
 		if matchConditions(query.Conditions, instanceFields(row)) {
@@ -519,15 +519,29 @@ func (r *Repository) PageDoneTasks(ctx context.Context, query spi.PageQuery, ope
 
 // ═══ 条件匹配基建（issues/05-5，对齐 JDBC 白名单语义） ═══
 
+// sp 把内存行的字符串值包成 *string（内存仓没有 SQL NULL 概念，恒有值，含 ""）。
+// 与 JDBC 侧 nullStrToPtr 的区别：JDBC 对真 NULL 出 nil（JSON null），内存对"无值"仍出 ""，
+// 保持内存 demo 既有出口形状不变（issues/141 G3 只修 JDBC 扫描形状，不改内存语义）。
+func sp(s string) *string { return &s }
+
+// derefStrForMatch 行字段映射里把 *string 解回具体值参与 matchConditions 比较
+// （eqValue/fmt.Sprint 要的是 string 而非 *string；nil 保留为 nil）。
+func derefStrForMatch(p *string) interface{} {
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
 // 行字段映射（列名 → 行属性，白名单列均可匹配）
 func taskFields(r *model.TaskRow) map[string]interface{} {
 	return map[string]interface{}{
 		"t.id": r.ID, "t.task_name": r.TaskName, "t.display_name": r.DisplayName,
 		"t.task_type": r.TaskType, "t.perform_type": r.PerformType, "t.task_state": r.TaskState,
-		"t.operator": r.Operator, "t.form_key": r.FormKey, "t.create_time": r.CreateTime,
+		"t.operator": derefStrForMatch(r.Operator), "t.form_key": derefStrForMatch(r.FormKey), "t.create_time": r.CreateTime,
 		"t.finish_time": r.FinishTime, "t.expire_time": r.ExpireTime,
 		"t.process_instance_id": r.ProcessInstanceID, "t.task_parent_id": r.TaskParentID,
-		"pd.name": r.ProcessDefineName, "pd.display_name": r.ProcessDefineDisplayName,
+		"pd.name": derefStrForMatch(r.ProcessDefineName), "pd.display_name": derefStrForMatch(r.ProcessDefineDisplayName),
 		"pd.version": r.DefineVersion,
 	}
 }
@@ -535,15 +549,15 @@ func taskFields(r *model.TaskRow) map[string]interface{} {
 func instanceFields(r *model.InstanceRow) map[string]interface{} {
 	return map[string]interface{}{
 		"t.id": r.ID, "t.parent_id": r.ParentID, "t.process_define_id": r.DefineID,
-		"t.state": r.State, "t.parent_node_name": r.ParentNodeName, "t.business_no": r.BusinessNo,
-		"t.operator": r.Operator, "t.expire_time": r.ExpireTime, "t.create_time": r.CreateTime,
-		"pd.name": r.DefineName, "pd.display_name": r.DefineDisplayName, "pd.version": r.DefineVersion,
+		"t.state": r.State, "t.parent_node_name": r.ParentNodeName, "t.business_no": derefStrForMatch(r.BusinessNo),
+		"t.operator": derefStrForMatch(r.Operator), "t.expire_time": r.ExpireTime, "t.create_time": r.CreateTime,
+		"pd.name": derefStrForMatch(r.DefineName), "pd.display_name": derefStrForMatch(r.DefineDisplayName), "pd.version": r.DefineVersion,
 	}
 }
 
 func defineFields(r *model.DefineRow) map[string]interface{} {
 	return map[string]interface{}{
-		"t.id": r.ID, "t.name": r.Name, "t.display_name": r.DisplayName, "t.type": r.Type,
+		"t.id": r.ID, "t.name": r.Name, "t.display_name": r.DisplayName, "t.type": derefStrForMatch(r.Type),
 		"t.state": r.State, "t.version": r.Version, "t.create_time": r.CreateTime,
 		"t.update_time": r.UpdateTime,
 	}
@@ -713,8 +727,8 @@ func (r *Repository) taskRow(t *model.ProcessTask) *model.TaskRow {
 	row := &model.TaskRow{
 		ID: t.ID, ProcessInstanceID: t.ProcessInstanceID, TaskName: t.TaskName,
 		DisplayName: t.DisplayName, TaskType: t.TaskType, PerformType: t.PerformType,
-		TaskState: t.TaskState, Operator: t.ActorID,
-		FinishTime: t.FinishTime, ExpireTime: t.ExpireTime, FormKey: t.FormKey,
+		TaskState: t.TaskState, Operator: sp(t.ActorID),
+		FinishTime: t.FinishTime, ExpireTime: t.ExpireTime, FormKey: sp(t.FormKey),
 		TaskParentID: t.ParentTaskID, Variables: t.Variables,
 		CreateTime: t.CreateTime, CreateUser: t.CreateUser,
 		UpdateTime: t.UpdateTime, UpdateUser: t.UpdateUser,
@@ -722,8 +736,8 @@ func (r *Repository) taskRow(t *model.ProcessTask) *model.TaskRow {
 	if inst, ok := r.instances[t.ProcessInstanceID]; ok {
 		row.InstanceCreateTime = inst.CreateTime
 		if def, ok := r.defines[inst.DefineID]; ok {
-			row.ProcessDefineName = def.Name
-			row.ProcessDefineDisplayName = def.DisplayName
+			row.ProcessDefineName = sp(def.Name)
+			row.ProcessDefineDisplayName = sp(def.DisplayName)
 			row.DefineVersion = def.Version
 		}
 	}

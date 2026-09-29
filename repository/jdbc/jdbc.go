@@ -54,6 +54,17 @@ func (n *nullStrScan) Scan(v interface{}) error {
 	return nil
 }
 
+// nullStrToPtr 可空字符串列 → *string（NULL → nil，不投成 ""）。
+// 出口形状对齐 jeeflow-java（rs.getString 对 NULL 返回 Java null → JSON null）；
+// 遵 spec 06 §2.4「可空列合法出口为 null/缺键，'' 违规」。用于分页行 DTO 的可空列。
+func nullStrToPtr(ns sql.NullString) *string {
+	if !ns.Valid {
+		return nil
+	}
+	s := ns.String
+	return &s
+}
+
 // nullTimeScan 可空时间列（NULL → 零值 time.Time）
 type nullTimeScan struct{ dst *time.Time }
 
@@ -253,7 +264,7 @@ func (r *Repository) FindDefineByID(ctx context.Context, id int64) (*model.Proce
 		id)
 	def := &model.ProcessDefine{}
 	var content []byte
-	err := row.Scan(&def.ID, &def.Name, &def.DisplayName, &def.Type, &def.State, &content, &def.Version,
+	err := row.Scan(&def.ID, &def.Name, &def.DisplayName, &nullStrScan{&def.Type}, &def.State, &content, &def.Version,
 		&nullTimeScan{&def.CreateTime}, &nullStrScan{&def.CreateUser},
 		&nullTimeScan{&def.UpdateTime}, &nullStrScan{&def.UpdateUser})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -274,7 +285,7 @@ func (r *Repository) FindDefineByName(ctx context.Context, name string) (*model.
 		name)
 	def := &model.ProcessDefine{}
 	var content []byte
-	err := row.Scan(&def.ID, &def.Name, &def.DisplayName, &def.Type, &def.State, &content, &def.Version,
+	err := row.Scan(&def.ID, &def.Name, &def.DisplayName, &nullStrScan{&def.Type}, &def.State, &content, &def.Version,
 		&nullTimeScan{&def.CreateTime}, &nullStrScan{&def.CreateUser},
 		&nullTimeScan{&def.UpdateTime}, &nullStrScan{&def.UpdateUser})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -359,7 +370,7 @@ func (r *Repository) FindInstanceByID(ctx context.Context, id int64) (*model.Pro
 	var parentID sql.NullInt64
 	var variable []byte
 	err := row.Scan(&inst.ID, &parentID, &inst.DefineID, &inst.State, &nullStrScan{&inst.ParentNodeName},
-		&inst.BusinessNo, &inst.Operator, &nullTimePtrScan{&inst.ExpireTime}, &variable,
+		&nullStrScan{&inst.BusinessNo}, &nullStrScan{&inst.Operator}, &nullTimePtrScan{&inst.ExpireTime}, &variable,
 		&nullTimeScan{&inst.CreateTime}, &nullStrScan{&inst.CreateUser},
 		&nullTimeScan{&inst.UpdateTime}, &nullStrScan{&inst.UpdateUser})
 	if errors.Is(err, sql.ErrNoRows) {
@@ -432,8 +443,8 @@ func scanTask(row scanner) (*model.ProcessTask, error) {
 	var parentTaskID sql.NullInt64
 	var variable []byte
 	err := row.Scan(&t.ID, &t.ProcessInstanceID, &t.TaskName, &t.DisplayName, &t.TaskType,
-		&t.PerformType, &t.TaskState, &t.ActorID, &nullTimePtrScan{&t.FinishTime},
-		&nullTimePtrScan{&t.ExpireTime}, &t.FormKey, &parentTaskID,
+		&t.PerformType, &t.TaskState, &nullStrScan{&t.ActorID}, &nullTimePtrScan{&t.FinishTime},
+		&nullTimePtrScan{&t.ExpireTime}, &nullStrScan{&t.FormKey}, &parentTaskID,
 		&variable, &nullTimeScan{&t.CreateTime}, &nullStrScan{&t.CreateUser},
 		&nullTimeScan{&t.UpdateTime}, &nullStrScan{&t.UpdateUser})
 	if err != nil {
@@ -559,11 +570,17 @@ func (r *Repository) findTaskActors(ctx context.Context, taskID int64) ([]string
 	defer rows.Close()
 	var actors []string
 	for rows.Next() {
-		var a string
+		// issues/141 G3：actor_id 本栈 DDL 为 NOT NULL，NULL 只可能来自混库时其他栈（宽松 DDL）写入的脏行。
+		// []string 无法承载 nil，投成 "" 会把"空归属"伪造成一个真实参与者（污染 actor 判定）。
+		// ⇒ 显式跳过 NULL 行：非脏行读回语义不变，脏行不入列。
+		var a sql.NullString
 		if err := rows.Scan(&a); err != nil {
 			return nil, err
 		}
-		actors = append(actors, a)
+		if !a.Valid {
+			continue
+		}
+		actors = append(actors, a.String)
 	}
 	return actors, rows.Err()
 }
@@ -700,13 +717,18 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 		var parentID sql.NullInt64
 		var variable []byte
 		var defineVersion sql.NullInt64
+		var businessNo, operator, defineName, defineDisplayName sql.NullString
 		if err := rows.Scan(&row.ID, &parentID, &row.DefineID, &row.State, &nullStrScan{&row.ParentNodeName},
-			&row.BusinessNo, &row.Operator, &nullTimePtrScan{&row.ExpireTime}, &variable,
+			&businessNo, &operator, &nullTimePtrScan{&row.ExpireTime}, &variable,
 			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
 			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},
-			&row.DefineName, &row.DefineDisplayName, &defineVersion); err != nil {
+			&defineName, &defineDisplayName, &defineVersion); err != nil {
 			return nil, 0, err
 		}
+		row.BusinessNo = nullStrToPtr(businessNo)
+		row.Operator = nullStrToPtr(operator)
+		row.DefineName = nullStrToPtr(defineName)
+		row.DefineDisplayName = nullStrToPtr(defineDisplayName)
 		if parentID.Valid {
 			v := parentID.Int64
 			row.ParentID = &v
@@ -748,11 +770,13 @@ func (r *Repository) PageDefines(ctx context.Context, query spi.PageQuery) ([]*m
 	var result []*model.DefineRow
 	for rows.Next() {
 		row := &model.DefineRow{}
-		if err := rows.Scan(&row.ID, &row.Name, &row.DisplayName, &row.Type, &row.State, &row.Version,
+		var defineType sql.NullString
+		if err := rows.Scan(&row.ID, &row.Name, &row.DisplayName, &defineType, &row.State, &row.Version,
 			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
 			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser}); err != nil {
 			return nil, 0, err
 		}
+		row.Type = nullStrToPtr(defineType)
 		result = append(result, row)
 	}
 	return result, total, rows.Err()
@@ -791,13 +815,18 @@ func (r *Repository) PageInstances(ctx context.Context, query spi.PageQuery, ope
 		var parentID sql.NullInt64
 		var variable []byte
 		var defVersion sql.NullInt64
+		var businessNo, operator, defineName, defineDisplayName sql.NullString
 		if err := rows.Scan(&row.ID, &parentID, &row.DefineID, &row.State, &nullStrScan{&row.ParentNodeName},
-			&row.BusinessNo, &row.Operator, &nullTimePtrScan{&row.ExpireTime}, &variable,
+			&businessNo, &operator, &nullTimePtrScan{&row.ExpireTime}, &variable,
 			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
 			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},
-			&row.DefineName, &row.DefineDisplayName, &defVersion); err != nil {
+			&defineName, &defineDisplayName, &defVersion); err != nil {
 			return nil, 0, err
 		}
+		row.BusinessNo = nullStrToPtr(businessNo)
+		row.Operator = nullStrToPtr(operator)
+		row.DefineName = nullStrToPtr(defineName)
+		row.DefineDisplayName = nullStrToPtr(defineDisplayName)
 		if parentID.Valid {
 			v := parentID.Int64
 			row.ParentID = &v
@@ -858,16 +887,21 @@ func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bo
 		row := &model.TaskRow{}
 		var parentTaskID sql.NullInt64
 		var variable, instVariable []byte
+		var taskOperator, taskFormKey, defineName, defineDisplayName sql.NullString
 		if err := rows.Scan(&row.ID, &row.ProcessInstanceID, &row.TaskName, &row.DisplayName,
-			&row.TaskType, &row.PerformType, &row.TaskState, &row.Operator,
+			&row.TaskType, &row.PerformType, &row.TaskState, &taskOperator,
 			&nullTimePtrScan{&row.FinishTime}, &nullTimePtrScan{&row.ExpireTime},
-			&row.FormKey, &parentTaskID, &variable,
+			&taskFormKey, &parentTaskID, &variable,
 			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
 			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},
-			&row.ProcessDefineName, &row.ProcessDefineDisplayName,
+			&defineName, &defineDisplayName,
 			&row.DefineVersion, &instVariable, &nullTimeScan{&row.InstanceCreateTime}); err != nil {
 			return nil, 0, err
 		}
+		row.Operator = nullStrToPtr(taskOperator)
+		row.FormKey = nullStrToPtr(taskFormKey)
+		row.ProcessDefineName = nullStrToPtr(defineName)
+		row.ProcessDefineDisplayName = nullStrToPtr(defineDisplayName)
 		if parentTaskID.Valid {
 			v := parentTaskID.Int64
 			row.TaskParentID = &v
