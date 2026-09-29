@@ -888,16 +888,33 @@ func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bo
 		var parentTaskID sql.NullInt64
 		var variable, instVariable []byte
 		var taskOperator, taskFormKey, defineName, defineDisplayName sql.NullString
+		// issues/141 G7：可空**数值**列同 G3 的病，只是列族不同——task_type / perform_type / task_state
+		// 建表即 NULL 允许（schema-mysql.sql:43-45），pd.version 走 LEFT JOIN（定义行缺失即 NULL，
+		// 孤儿任务真实存在：RemoveDefine 只删定义行、任务行留着），且 define.version 列本身也可空
+		// （schema-mysql.sql:10）。裸扫进 int 会让 database/sql 报
+		// `converting NULL to int(64) is unsupported`（MySQL 驱动回 int64、sqlite 回 int，同一病灶）
+		// ⇒ **整条待办/已办分页失败**（不是单列降级）。
+		// 出口形状遵 jeeflow-java JdbcProcessRepository.mapTaskRow:1122-1124 的 rs.getInt：
+		// SQL NULL ⇒ Java int 0（wasNull 只用来判空，不改变出口值），故用 sql.NullInt64 接收后取
+		// Int64（!Valid 时天然为 0）。**不改**成 *int64：G3 刚定下的指针投影只针对 string 家族，
+		// 扩大形状会把分页 DTO / 前端契约一起牵进来。
+		// 备注：task_state 这一列在两条分页谓词（`= 10` / `<> 10`，见 filterWhere）下 NULL 行根本
+		// 进不了结果集，收它属防御性同口径（谓词一改就是同一个雷），不为它单独造夹具。
+		var taskType, performType, taskState, defineVersion sql.NullInt64
 		if err := rows.Scan(&row.ID, &row.ProcessInstanceID, &row.TaskName, &row.DisplayName,
-			&row.TaskType, &row.PerformType, &row.TaskState, &taskOperator,
+			&taskType, &performType, &taskState, &taskOperator,
 			&nullTimePtrScan{&row.FinishTime}, &nullTimePtrScan{&row.ExpireTime},
 			&taskFormKey, &parentTaskID, &variable,
 			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
 			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},
 			&defineName, &defineDisplayName,
-			&row.DefineVersion, &instVariable, &nullTimeScan{&row.InstanceCreateTime}); err != nil {
+			&defineVersion, &instVariable, &nullTimeScan{&row.InstanceCreateTime}); err != nil {
 			return nil, 0, err
 		}
+		row.TaskType = int(taskType.Int64)
+		row.PerformType = int(performType.Int64)
+		row.TaskState = model.TaskState(taskState.Int64)
+		row.DefineVersion = int(defineVersion.Int64)
 		row.Operator = nullStrToPtr(taskOperator)
 		row.FormKey = nullStrToPtr(taskFormKey)
 		row.ProcessDefineName = nullStrToPtr(defineName)

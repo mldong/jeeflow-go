@@ -249,7 +249,8 @@ func (f *Facade) deploy(args map[string]interface{}) (interface{}, error) {
 	}
 	var flow model.FlowModel
 	if err := json.Unmarshal(content, &flow); err != nil {
-		return nil, fmt.Errorf("流程定义 JSON 解析失败: %w", err)
+		// issues/139：对外 msg 为固定文案，原始异常只留在错误对象链（Unwrap），不进 msg
+		return nil, fixedMsgError(msgReadFlowDefineJSONFailed, err)
 	}
 	if flow.Name == "" {
 		return nil, errors.New("流程定义缺少 name")
@@ -289,7 +290,8 @@ func (f *Facade) redeploy(args map[string]interface{}) error {
 	}
 	var flow model.FlowModel
 	if err := json.Unmarshal(content, &flow); err != nil {
-		return fmt.Errorf("流程定义 JSON 解析失败: %w", err)
+		// issues/139：对外 msg 为固定文案，原始异常只留在错误对象链（Unwrap），不进 msg
+		return fixedMsgError(msgReadFlowDefineJSONFailed, err)
 	}
 	return f.repo.UpdateDefine(context.Background(), &model.ProcessDefine{
 		ID:          defineID,
@@ -825,7 +827,8 @@ func (f *Facade) designRedeploy(args map[string]interface{}) (interface{}, error
 	content := hisList[0].Content
 	var flow model.FlowModel
 	if err := json.Unmarshal(content, &flow); err != nil {
-		return nil, fmt.Errorf("流程定义 JSON 解析失败: %w", err)
+		// issues/139：对外 msg 为固定文案，原始异常只留在错误对象链（Unwrap），不进 msg
+		return nil, fixedMsgError(msgReadFlowDefineJSONFailed, err)
 	}
 	if flow.Name == "" {
 		return nil, errors.New("流程定义缺少 name")
@@ -1958,6 +1961,34 @@ func stringifyIDs(v interface{}) interface{} {
 
 func errorResult(msg string) map[string]interface{} {
 	return map[string]interface{}{"code": 99999999, "msg": msg}
+}
+
+// msgReadFlowDefineJSONFailed 流程定义 JSON 解析失败的**逐字固定**对外文案（issues/139）。
+// 与 Java 参考实现同源：jeeflow-core ModelParser.java:47
+// `throw new RuntimeException("读取流程定义 JSON 失败", e)` —— 门面出口
+// JeeflowFacade.java:177 `error(e.getMessage())` 取到的就是这句固定文案，cause 不进 msg。
+const msgReadFlowDefineJSONFailed = "读取流程定义 JSON 失败"
+
+// facadeFixedError 对外 msg 与内部 cause **分离**的错误（issues/139）。
+//
+// 为什么不在包装文案上动手（`fmt.Errorf("固定文案: %w", err)` 做不到）：门面顶层出口是
+// `errorResult(err.Error())`（facade.go:192），Error() 里拼了什么，msg 字段就是什么——
+// `%w` 只保证错误链可解，不让 Error() 变短。要"msg 逐字固定、异常只留在错误对象链"，
+// 就得让 Error() 本身只返回固定文案，cause 靠 Unwrap 交给调用方/日志。
+// 这正好复刻 Java 那侧 getMessage()/getCause() 的分工，出口映射一行都不用改。
+type facadeFixedError struct {
+	msg   string
+	cause error
+}
+
+func (e *facadeFixedError) Error() string { return e.msg }
+
+// Unwrap 保留原始异常于错误链（errors.Is/As/Unwrap 均可取到），仅供调用方与日志使用。
+func (e *facadeFixedError) Unwrap() error { return e.cause }
+
+// fixedMsgError 以逐字固定的 msg 出口，cause 只进错误链不进 msg（issues/139）。
+func fixedMsgError(msg string, cause error) error {
+	return &facadeFixedError{msg: msg, cause: cause}
 }
 
 func toStr(v interface{}, def string) string {

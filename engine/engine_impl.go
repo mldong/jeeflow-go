@@ -496,6 +496,16 @@ func (e *EngineImpl) isFirstTaskNode(flow *model.FlowModel, node *model.FlowNode
 
 // createTaskWithActors 以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）
 //
+// ⚠️ issues/137 B：**当前本仓零调用者**（全仓 grep 只命中本定义与 surrogate.go:112 的注释——
+// 主路径 executeNode → createTask 自己走 resolveActors 解析参与者，没有任何路径把"已算好的
+// 显式参与者集合"递进来）。**不删**：它承担**契约形状义务**——引擎对外承诺"给定参与者集合即可按
+// 主路径同语义建单"，① 其他语言栈的同名入口以此对照；② 未来的显式指派入口（预派人、外部按
+// 组织/角色算好参与者）照这个形状接，而不是绕回"传节点属性让引擎再解析一遍"。
+// 零调用者 ≠ 零契约，所以它的行为必须与 createTask 锁死在同一格测试里：
+// 见 engine/create_task_with_actors_137_test.go（普通 / 并行会签 / 串行会签 / 未知会签类型兜底 /
+// 单参与者 / applicant / 空参与者 七档，比读回持久值 + 事件序列，另有一格建单不变量守卫）。
+// 改动 createTask 的建单语义时，请同步看那一格——它红了就是两条路分叉了。
+//
 // parentTaskID：建单不变量 ①——产生这些任务的那个"刚办结的任务"id（发起路径为 0），见 model.CreateTask
 func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowModel, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}, actors []string, parentTaskID int64) error {
 	if len(actors) == 0 {
