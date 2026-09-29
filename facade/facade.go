@@ -1341,12 +1341,14 @@ func (f *Facade) createCCInstance(args map[string]interface{}) error {
 		return fmt.Errorf("processInstanceId 缺失或非法: %v", err)
 	}
 	operator := operatorArg(args)
-	// issues/141 G10「空抄送人不建 cc 行」（spec 06 §2.10）：手动腿与引擎腿（f_/tf_ 两条）
-	// 走同一条归一判据 [spi.NormalizeCcActors]——空串/纯空白/数组里的空元素一律丢弃，落库与
-	// 比较值取 trim 后的串。归一后**丢完为空 ⇒ 与上面"空 actorIds"档同判**（沿用既有
-	// `actorIds 缺失`，不新造错误码或文案）：不建行、不 fire 码 4。
+	// issues/141 G10「空抄送人不建 cc 行」（spec 06 §2.10）＋ issues/142 B 批（spec 06 §2.11）：
+	// 手动腿与引擎腿（f_/tf_ 两条）走**同一枚判据** [spi.NormalizeActors]，本栈的解析入口
+	// 就是 toStringSlice2——逗号串与数组**两形同判据**（空串/纯空白/数组里的 nil 一律丢弃，
+	// 落库与比较值取 trim 后的串）。
+	// 归一后**丢完为空 ⇒ 与上面"空 actorIds"档同判**（沿用既有 `actorIds 缺失`，不新造错误码
+	// 或文案）：不建行、不 fire 码 4。
 	// ⚠️ 反向哨兵：只吃空值，"0" 这类"看起来像空"的正常 id 不得被丢掉。
-	actors := spi.NormalizeCcActors(toStringSlice2(args["actorIds"])...)
+	actors := toStringSlice2(args["actorIds"])
 	if len(actors) == 0 {
 		return errors.New("actorIds 缺失")
 	}
@@ -1375,7 +1377,11 @@ func (f *Facade) updateCCStatus(args map[string]interface{}) error {
 	if err != nil {
 		return fmt.Errorf("processInstanceId 缺失或非法: %v", err)
 	}
-	operator := operatorArg(args)
+	// issues/142 B 批（spec 06-facade.md §2.11 写点表「updateCCStatus 的 operator」那一行）：
+	// **入参归一后再比**——operator 取 trim 后的值，否则 " 123 " 打不中库里 trim 后的行（静默
+	// no-op 报成功），而空 operator 会把 state=1 打到历史 actor_id 为空串 的脏行上（issues/129 病根）。
+	// operatorArg 已把"空串/缺键"回落 demo 缺省 user1（issues/129 案 A），这里补的是 trim 那半。
+	operator := singleActorArg(operatorArg(args))
 	return f.repo.UpdateCcStatus(context.Background(), instanceID, operator)
 }
 
@@ -1588,15 +1594,35 @@ func (f *Facade) nextTaskCandidates(flow *model.FlowModel, taskName string) []st
 }
 
 func (f *Facade) taskAddActor(args map[string]interface{}) error {
-	taskID, err := toInt64(args["processTaskId"])
+	taskID, err := taskIDArg(args)
 	if err != nil {
-		return fmt.Errorf("processTaskId 缺失或非法: %v", err)
+		return err
 	}
+	// issues/142 B 批（spec 06 §2.11）：actorIds 的逗号串与数组**两形同判据**，归一已在
+	// toStringSlice2 里落地（同一枚 spi.NormalizeActors：trim＋丢空＋折叠）。
+	// 丢完为空 ⇒ 沿用既有"actorIds 缺失"信封（§2.11 硬要求③，不新造错误码/文案）。
 	actors := toStringSlice2(args["actorIds"])
 	if len(actors) == 0 {
 		return errors.New("actorIds 缺失")
 	}
 	return f.repo.AddTaskActor(context.Background(), taskID, actors)
+}
+
+// taskIDArg 任务主键入参（spec 06-facade.md §2.11「主键类参数另判一档」）。
+//
+// 这一档与"归属值为空 ⇒ 丢弃"是**两件事**：归属值可有可无，主键没有就是调用方写错了，
+// 静默接受等于把脏行钉进表里。所以 processTaskId 缺失/空串/非数值一律走既有
+// 「processTaskId 缺失或非法」信封报错，**显式 0 也响亮报错**（不得拿 空串/0 当 id 落库）。
+// ⚠️ 严禁把 [spi.NormalizeActors] 那套判据套到主键上——那是归属值的尺子。
+func taskIDArg(args map[string]interface{}) (int64, error) {
+	id, err := toInt64(args["processTaskId"])
+	if err != nil {
+		return 0, fmt.Errorf("processTaskId 缺失或非法: %v", err)
+	}
+	if id == 0 {
+		return 0, errors.New("processTaskId 缺失或非法: 不得为 0")
+	}
+	return id, nil
 }
 
 // taskTransfer 转办（spec 06 §processTask/transfer，issues/115）：只摘 fromActor 那一行参与者、
@@ -1606,19 +1632,22 @@ func (f *Facade) taskAddActor(args map[string]interface{}) error {
 // 与 surrogate/addCandidate 的区别：那两个 action 只追加（加签，原参与人保留可办），本 action 才摘人。
 // 鉴权：operator == fromActor（只能转自己那一条待办），或 operator ∈ {flow.auto, flow.admin}。
 func (f *Facade) taskTransfer(args map[string]interface{}) error {
-	taskID, err := toInt64(args["processTaskId"])
+	taskID, err := taskIDArg(args)
 	if err != nil {
-		return fmt.Errorf("processTaskId 缺失或非法: %v", err)
+		return err
 	}
 	operator := strings.TrimSpace(toStr(args["operator"], ""))
 	if operator == "" {
 		return errors.New("operator 必填")
 	}
-	fromActor := strings.TrimSpace(toStr(args["fromActor"], ""))
+	// issues/142 B 批（spec 06 §2.11 写点表 transfer 那一行）：fromActor/toActor **归一后再参与
+	// 删除与插入**，走与集合侧同一枚判据 [spi.NormalizeActors]（singleActorArg）。
+	// 必填档不变：丢完为空 ⇒ 既有「fromActor/toActor 必填」信封（硬要求③不新造错误码）。
+	fromActor := singleActorArg(args["fromActor"])
 	if fromActor == "" {
 		return errors.New("fromActor 必填")
 	}
-	toActor := strings.TrimSpace(toStr(args["toActor"], ""))
+	toActor := singleActorArg(args["toActor"])
 	if toActor == "" {
 		return errors.New("toActor 必填")
 	}
@@ -1642,15 +1671,35 @@ func (f *Facade) taskTransfer(args map[string]interface{}) error {
 		return err
 	}
 	participants := dedupStrs(append(append([]string{}, actors...), task.ActorIDs...))
-	if !containsStr(participants, fromActor) {
+	// spec 06 §2.11 硬要求②「落库与比较一律取 trim 后的值」：库里历史行的值是**修复前落下的未
+	// trim 原值**（" 123 "），入参归一后（"123"）必须判成同一个人。比对取归一形、**删除用行上的
+	// 原值**——只拿归一值去 DELETE 会"判成同一人却一条没删"，转办报成功而原人的待办还在（假成功）。
+	var fromRaw, kept []string
+	alreadyTo := false
+	for _, p := range participants {
+		n := singleActorArg(p)
+		if n == "" {
+			kept = append(kept, p) // 历史空归属脏行不参与转办（不摘也不加），交给仓储写侧兜底
+			continue
+		}
+		if n == fromActor {
+			fromRaw = append(fromRaw, p)
+			continue
+		}
+		if n == toActor {
+			alreadyTo = true
+		}
+		kept = append(kept, p)
+	}
+	if len(fromRaw) == 0 {
 		return errors.New("原办理人不是该任务参与人")
 	}
-	if containsStr(participants, toActor) {
+	if alreadyTo {
 		return errors.New("目标人已是该任务参与人")
 	}
-	// 摘原人 + 加新人：RemoveTaskActor 只删 fromActor 那一行，同任务其余参与人（会签其他成员、
-	// 加签来的人）不受影响
-	if err := f.repo.RemoveTaskActor(ctx, taskID, []string{fromActor}); err != nil {
+	// 摘原人 + 加新人：RemoveTaskActor 只删 fromActor 那些行（同一人的未 trim 脏行一并摘掉），
+	// 同任务其余参与人（会签其他成员、加签来的人）不受影响
+	if err := f.repo.RemoveTaskActor(ctx, taskID, fromRaw); err != nil {
 		return err
 	}
 	if err := f.repo.AddTaskActor(ctx, taskID, []string{toActor}); err != nil {
@@ -1688,9 +1737,10 @@ func (f *Facade) taskTransfer(args map[string]interface{}) error {
 	task.UpdateTime = now
 	task.UpdateUser = operator
 	// 内存仓 UpdateTask 会用任务副本的 ActorIDs 覆盖参与者表：必须回传变更后的清单，
-	// 否则上面的摘人/加人被旧副本回滚（SQL 仓 UpdateTask 不碰参与者表，同值回写无害）
-	task.ActorIDs = dedupStrs(append(
-		removeStr(participants, fromActor), toActor))
+	// 否则上面的摘人/加人被旧副本回滚（SQL 仓 UpdateTask 不碰参与者表，同值回写无害）。
+	// kept ＝ 参与者清单里**除去 fromRaw 那些行**的其余原值（逐字与 SQL 仓此刻的行集同形），
+	// 追加的是归一后的 toActor ⇒ 两仓落库形状一致。
+	task.ActorIDs = dedupStrs(append(kept, toActor))
 	if err := f.repo.UpdateTask(ctx, task); err != nil {
 		return err
 	}
@@ -1771,36 +1821,55 @@ func (f *Facade) taskLatest(args map[string]interface{}) (interface{}, error) {
 	}, nil
 }
 
-// toStringSlice2 把 actorIds（数组或逗号串）转列表
+// toStringSlice2 把 actorIds（数组或逗号串）转列表，**输出即归一后的集合**。
 //
-// issues/141 G10 附带的一档：[]interface{} 里的 **nil 元素**在这里就丢掉——以前
+// issues/142 B 批（spec 06-facade.md §2.11「两形同判据」·owner 2026-09-30 拍
+// 「八栈一起收：两形同判据＋写侧兜底＋trim＋哨兵」）：本函数的三个入参形态
+// （[]string／[]interface{}／逗号串）**一律过同一枚判据** [spi.NormalizeActors]——
+// 逐元素 trim、空串/纯空白丢弃、同次调用折叠、落库与比较取 trim 后的值。
+// 改前三形三样尺子（普查底稿 issues/142 §2 B 表 go 那一行）：
+//   - []string 不 trim、空串照收 ⇒ " 123 " 与 "123" 判成两个人、actor_id 为空串 直接落库；
+//   - []interface{} 丢 nil 但 "" 照收、不 trim；
+//   - 只有逗号串那一支才 TrimSpace＋丢空。
+//
+// issues/141 G10 附带的一档保留：[]interface{} 里的 **nil 元素**在这里就丢掉——以前
 // fmt.Sprintf("%v", nil) 得到字面量 "<nil>"，归一判据（它只吃空串/纯空白）认不出来，
-// 于是 `[null]` 这种 JSON 形状能带出一条 actor_id='<nil>' 的抄送行。nil 元素本身就是
-// "空元素"，与空串同档；引擎漏斗（engine.parseCcActors）同判。
+// 于是 `[null]` 这种 JSON 形状能带出一条 actor_id='<nil>' 的行。nil 元素本身就是
+// "空元素"，与空串同档；引擎漏斗（engine.parseCcActors／engine.valueToActors）同判。
+// **形态拆解**（怎么把 JSON 值摊成候选串）留在各调用点，**判据**只有 spi.NormalizeActors 那一枚
+// ——两份判据迟早分叉（spec §2.11 结尾点名 php 那轮的实测教训）。
 //
 // ⚠️ 入参形态策略不变：只收数组与逗号串，裸标量（例如 JSON 数字解析成的 float64）仍返回
 // 空集 ⇒ 调用方按"参数缺失"报错，不静默 Sprintf 成 "1.2345e+04" 这种花名。
+//
+// ⚠️ 反向哨兵：判据只吃空值，"0" 是有效参与者不得被丢掉，"0" 与 "00" 是两个不同的人。
 func toStringSlice2(v interface{}) []string {
-	var list []string
+	var raw []string
 	switch t := v.(type) {
 	case []string:
-		list = append(list, t...)
+		raw = append(raw, t...)
 	case []interface{}:
 		for _, s := range t {
 			if s == nil {
-				continue
+				continue // nil 元素＝空元素，绝不串化成 "<nil>"
 			}
-			list = append(list, fmt.Sprintf("%v", s))
+			raw = append(raw, fmt.Sprintf("%v", s))
 		}
 	case string:
-		for _, s := range strings.Split(t, ",") {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				list = append(list, s)
-			}
-		}
+		raw = append(raw, strings.Split(t, ",")...)
 	}
-	return list
+	return spi.NormalizeActors(raw...)
+}
+
+// singleActorArg 单人归属入参归一（spec 06-facade.md §2.11 写点表：transfer 的
+// fromActor/toActor、updateCCStatus 的 operator）：**走与集合侧同一枚判据**
+// [spi.NormalizeActors]，返回 trim 后的值；空串/纯空白/nil ⇒ 空串，由调用方按
+// 自己既有的"必填"档报错（§2.11 硬要求③「沿用各栈既有的缺参数错误信封，不新造错误码」）。
+func singleActorArg(v interface{}) string {
+	if list := spi.NormalizeActors(toStr(v, "")); len(list) > 0 {
+		return list[0]
+	}
+	return ""
 }
 
 // ═══ 工具 ═══

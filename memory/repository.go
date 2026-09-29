@@ -274,15 +274,28 @@ func (r *Repository) FindTaskActors(ctx context.Context, taskID int64) ([]string
 	return append([]string{}, r.actors[taskID]...), nil
 }
 
+// AddTaskActor 追加任务参与者（内存仓）。
+//
+// issues/142 B 批（spec 06-facade.md §2.11「归属值写侧归一」·写侧兜底层）：入参先过
+// [spi.NormalizeActors]——空串/纯空白丢弃、值取 trim 后的串、同一次调用内折叠；与 JDBC 仓
+// 同判据、两仓必须同答案（issues/117 场景 27 那把尺子）。判据必须落在这一层而不只在门面/引擎
+// 的入参解析里：绕过门面直连仓储的调用方（集成层、第三方仓储消费者）同样不得把空归属值灌进
+// actor_id——那是 issues/129 那族"空 operator 读全库"的上游进水口。不 trim 还会让" 123 "与
+// "123" 落两行，把既有判重打穿。
+//
+// ⚠️ 反向哨兵：只吃空值，"0" 这类"看起来像空"的正常 id 不得被丢掉（"0" 与 "00" 是两个人）。
+// ⚠️ 主键 taskID 不套用本判据——§2.11「主键类参数另判一档」，缺失/0 由调用方响亮报错。
 func (r *Repository) AddTaskActor(ctx context.Context, taskID int64, actors []string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	existing := r.actors[taskID]
 	seen := make(map[string]bool)
-	for _, a := range existing {
+	// 比较一律取 trim 后的值（硬要求②）：历史脏行（修复前落下的未 trim 原值）与归一后的入参
+	// 判为同一个人 ⇒ 不再落第二行。行上的原值不清理（与 issues/141 G2「历史重复行不清理」同档）。
+	for _, a := range spi.NormalizeActors(existing...) {
 		seen[a] = true
 	}
-	for _, a := range actors {
+	for _, a := range spi.NormalizeActors(actors...) {
 		if !seen[a] {
 			existing = append(existing, a)
 			seen[a] = true
@@ -317,7 +330,7 @@ func (r *Repository) RemoveTaskActor(ctx context.Context, taskID int64, actors [
 // 判重在写侧，查询侧不引入去重（历史重复行不清理）。
 //
 // issues/141 G10「空抄送人不建 cc 行」（spec 06 §2.10）**写侧兜底层**：入参先过
-// [spi.NormalizeCcActors]——空串/纯空白丢弃、值取 trim 后的串。判据必须落在这一层而不只在
+// [spi.NormalizeActors]——空串/纯空白丢弃、值取 trim 后的串。判据必须落在这一层而不只在
 // 引擎漏斗里：绕过引擎/门面直连仓储的调用方（集成层、第三方仓储消费者）同样不得把空归属值
 // 灌进 actor_id（issues/129 那族"空 operator 读全库"的病根）；不 trim 还会让" 123 "与"123"
 // 落两行，把 G2 的判重打穿。与 JDBC 仓同判据、两仓必须同答案（issues/117 场景 27）。
@@ -325,7 +338,7 @@ func (r *Repository) CreateCcInstance(ctx context.Context, instanceID int64, cre
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rows := r.ccInstances[instanceID]
-	for _, actorID := range spi.NormalizeCcActors(actorIDs...) {
+	for _, actorID := range spi.NormalizeActors(actorIDs...) {
 		if ccRowOf(rows, actorID) != nil {
 			continue // 已有行：①不新增 ②不重置 state ③不刷时间
 		}
@@ -348,13 +361,13 @@ func (r *Repository) FindCcActorIDs(ctx context.Context, instanceID int64) ([]st
 //
 // issues/141 G10：返回的子集**不得含空值、也不得含未 trim 的值**——子集是直接拿去逐人 fire 码 4
 // 的入参，漏一个空值就等于"为空归属值发了一次提醒"。判据与 [Repository.CreateCcInstance] 同一支
-// （[spi.NormalizeCcActors]）。
+// （[spi.NormalizeActors]）。
 func (r *Repository) CreateCcInstanceIfAbsent(ctx context.Context, instanceID int64, creator string, actorIDs ...string) ([]string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	rows := r.ccInstances[instanceID]
 	var fresh []string
-	for _, actorID := range spi.NormalizeCcActors(actorIDs...) {
+	for _, actorID := range spi.NormalizeActors(actorIDs...) {
 		if ccRowOf(rows, actorID) != nil || containsStr(fresh, actorID) {
 			continue // 已有行 / 同一次调用内已排进新建集 ⇒ 折叠
 		}
@@ -371,10 +384,20 @@ func (r *Repository) CreateCcInstanceIfAbsent(ctx context.Context, instanceID in
 // actor id，没有已读态），行模型升级后这一档才照得出来——"重复抄送不得把已读抹回未读"的断言
 // 依赖它。
 func (r *Repository) UpdateCcStatus(ctx context.Context, instanceID int64, actorID string) error {
+	// issues/142 B 批（spec 06-facade.md §2.11 写点表「updateCCStatus 的 operator」那一行）：
+	// **入参归一后再比**——比较值取 trim 后的串；归属为空（空串/纯空白）⇒ 整支 no-op，
+	// 严禁退化成"这条条件不加"把 state=1 打到历史 actor_id 为空串 的脏行上（issues/129 病根）。
+	// 判据的单点＝[spi.NormalizeActors]，与门面腿同一枚（§2.11 硬要求①「两层都挡」）。
+	// 行上的值**不做二次归一**：与 SQL 仓 `WHERE actor_id=?` 逐字同判据，两仓必须同答案
+	// （issues/117 场景 27 那把尺子；SQL 侧不便套 TRIM，各库语义不一）。
+	target := spi.NormalizeActors(actorID)
+	if len(target) == 0 {
+		return nil
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, row := range r.ccInstances[instanceID] {
-		if row.ActorID == actorID {
+		if row.ActorID == target[0] {
 			row.State = 1
 			row.UpdateTime = time.Now()
 		}

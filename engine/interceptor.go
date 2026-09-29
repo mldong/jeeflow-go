@@ -341,7 +341,7 @@ func (e *EngineImpl) FireEvent(evt ProcessEvent) {
 // issues/141 G10「空抄送人不建 cc 行」（spec 06 §2.10）：入参解析（parseCcActors）归一后
 // **丢完为空 ⇒ 整支不执行**——不建任何 cc 行、也不 fire 码 4。逗号串与数组两种形态同判据，
 // 落库/比较值一律取 trim 后的串（" 123 " 与 "123" 是同一个人，与 G2 判重咬合）。
-// 判据的**唯一落点**是 [spi.NormalizeCcActors]，写侧另有两层兜底（两仓的 CreateCcInstance
+// 判据的**唯一落点**是 [spi.NormalizeActors]，写侧另有两层兜底（两仓的 CreateCcInstance
 // 各自再挡一次）——只修本漏斗不算修完，绕过引擎/门面直连仓储的调用方照样能灌进空归属值。
 func (e *EngineImpl) HandleCcActors(ctx context.Context, instanceID int64, operator string, ccActors interface{}) error {
 	actors := parseCcActors(ccActors)
@@ -372,7 +372,7 @@ func (e *EngineImpl) notifyCcCreate(instanceID int64, actors []string) {
 // → []string；逐元素 trim，空元素剔除；nil / 空串 / 空数组 → nil。
 //
 // issues/141 G10「空不创建行」（spec 06 §2.10）漏斗层的落点：本函数的输出**一律过
-// [spi.NormalizeCcActors]**（逗号串与数组两种形态同判据，判据只有一个落点、不抄第二份），
+// [spi.NormalizeActors]**（逗号串与数组两种形态同判据，判据只有一个落点、不抄第二份），
 // 丢完为空时 HandleCcActors 直接返回、不建行也不 fire 码 4。写侧另有两层兜底
 // （内存仓/JDBC 仓的 CreateCcInstance 各自再挡一次），只修漏斗不算修完。
 func parseCcActors(v interface{}) []string {
@@ -380,9 +380,9 @@ func parseCcActors(v interface{}) []string {
 	case nil:
 		return nil
 	case string:
-		return spi.NormalizeCcActors(strings.Split(t, ",")...)
+		return spi.NormalizeActors(strings.Split(t, ",")...)
 	case []string:
-		return spi.NormalizeCcActors(t...)
+		return spi.NormalizeActors(t...)
 	case []interface{}:
 		raw := make([]string, 0, len(t))
 		for _, a := range t {
@@ -394,8 +394,8 @@ func parseCcActors(v interface{}) []string {
 			}
 			raw = append(raw, fmt.Sprintf("%v", a))
 		}
-		return spi.NormalizeCcActors(raw...)
+		return spi.NormalizeActors(raw...)
 	default:
-		return spi.NormalizeCcActors(fmt.Sprintf("%v", t))
+		return spi.NormalizeActors(fmt.Sprintf("%v", t))
 	}
 }

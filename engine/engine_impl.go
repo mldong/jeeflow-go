@@ -978,36 +978,54 @@ func (e *EngineImpl) resolveActors(node *model.FlowNode, inst *model.ProcessInst
 	return nil
 }
 
-// valueToActors 把变量值转参与者列表：
-// split=true 时 String 按逗号分割（tf_nextNodeOperator 语义）；否则 String 原样单个（assignee 命中语义）
+// valueToActors 把变量值转参与者列表：**输出即归一后的集合**。
+//
+// split=true 时 String 按逗号分割（tf_nextNodeOperator 语义）；否则 String 原样单个（assignee 命中语义）。
+//
+// issues/142 B 批（spec 06-facade.md §2.11 写点表 f_nextNodeOperator／tf_nextNodeOperator 那一行
+// ·owner 2026-09-30 拍「两形同判据」）：逗号串与数组两种形态**同判据**，判据只有
+// [spi.NormalizeActors] 那一枚（逐元素 trim、空串/纯空白丢弃、同次调用折叠、落库与比较取 trim
+// 后的值）；本函数只负责**形态拆解**（把变量值摊成逐元素候选串）。改前三处都从这一支漏过
+// （普查底稿 issues/142 §2 B 表 go 那一行）：
+//   - 数组里的 nil／整个 nil 入参被 fmt.Sprintf 成字面量 "<nil>" 落进归属列 ⇒ 现在与空串同档丢弃；
+//   - []string 与 []interface{} 两支都不 trim ⇒ " 123 " 与 "123" 判成两个人；
+//   - 空串元素照收 ⇒ 正是 issues/129 那族"空归属值读全库"的进水口。
+//
+// 数字元素照旧字符串化（fmt.Sprint 之后**仍走同一枚归一**，两端空格一样剥掉），不得被静默丢弃；
+// ⚠️ 反向哨兵："0" 是有效参与者，判据只吃空值。
 func valueToActors(v interface{}, split bool) []string {
-	var out []string
+	return spi.NormalizeActors(actorValueToRawStrings(v, split)...)
+}
+
+// actorValueToRawStrings 形态拆解（**不做判据**）：变量值 → 逐元素候选串。
+// 判据一律落在 [spi.NormalizeActors]，这里再写一份就是"两份尺子迟早分叉"（spec §2.11 结尾点名）。
+func actorValueToRawStrings(v interface{}, split bool) []string {
 	switch t := v.(type) {
+	case nil:
+		return nil // nil 入参＝没有这一档，不产出候选串（旧形状在这里 Sprintf 出 "<nil>"）
 	case string:
 		if split {
-			for _, s := range strings.Split(t, ",") {
-				s = strings.TrimSpace(s)
-				if s != "" {
-					out = append(out, s)
-				}
-			}
-		} else if t = strings.TrimSpace(t); t != "" {
-			out = append(out, t)
+			return strings.Split(t, ",")
 		}
+		return []string{t}
 	case []string:
-		out = append(out, t...)
+		return t
 	case []interface{}:
+		out := make([]string, 0, len(t))
 		for _, s := range t {
+			if s == nil {
+				continue // 数组里的 nil 元素就是"空元素"，与空串同档，绝不串化成 "<nil>"
+			}
 			if str, ok := s.(string); ok {
 				out = append(out, str)
-			} else {
-				out = append(out, fmt.Sprintf("%v", s))
+				continue
 			}
+			out = append(out, fmt.Sprintf("%v", s))
 		}
+		return out
 	default:
-		out = append(out, fmt.Sprintf("%v", v))
+		return []string{fmt.Sprintf("%v", t)}
 	}
-	return out
 }
 
 func (e *EngineImpl) isAllowed(task *model.ProcessTask, operator string) bool {

@@ -143,7 +143,7 @@ func (p *ProcessInstance) CreateTask(id int64, taskName, displayName, actor, ope
 // 可由加派参与者（processTask/addCandidate、taskSurrogate）或 flow.auto/flow.admin 办动。
 // 空集的落库形状：`wf_process_task_actor` **一行都不插**（不是插一条 actor_id 为空串的——
 // 空归属值正是 issues/129／141 B 表那族"空 actor_id 读全库"的上游进水口，
-// 同 spi.NormalizeCcActors 的写侧义务）。
+// 同 [spi.NormalizeActors] 的写侧义务）。
 func (p *ProcessInstance) CreateTaskWithActors(id int64, taskName, displayName string, actors []string,
 	operator, formKey string, now time.Time, parentTaskID int64, isFirstTaskNode bool, performType ...int) *ProcessTask {
 	pt := 0

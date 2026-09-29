@@ -30,6 +30,25 @@ type ProcessRepository interface {
 	FindHistoryTasks(ctx context.Context, instanceID int64) ([]*model.ProcessTask, error)
 
 	FindTaskActors(ctx context.Context, taskID int64) ([]string, error)
+
+	// AddTaskActor 追加任务参与者（逐人一行；**追加语义**，不清空原参与者，issues/03）。
+	//
+	// issues/142 B 批「归属值写侧归一」（issues/142 B 批 · spec 06-facade.md §2.11，
+	// 判据逐字承 issues/141 G10 · spec §2.10）——**空值义务同样落在实现方自己身上**，
+	// 不只是引擎/门面的入参解析那一层：
+	//   - 入参 actors 里的**空串、纯空白一律丢弃**，落库值取 trim 后的串
+	//     （" 123 " 与 "123" 是同一个人，不 trim 会让同一人落两行、把判重打穿）；
+	//   - 同一次调用内的重复折叠；
+	//   - 判据的单点＝[NormalizeActors]，本仓内存仓与 JDBC 仓都调它，
+	//     第三方仓储实现请同样复用它而不是各写一份（两份判据迟早分叉）；
+	//   - ⚠️ 反向哨兵：只吃空值，"0" 这类"看起来像空"的正常 id **不得**被丢掉，
+	//     "0" 与 "00" 是两个不同的人（比较用字符串等值，严禁借语言自带的假值判据）；
+	//   - **主键另判一档**：taskID 是主键不是归属值，缺失/空/0 必须由**调用方**响亮报错，
+	//     不得拿 空串/0 当 id 往下落库（§2.11「主键类参数另判一档」）。
+	//
+	// 为什么义务要写在实现方身上：绕过引擎/门面直连仓储的调用方（集成层、第三方仓储消费者）
+	// 同样不得把空归属值灌进 wf_process_task_actor.actor_id——那是 issues/129 那族
+	// "空 operator 读全库"的上游进水口（spec §2.11 硬要求①「两层都挡」）。
 	AddTaskActor(ctx context.Context, taskID int64, actors []string) error
 	RemoveTaskActor(ctx context.Context, taskID int64, actors []string) error
 
@@ -46,7 +65,8 @@ type ProcessRepository interface {
 	// issues/141 G10「空抄送人不建 cc 行」（spec 06 §2.10）：入参里的**空串、纯空白一律丢弃**，
 	// 落库值取 trim 后的串（" 123 " 与 "123" 是同一个人）。这条义务要落在**实现方自己身上**
 	// 而不只落在引擎漏斗里——绕过引擎/门面直连仓储的调用方同样不得把空归属值灌进 actor_id
-	// （issues/129 那族"空 operator 读全库"的病根）。判据的单点＝[NormalizeCcActors]，
+	// （issues/129 那族"空 operator 读全库"的病根）。判据的单点＝[NormalizeActors]
+	// （cc 侧旧名 [NormalizeCcActors] 只是它的转发，不是第二份判据），
 	// 本仓内存仓与 JDBC 仓都调它，第三方仓储实现请同样复用它而不是各写一份。
 	CreateCcInstance(ctx context.Context, instanceID int64, creator string, actorIDs ...string) error
 
@@ -67,6 +87,12 @@ type ProcessRepository interface {
 	// **子集为空则整支不 fire**（不空转、也不照旧按原始请求全量 fire）。
 	CreateCcInstanceIfAbsent(ctx context.Context, instanceID int64, creator string, actorIDs ...string) ([]string, error)
 
+	// UpdateCcStatus 抄送已读（state 0→1）。
+	//
+	// issues/142 B 批（spec 06-facade.md §2.11 写点表「processInstance/updateCCStatus 的 operator」
+	// 一行）：**入参归一后再比**——actorID 取 trim 后的值，空串/纯空白按"没给归属"处理，
+	// 严禁退化成"这条条件不加"把 state=1 打到历史 actor_id 为空串 的脏行上（issues/129 那族病根）。
+	// 判据的单点＝[NormalizeActors]；门面腿已在解析时归一，仓储这层是第二道（§2.11 硬要求①）。
 	UpdateCcStatus(ctx context.Context, instanceID int64, actorID string) error
 
 	// PageCcInstances 我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：
