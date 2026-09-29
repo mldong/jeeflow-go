@@ -15,13 +15,27 @@ import (
 )
 
 type Repository struct {
-	mu          sync.RWMutex
-	defines     map[int64]*model.ProcessDefine
-	instances   map[int64]*model.ProcessInstance
-	tasks       map[int64]*model.ProcessTask
-	actors      map[int64][]string
-	ccInstances map[int64][]string
+	mu        sync.RWMutex
+	defines   map[int64]*model.ProcessDefine
+	instances map[int64]*model.ProcessInstance
+	tasks     map[int64]*model.ProcessTask
+	actors    map[int64][]string
+	// ccInstances 的值是 **cc 行模型**（[CcRow]），不是 actor id 串/切片：issues/141 G2 的
+	// ②"不重置未读"③"不更新原行时间"两档只有带 state/create_time/update_time 的行才照得出来
+	// （同 Java MemoryProcessRepository.CcRow，形状对齐 wf_process_cc_instance 表）。
+	ccInstances map[int64][]*CcRow
 	nextID      atomic.Int64
+}
+
+// CcRow 内存仓的一条抄送行（issues/141 G2）——形状对齐 wf_process_cc_instance 表：
+// actor id ＋ 未读状态（0 未读 / 1 已读）＋ 建行时间与更新时间。
+// 导出是为了让跨包测试能直接断言 state/时间两档（只看 actor id 集合照不出"重复抄送把已读
+// 抹回未读 / 把时间刷成 now"这两种假修）。
+type CcRow struct {
+	ActorID    string
+	State      int
+	CreateTime time.Time
+	UpdateTime time.Time
 }
 
 func New() *Repository {
@@ -30,7 +44,7 @@ func New() *Repository {
 		instances:   make(map[int64]*model.ProcessInstance),
 		tasks:       make(map[int64]*model.ProcessTask),
 		actors:      make(map[int64][]string),
-		ccInstances: make(map[int64][]string),
+		ccInstances: make(map[int64][]*CcRow),
 	}
 	r.nextID.Store(1)
 	return r
@@ -295,18 +309,111 @@ func (r *Repository) RemoveTaskActor(ctx context.Context, taskID int64, actors [
 	return nil
 }
 
+// CreateCcInstance 建 cc 行（逐抄送人一行）。
+//
+// issues/141 G2 写侧判重＝幂等空操作（spec 06 §4），与 JdbcProcessRepository.CreateCcInstance
+// 同一条判据：同一 (实例, 被抄送人) 已有 cc 行 ⇒ **跳过**——不新增行、不重置未读（state 保持
+// 原值）、不更新原行时间（CreateTime/UpdateTime 逐字不变）；同一次调用里的重复也折叠成一行。
+// 判重在写侧，查询侧不引入去重（历史重复行不清理）。
 func (r *Repository) CreateCcInstance(ctx context.Context, instanceID int64, creator string, actorIDs ...string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.ccInstances[instanceID] = append(r.ccInstances[instanceID], actorIDs...)
+	rows := r.ccInstances[instanceID]
+	for _, actorID := range actorIDs {
+		if ccRowOf(rows, actorID) != nil {
+			continue // 已有行：①不新增 ②不重置 state ③不刷时间
+		}
+		now := time.Now()
+		rows = append(rows, &CcRow{ActorID: actorID, State: 0, CreateTime: now, UpdateTime: now})
+	}
+	r.ccInstances[instanceID] = rows
 	return nil
 }
 
-func (r *Repository) UpdateCcStatus(ctx context.Context, instanceID int64, actorID string) error {
-	return nil // 内存实现无已读状态
+// FindCcActorIDs 某实例已有的 cc 行 actor id（issues/141 G2 写侧判重的读侧，按建行顺序）。
+func (r *Repository) FindCcActorIDs(ctx context.Context, instanceID int64) ([]string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return ccActorIDsOf(r.ccInstances[instanceID]), nil
 }
 
-// PageCcInstances 我的抄送分页（v1.3.0）：按抄送人 actorID 过滤，join 实例 + 定义
+// CreateCcInstanceIfAbsent 写侧幂等建 cc 行，返回**实际新建**的 actor 子集（issues/141 G2）。
+// 子集为空 ⇒ 没有任何"创建"发生 ⇒ 调用方整支不得 fire CC_CREATE（spec 11.2 原则 1「码=事实」）。
+func (r *Repository) CreateCcInstanceIfAbsent(ctx context.Context, instanceID int64, creator string, actorIDs ...string) ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rows := r.ccInstances[instanceID]
+	var fresh []string
+	for _, actorID := range actorIDs {
+		if ccRowOf(rows, actorID) != nil || containsStr(fresh, actorID) {
+			continue // 已有行 / 同一次调用内已排进新建集 ⇒ 折叠
+		}
+		fresh = append(fresh, actorID)
+		now := time.Now()
+		rows = append(rows, &CcRow{ActorID: actorID, State: 0, CreateTime: now, UpdateTime: now})
+	}
+	r.ccInstances[instanceID] = rows
+	return fresh, nil
+}
+
+// UpdateCcStatus 已读：state 0→1 ＋ 刷新该行 updateTime（对齐 wf_process_cc_instance.state 语义
+// 与 JdbcProcessRepository.UpdateCcStatus）。issues/141 G2 之前本方法是 no-op（内存仓的 cc 只存
+// actor id，没有已读态），行模型升级后这一档才照得出来——"重复抄送不得把已读抹回未读"的断言
+// 依赖它。
+func (r *Repository) UpdateCcStatus(ctx context.Context, instanceID int64, actorID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, row := range r.ccInstances[instanceID] {
+		if row.ActorID == actorID {
+			row.State = 1
+			row.UpdateTime = time.Now()
+		}
+	}
+	return nil
+}
+
+// CcActorsForTest 测试访问器：某实例已落库的抄送人（按建行顺序）。
+func (r *Repository) CcActorsForTest(instanceID int64) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return ccActorIDsOf(r.ccInstances[instanceID])
+}
+
+// CcRowsForTest 测试访问器：某实例的 cc **行**副本（issues/141 G2 的②③档要看未读状态与原行时间，
+// 只看 actor id 集合照不出"重复抄送把 state 抹回未读 / 把时间刷成 now"这两种假修）。
+func (r *Repository) CcRowsForTest(instanceID int64) []*CcRow {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*CcRow, 0, len(r.ccInstances[instanceID]))
+	for _, row := range r.ccInstances[instanceID] {
+		cp := *row
+		out = append(out, &cp)
+	}
+	return out
+}
+
+func ccRowOf(rows []*CcRow, actorID string) *CcRow {
+	for _, row := range rows {
+		if row.ActorID == actorID {
+			return row
+		}
+	}
+	return nil
+}
+
+func ccActorIDsOf(rows []*CcRow) []string {
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.ActorID)
+	}
+	return out
+}
+
+// PageCcInstances 我的抄送分页（v1.3.0）：按抄送人 actorID 过滤，join 实例 + 定义。
+//
+// **归属条件必填**（issues/141 G1 · spec 06 §2.5）：见 [spi.ProcessRepository.PageCcInstances]。
+// 本仓与 JDBC 仓必须同判据同答案——旧形状是本仓**完全不读** query.Conditions（JDBC 仓把它们
+// 落进 WHERE），于是"cc.actor_id 条件是空值/与入参不一致"这类查询两仓各说各话。
 func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, actorID string) ([]*model.CcInstanceRow, int, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -317,24 +424,22 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 	if pageSize <= 0 {
 		pageSize = 10
 	}
-	// issues/129 案 A 第二层（仓储兜底）：归属入参为空 ⇒ **空页**，绝不允许折叠成"这条条件不加"。
-	// 本栈"空串读出全库"的症状就发生在这里——以前 `if actorID != ""` 把空串读成"不过滤"，
-	// 于是 demo（内存仓，见 demo/controller.go 的 memory.New()）里 `{"operator":""}` 直接
-	// 返回**全部** cc 实例（谁的都混进来），而 user1 只该收到抄给他的那几条。
+	// issues/129 案 A 第二层（仓储兜底）＋ issues/141 G1 归属条件必填：归属没给**有效**值 ⇒
+	// **空页**，绝不允许折叠成"这条条件不加"。本栈"空串读出全库"的症状就发生在这里——以前
+	// `if actorID != ""` 把空串读成"不过滤"，于是 demo（内存仓，见 demo/controller.go 的
+	// memory.New()）里 `{"operator":""}` 直接返回**全部** cc 实例（谁的都混进来），而 user1
+	// 只该收到抄给他的那几条。
 	// 门面已把空串归一化成缺省 user1（facade.operatorArg），这一道防的是绕过门面直调仓储的
 	// 调用方与将来的门面改动，只留门面那半不算修完（同 Java buildWhere / Rust 1.0.17 两层）。
-	if blankOwnership(actorID) {
+	// G1 新增的是第二条：m_ 条件通道里的 cc.actor_id 给了空值形态（空串/全空白/nil/空集合）
+	// 同样按"没给归属"处理 ⇒ 空页（JDBC 仓 buildWhere 的 `AND 1=0` 与本判据同一条）。
+	if !ccOwnershipEffective(query, actorID) {
 		return []*model.CcInstanceRow{}, 0, nil
 	}
 	var rows []*model.CcInstanceRow
-	for instID, actors := range r.ccInstances {
-		hit := false
-		for _, a := range actors {
-			if a == actorID {
-				hit = true
-				break
-			}
-		}
+	for instID, ccRows := range r.ccInstances {
+		actorIDs := ccActorIDsOf(ccRows)
+		hit := containsStr(actorIDs, actorID)
 		if !hit {
 			continue
 		}
@@ -362,8 +467,18 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 			row.DefineDisplayName = sp(def.DisplayName)
 			row.DefineVersion = def.Version
 		}
+		// issues/141 G1：条件通道在本仓同样生效（与 JDBC 仓 buildWhere 同一条判据 ⇒ 两仓同答案）。
+		// 本仓此前**完全不读** query.Conditions，"cc.actor_id 条件是空值 / 与归属入参不一致"这类
+		// 查询内存仓放行、SQL 仓收掉，正是 G1 立法要关的那类"同一栈两个仓储两个答案"。
+		// cc.actor_id 以该实例的被抄送人集合参与匹配（同 Java MemoryProcessRepository 把它投成
+		// List 再走 matches()）。
+		if !matchConditions(query.Conditions, ccFields(row, actorIDs)) {
+			continue
+		}
 		rows = append(rows, row)
 	}
+	// 行序按实例 id 升序——JDBC 仓是 `ORDER BY t.id ASC`：map 遍历序既不稳定也让分页两仓不同答案
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 	total := len(rows)
 	// 简单分页（对齐 Java 按 id 升序的默认行为）
 	start := (pageNum - 1) * pageSize
@@ -375,6 +490,59 @@ func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, a
 		end = total
 	}
 	return rows[start:end], total, nil
+}
+
+// ccFields 抄送分页的行字段映射（issues/141 G1）：实例/定义列同 instanceFields 口径，另加
+// 归属列 cc.actor_id（值为该实例全部被抄送人；EQ 走 eqValue 的集合分支，与 JDBC 仓
+// `cc.actor_id = ?` 同一判据）。
+func ccFields(r *model.CcInstanceRow, actorIDs []string) map[string]interface{} {
+	return map[string]interface{}{
+		"t.id": r.ID, "t.parent_id": r.ParentID, "t.process_define_id": r.DefineID,
+		"t.state": r.State, "t.parent_node_name": r.ParentNodeName, "t.business_no": derefStrForMatch(r.BusinessNo),
+		"t.operator": derefStrForMatch(r.Operator), "t.expire_time": r.ExpireTime, "t.create_time": r.CreateTime,
+		"pd.name": derefStrForMatch(r.DefineName), "pd.display_name": derefStrForMatch(r.DefineDisplayName), "pd.version": r.DefineVersion,
+		"cc.actor_id": actorIDs,
+	}
+}
+
+// ccOwnershipEffective 抄送分页"归属条件必填"判据（issues/141 G1 · spec 06 §2.5，
+// JDBC 仓同名同判据）：
+//   - 显式 actorID 入参（本栈归属主通道，门面 ccList 恒挂 operator）必须是有效值；
+//   - query.Conditions 里的 cc.actor_id 条件不得是空值形态（空串/全空白/nil/空集合——
+//     空集合就是"没有人"）。
+//
+// 任一不满足 ⇒ 按"没给归属"处理 ⇒ 空页，绝不折叠成"这条不加"而返回全部实例。
+// 只收归属列：非归属列（m_LIKE_* 等可选过滤）的空值放行维持原样（由 matchConditions 兜）。
+func ccOwnershipEffective(query spi.PageQuery, actorID string) bool {
+	if blankOwnership(actorID) {
+		return false
+	}
+	for _, c := range query.Conditions {
+		if c.Column == ccOwnershipColumn && !conditionValueEffective(c.Value) {
+			return false
+		}
+	}
+	return true
+}
+
+// ccOwnershipColumn 抄送分页的归属列名（两仓逐字一致）。
+const ccOwnershipColumn = "cc.actor_id"
+
+// conditionValueEffective 条件值是否"有效"（issues/141 G1，判据同 Java hasEffectiveCondition）：
+// 值非 nil、字符串 TrimSpace 后非空、集合非空。等于 [blankCondValue] 加一档集合判据。
+func conditionValueEffective(val interface{}) bool {
+	if val == nil {
+		return false
+	}
+	switch t := val.(type) {
+	case string:
+		return strings.TrimSpace(t) != ""
+	case []interface{}:
+		return len(t) > 0
+	case []string:
+		return len(t) > 0
+	}
+	return true
 }
 
 // ─── Demo helpers ──────────────────────────────────────────────────────────────

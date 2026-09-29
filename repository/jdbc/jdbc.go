@@ -654,17 +654,77 @@ func (r *Repository) RemoveTaskActor(ctx context.Context, taskID int64, actors [
 
 // ─── CcInstance（抄送）─────────────────────────────────────────────────────────
 
+// CreateCcInstance 建 cc 行（逐抄送人一条 INSERT）。
+//
+// issues/141 G2 写侧判重＝幂等空操作（spec 06 §4）：同一 (实例, 被抄送人) 已有 cc 行时
+// **跳过**——①不新增行 ②不重置未读（state 保持原值）③不更新原行时间（不走 UPDATE，
+// create_time/update_time 与原行 id 逐字不变）。判重放在写侧而不是查询侧：查询保持现状
+// 不引入 DISTINCT，历史重复行也不清理。同一次调用内的重复也算"已存在"，只落一行。
+// 读侧与内存仓同一条判据（[Repository.FindCcActorIDs]），两仓必须同答案。
 func (r *Repository) CreateCcInstance(ctx context.Context, instanceID int64, creator string, actorIDs ...string) error {
+	existing, err := r.FindCcActorIDs(ctx, instanceID)
+	if err != nil {
+		return err
+	}
 	c := r.conn(ctx)
 	now := time.Now()
 	for _, actorID := range actorIDs {
+		if containsStr(existing, actorID) {
+			continue // 已有行：①不新增 ②不重置 state ③不刷时间
+		}
 		if _, err := c.ExecContext(ctx,
 			"INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state, create_time, create_user, update_time, update_user) VALUES (?,?,?,0,?,?,?,?)",
 			r.idGen.NextID(), instanceID, actorID, now, creator, now, creator); err != nil {
 			return err
 		}
+		existing = append(existing, actorID) // 同一次调用内的重复也按"已存在"处理
 	}
 	return nil
+}
+
+// FindCcActorIDs 某实例已有的 cc 行 actor id（issues/141 G2 写侧判重的读侧，对齐 Java
+// IProcessRepository.findCcActorIds）。取真实行集、按建行顺序（ORDER BY id，与内存仓一致，
+// 也让"实际新建子集"的逐人 fire 顺序稳定可断言）。走 r.conn(ctx)，WithTx 时与插入同事务。
+func (r *Repository) FindCcActorIDs(ctx context.Context, instanceID int64) ([]string, error) {
+	rows, err := r.conn(ctx).QueryContext(ctx,
+		"SELECT actor_id FROM wf_process_cc_instance WHERE process_instance_id = ? ORDER BY id", instanceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var actorIDs []string
+	for rows.Next() {
+		var actorID string
+		if err := rows.Scan(&actorID); err != nil {
+			return nil, err
+		}
+		actorIDs = append(actorIDs, actorID)
+	}
+	return actorIDs, rows.Err()
+}
+
+// CreateCcInstanceIfAbsent 写侧幂等建 cc 行，返回**实际新建**的 actor 子集（issues/141 G2，
+// 对齐 Java IProcessRepository.createCcInstanceIfAbsent）。子集为空 ⇒ 没有发生"创建" ⇒
+// 调用方整支不得 fire CC_CREATE（spec 11.2 原则 1「码=事实」）。
+func (r *Repository) CreateCcInstanceIfAbsent(ctx context.Context, instanceID int64, creator string, actorIDs ...string) ([]string, error) {
+	existing, err := r.FindCcActorIDs(ctx, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	var fresh []string
+	for _, actorID := range actorIDs {
+		if containsStr(existing, actorID) || containsStr(fresh, actorID) {
+			continue
+		}
+		fresh = append(fresh, actorID)
+	}
+	if len(fresh) == 0 {
+		return nil, nil
+	}
+	if err := r.CreateCcInstance(ctx, instanceID, creator, fresh...); err != nil {
+		return nil, err
+	}
+	return fresh, nil
 }
 
 func (r *Repository) UpdateCcStatus(ctx context.Context, instanceID int64, actorID string) error {
@@ -675,11 +735,16 @@ func (r *Repository) UpdateCcStatus(ctx context.Context, instanceID int64, actor
 	return err
 }
 
-// PageCcInstances 我的抄送分页（v1.3.0）：cc 表 join 实例 + 定义，按抄送人过滤（对齐 Java pageCcInstances）
+// PageCcInstances 我的抄送分页（v1.3.0）：cc 表 join 实例 + 定义，按抄送人过滤（对齐 Java pageCcInstances）。
+//
+// **归属条件必填**（issues/141 G1 · spec 06 §2.5）：见 [spi.ProcessRepository.PageCcInstances]——
+// 归属没给**有效**值（显式入参空 / cc.actor_id 条件是空值形态）⇒ 空页（total=0、rows 空集），
+// 判据与本栈内存仓逐字同一条，两仓必须同答案。
 func (r *Repository) PageCcInstances(ctx context.Context, query spi.PageQuery, actorID string) ([]*model.CcInstanceRow, int, error) {
-	// issues/129 案 A 第二层：cc.actor_id 是归属列，归属入参为空 ⇒ 空页（判据同 PageInstances）。
-	if blankOwnership(actorID) {
-		return nil, 0, nil
+	// issues/129 案 A 第二层 ＋ issues/141 G1：cc.actor_id 是归属列，归属入参为空或条件为
+	// 空值形态 ⇒ 空页（判据同 PageInstances，且不折叠成"这条不加"）。
+	if !ccOwnershipEffective(query, actorID) {
+		return []*model.CcInstanceRow{}, 0, nil
 	}
 	pageNum, pageSize := query.PageNum, query.PageSize
 	if pageNum <= 0 {
@@ -986,6 +1051,60 @@ func blankCondValue(val interface{}) bool {
 
 // blankOwnership 归属入参判空（issues/129 案 A 第二层）：空串与全空白同判"空"⇒ 空页。
 func blankOwnership(s string) bool { return strings.TrimSpace(s) == "" }
+
+// ccOwnershipColumn 抄送分页的归属列名（内存仓同名同判据）。
+const ccOwnershipColumn = "cc.actor_id"
+
+// containsStr 列表包含判断（写侧判重用；与内存仓同名同语义）。
+func containsStr(list []string, s string) bool {
+	for _, item := range list {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+// conditionValueEffective 条件值是否"有效"（issues/141 G1，判据同 Java hasEffectiveCondition）：
+// 值非 nil、字符串 TrimSpace 后非空、集合非空。等于 [blankCondValue] 加一档集合判据
+// （空 IN 就是"没有人"，绝不能当成"这条条件不加"）。
+func conditionValueEffective(val interface{}) bool {
+	if val == nil {
+		return false
+	}
+	switch t := val.(type) {
+	case string:
+		return strings.TrimSpace(t) != ""
+	case []interface{}:
+		return len(t) > 0
+	case []string:
+		return len(t) > 0
+	}
+	return true
+}
+
+// ccOwnershipEffective 抄送分页"归属条件必填"判据（issues/141 G1 · spec 06 §2.5，
+// 内存仓同名同判据）：
+//   - 显式 actorID 入参（本栈归属主通道，门面 ccList 恒挂 operator）必须是有效值；
+//   - query.Conditions 里的 cc.actor_id 条件不得是空值形态（空串/全空白/nil/空集合）。
+//
+// 任一不满足 ⇒ 按"没给归属"处理 ⇒ 空页，绝不折叠成"这条不加"而返回全部实例
+// （旧形状：LEFT JOIN wf_process_cc_instance 不带条件时放出**全部**实例，php PDO 仓的同款
+// 反面教材，而本栈内存仓只放"有 cc 行的实例"——同一栈两个仓储两个答案，issues/117 场景 27
+// 立过法）。空值三形里的 EQ 空串档另有 buildWhere 的 ownershipColumns `AND 1=0` 兜（issues/129），
+// 本格多收的是"条件整条没给"与"空集合 IN"两档。
+// 只收归属列：非归属列（m_LIKE_* 等可选过滤）的空值放行维持原样。
+func ccOwnershipEffective(query spi.PageQuery, actorID string) bool {
+	if blankOwnership(actorID) {
+		return false
+	}
+	for _, c := range query.Conditions {
+		if c.Column == ccOwnershipColumn && !conditionValueEffective(c.Value) {
+			return false
+		}
+	}
+	return true
+}
 
 // buildWhere m_ 条件 WHERE 构建（白名单 + 参数化）
 func buildWhere(conditions []spi.Condition, whitelist map[string]bool) (string, []interface{}) {

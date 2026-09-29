@@ -1345,12 +1345,19 @@ func (f *Facade) createCCInstance(args map[string]interface{}) error {
 	if len(actors) == 0 {
 		return errors.New("actorIds 缺失")
 	}
-	if err := f.repo.CreateCcInstance(context.Background(), instanceID, operator, actors...); err != nil {
+	// issues/141 G2 写侧判重＝幂等空操作（spec 06 §4）：手动腿与引擎腿（f_/tf_ 两条）共用
+	// 同一条判据（spec §11.7「三条入口同一支」）——同一 (实例, 人) 已有 cc 行时跳过，
+	// 不新增行、不重置未读、不更新原行时间。
+	created, err := f.repo.CreateCcInstanceIfAbsent(context.Background(), instanceID, operator, actors...)
+	if err != nil {
 		return err
 	}
-	// issues/102 / spec §11.2 原则 1：手动补抄送与引擎自动路径共用同一个码——
-	// "新增了一条抄送记录"这个事实成立即 fire，逐抄送人（与发起/办理腿同粒度，对齐 PHP/Java）
-	for _, actor := range actors {
+	// CC_CREATE（spec §11.2 原则 1 ＋ §11.3 码 4 ＋ §11.6）：手动抄送腿同样必须 fire——
+	// 码值表达"新增了一条抄送记录"这个事实。fire 排在 cc 行落库之后（§11.2 原则 3）；
+	// 集成层严禁再自己补发（§11.1）。
+	// 入参＝**实际新建的子集**而不是原始 actors（issues/141 G2）：重复抄送没发生"创建"
+	// ⇒ 不发码 4；子集为空整支不 fire（不空转、也不照旧全量 fire）。
+	for _, actor := range created {
 		f.engine.FireEvent(engine.ProcessEvent{
 			Type: engine.EventCCCreate, InstanceID: instanceID, CcActorID: actor,
 		})

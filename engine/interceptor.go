@@ -313,12 +313,12 @@ func (e *EngineImpl) FireEvent(evt ProcessEvent) {
 // ─── 抄送腿（spec 11-events §11.7 / issues/127）───────────────────────────────
 
 // HandleCcActors 抄送唯一漏斗：解析抄送人 → 建 wf_process_cc_instance 行 → **落库之后**
-// 逐抄送人 fire CC_CREATE（code 4，ccActorId 直传事件体）。
+// 逐**实际新建**的抄送人 fire CC_CREATE（code 4，ccActorId 直传事件体）。
 //
 // 三条路径共用本函数（§11.2 原则 1「同一事实只发一次，路径不进事件名」）：
 //   - 发起 f_ccActors（facade startAndExecute）
 //   - 办理 tf_ccActors（引擎 ExecuteProcessTask 一条路径，与任务更新同一个 ctx＝同一个事务）
-//   - 手动 processInstance/createCCInstance（facade）
+//   - 手动 processInstance/createCCInstance（facade 侧，与本函数同一条判据，见 spec §11.7）
 //
 // ⚠️ §11.7 边界 2：覆盖面以 Java 基准为准，**办理腿只算 executeProcessTask 一条**。
 // ExecuteAndJumpToEnd / ExecuteAndJumpTask / ExecuteAndJumpToFirstTaskNode 这类跳转·回退
@@ -329,20 +329,30 @@ func (e *EngineImpl) FireEvent(evt ProcessEvent) {
 // 基准＝Java JeeflowEngineImpl.handleCcActors → notifyCcCreate（发起与办理走同一条腿）。
 // ccActors 为空/未配置 ⇒ 零写入、零 fire、返回 nil（纯增量：不带抄送的办理行为不变）。
 // 接收人过滤（trim / 非空 / 纯数字 / 去重）归集成层监听器，引擎只按 cc 行粒度 fire。
+//
+// issues/141 G2 写侧判重＝幂等空操作（spec 06 §4）：建行走 CreateCcInstanceIfAbsent，
+// 同一 (实例, 人) 已有 cc 行时跳过（不新增行、不重置未读、不刷原行时间）；**逐人 fire 的入参
+// 是实际新建的子集**而不是原始请求（spec §11.2 原则 1「码=事实」——没发生"创建"就不得发码 4），
+// 子集为空整支不 fire（不空转、也不照旧全量 fire）。
 func (e *EngineImpl) HandleCcActors(ctx context.Context, instanceID int64, operator string, ccActors interface{}) error {
 	actors := parseCcActors(ccActors)
 	if len(actors) == 0 {
 		return nil
 	}
-	if err := e.repo.CreateCcInstance(ctx, instanceID, operator, actors...); err != nil {
+	created, err := e.repo.CreateCcInstanceIfAbsent(ctx, instanceID, operator, actors...)
+	if err != nil {
 		return err
 	}
-	e.notifyCcCreate(instanceID, actors)
+	if len(created) == 0 {
+		return nil // 全是重复抄送 ⇒ 没有"创建"这个事实，整支不发码 4
+	}
+	e.notifyCcCreate(instanceID, created)
 	return nil
 }
 
 // notifyCcCreate CC_CREATE 逐抄送人 fire（与 CreateCcInstance 逐行 INSERT 一一对应）。
 // Operator 不带——事件体的"操作人"语义留给办理人/发起人，抄送人只走 CcActorID（对齐 Java）。
+// 入参必须是仓储 CreateCcInstanceIfAbsent 返回的实际新建子集（issues/141 G2）。
 func (e *EngineImpl) notifyCcCreate(instanceID int64, actors []string) {
 	for _, actor := range actors {
 		e.fireEvent(ProcessEvent{Type: EventCCCreate, InstanceID: instanceID, CcActorID: actor})

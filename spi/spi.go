@@ -33,11 +33,48 @@ type ProcessRepository interface {
 	AddTaskActor(ctx context.Context, taskID int64, actors []string) error
 	RemoveTaskActor(ctx context.Context, taskID int64, actors []string) error
 
+	// CreateCcInstance 建 cc 行（逐抄送人一行）。
+	//
+	// issues/141 G2 写侧判重＝幂等空操作（spec 06 §4）：同一 (instanceID, actorID) 已有 cc 行时
+	// **跳过**——①不新增行 ②不重置未读状态（state）③不更新原行时间（create_time/update_time
+	// 逐字不变，也没有"删旧插新"），重复抄送同一个人在数据面上是 no-op。同一次调用里重复给的
+	// 同一个人也折叠成一行。判重在**写侧**：查询侧不引入 DISTINCT，历史重复行不清理。
+	//
+	// ⚠️ 需要"实际新建了谁"的调用方（引擎/门面的三条抄送入口）一律改用
+	// [ProcessRepository.CreateCcInstanceIfAbsent]，拿返回的子集去 fire CC_CREATE。
 	CreateCcInstance(ctx context.Context, instanceID int64, creator string, actorIDs ...string) error
+
+	// FindCcActorIDs 读某实例**已存在**的 cc 行 actor id（issues/141 G2 写侧判重的读侧，
+	// 对齐 Java IProcessRepository.findCcActorIds）：供建 cc 的三条入口（发起 f_ccActors／
+	// 办理 tf_ccActors／门面手动 createCCInstance）判重用。返回值来自真实行集（内存仓的行、
+	// SQL 仓的 SELECT），不得是内存猜测；顺序按建行顺序（SQL 仓 ORDER BY id）。
+	FindCcActorIDs(ctx context.Context, instanceID int64) ([]string, error)
+
+	// CreateCcInstanceIfAbsent 写侧幂等建 cc 行，返回**实际新建**的 actor 子集
+	// （issues/141 G2，对齐 Java IProcessRepository.createCcInstanceIfAbsent）。
+	//
+	// 子集形状：跳过 [ProcessRepository.FindCcActorIDs] 已有的 actor，顺序与入参一致，
+	// 同一次调用内的重复也折叠；全部已存在时返回空子集（不是 nil 语义上的"全部"）。
+	//
+	// 为什么返回子集而不是 error-only：spec 11.2 原则 1「码值表达发生了什么事实」⇒
+	// 没发生"创建"就不得 fire CC_CREATE（码 4）。三条入口逐人 fire 的入参一律换成这个子集，
+	// **子集为空则整支不 fire**（不空转、也不照旧按原始请求全量 fire）。
+	CreateCcInstanceIfAbsent(ctx context.Context, instanceID int64, creator string, actorIDs ...string) ([]string, error)
+
 	UpdateCcStatus(ctx context.Context, instanceID int64, actorID string) error
 
 	// PageCcInstances 我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：
-	// 按抄送人 actorID 过滤实例列表，返回行数据（含关联定义名/版本）+ 总数
+	// 按抄送人 actorID 过滤实例列表，返回行数据（含关联定义名/版本）+ 总数。
+	//
+	// **归属条件必填**（issues/141 G1 · spec 06 §2.5）：本入口的取数范围必须由 cc.actor_id
+	// 的**有效**归属条件圈定，条件缺失或为空值时**返回空页**（total=0、rows 为空集），
+	// 严禁退化成"这条条件不加"而返回全部实例。
+	//   - 本栈归属有两个载体：显式入参 actorID（主通道，门面 ccList 恒挂 operator）＋
+	//     query.Conditions 里的 cc.actor_id 条件（m_ 参数通道）。actorID 为空值形态、
+	//     或任一 cc.actor_id 条件为空值形态 ⇒ 都按"没给归属"处理 ⇒ 空页。
+	//   - "有效"判据＝值非 nil、字符串 TrimSpace 后非空、集合非空（空 IN 即"没有人"）。
+	//   - **非归属列**的空值放行不变：m_LIKE_* 之类可选过滤传空串仍按"没填"忽略。
+	//   - SQL 仓与内存仓必须给同一个答案（issues/117 场景 27 那把尺子扩到 ccList）。
 	PageCcInstances(ctx context.Context, query PageQuery, actorID string) ([]*model.CcInstanceRow, int, error)
 
 	// ── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──
