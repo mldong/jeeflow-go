@@ -602,9 +602,48 @@ func (e *EngineImpl) loadAndCheck(ctx context.Context, taskID int64, operator st
 	return task, inst, nil
 }
 
+// isKnownNodeType 类型表成员判定——表体就是 model/types.go:40-46 那七档 `snaker:*` 常量，
+// 逐字精确匹配：不剥 `snaker:` 前缀、不做大小写归一（G4 义务 1 的归一化是另一批的事，
+// spec/02:95-107 owner 2026-10-01 已裁定「历史旧账不管」，本处只兑现义务 2 的「不得静默」）。
+//
+// ⚠️ 它**只用来决定要不要记那条可诊断日志**，不参与任何分派 ⇒ 行为零变化。
+func isKnownNodeType(t string) bool {
+	switch t {
+	case model.TypeStart, model.TypeEnd, model.TypeTask, model.TypeDecision,
+		model.TypeFork, model.TypeJoin, model.TypeCustom:
+		return true
+	}
+	return false
+}
+
 // executeNode 节点执行链。parentTaskID ＝本次 execution 刚办结的当前任务 id
 // （建单不变量 ①，逐层透传给 decision/fork/join 落到的任务节点；发起路径传 0）
 func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}, parentTaskID int64) error {
+	// ── 未知档可诊断日志 · spec/02-flow-definition.md「类型键的三条义务」第 2 条（issues/141 G4）──
+	// 「类型不在表里时，必须记一条可诊断日志（带节点 id 与实得类型串）再决定跳过，不允许
+	// 『静默丢节点＋连带丢它的出边』」。
+	//
+	// 为什么发在这一处：go 没有独立的解析阶段——`json.Unmarshal`（StartProcessInstanceByID:60-63、
+	// prepareExecuteTask:311）把 nodes 原样收进 model.FlowModel，一个都不删；**类型表只在执行腿
+	// 这一处被查**（下面那条 if 链 ＋ switch），未命中一路落到 switch 之后的 `return nil`——
+	// 那里就是本栈「丢节点＋丢出边」的现场。所以这一处就是 go 的判点，也是唯一会打日志的一处
+	// （不存在第二处查表 ⇒ 不存在同节点双打；同一节点被多条入边各触达一次时，每次触达各记
+	// 一条它自己的事实，那不是刷屏）。
+	//
+	// 为什么必须带**实得类型串原文**：子流程 `snaker:subProcess` 在 go/python/node 六栈按**未知档**
+	// 暴露（spec/02:107-111，owner 2026-10-01 二拍「子流程暂不进契约面」⇒ 设计器画出它时，
+	// 义务 2 这条日志就是它现状唯一的可诊断面）。逐字打原文、不剥前缀、不归一大小写：
+	// `snaker:subProcess`（缺档）／`snaker:Custom`（大小写拼错）／`task`（裸名，本栈类型表只有
+	// `snaker:*` 七档、无裸名档）／缺 `type` 键（空串）四类病灶要在同一句里彼此分得开。
+	//
+	// ⚠️ 只加日志，**不改分派/落穿行为**：记完照旧往下走，未命中仍落到 `return nil`。
+	// 义务 2 的后半（指向被丢弃节点的那条边「落穿停住、严禁打崩办理」）由 issues/143 在
+	// java/php/c# 落地；本栈属「按 id 现查目标、查不到就停」那一派（followEdges:1152），
+	// 行为已经对，本轮不动。
+	if !isKnownNodeType(node.Type) {
+		log.Printf("[jeeflow] WARNING 流程定义里的节点类型不在类型表里，该节点及其出边将被跳过"+
+			"（令牌停在此处：不建行、不推进）: nodeId=%s type=%s", node.ID, node.Type)
+	}
 	// 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
 	// 任务完成的拦截器由 ExecuteProcessTask 显式触发，1.8.0 SYNC 同步演进）
 	if node.Type == model.TypeTask {
