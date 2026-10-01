@@ -1,4 +1,5 @@
 // issues/126 案 A · 任务行 expire_time 的**求值器**与**建单写点**（基准＝boot2 内置版）。
+// issues/137 A · 批二 §3-4（A 案）· 同把尺子再加一处**实例级**写点（发起腿，见 applyInstanceExpireTime）。
 //
 // 参考实现并排：
 //   - Java 求值器 `FlowUtil.processTime(String, FlowData)`（jeeflow-java jeeflow-core util/FlowUtil.java:64）
@@ -143,6 +144,43 @@ func applyExpireTime(task *model.ProcessTask, expr string, args map[string]inter
 		return
 	}
 	task.ExpireTime = ProcessTime(expr, args)
+}
+
+// applyInstanceExpireTime **实例级** expire_time 的写点（issues/137 A · 批二 §3-4，A 案：
+// 列值＝定义级顶层表达式的**求值结果**＝一个时刻，不是表达式原串）。
+//
+// 逐字对齐基准 java `JeeflowEngineImpl.java:93-96`（＝boot2 内置版
+// `ProcessInstanceServiceImpl.java:157-160` 同形状）：
+//
+//	String expireTime = model.getExpireTime();                       // 流程 JSON 根上的 expireTime 键
+//	if (StringUtils.isNotEmpty(expireTime))                          // 没配 ⇒ 一个字都不写
+//	    instance.setExpireTime(FlowUtil.processTime(expireTime, args));
+//
+// 三条落点语义（判据 3／4）：
+//   - **没配**（JSON 缺键 / 键值为 null / 空串 ⇒ expr == ""）⇒ 直接 return，这一列保持 NULL：
+//     不赋 now()、不赋空串、不赋 0。纯空白串进不了 isNotEmpty 那道门以外的一切——它落到
+//     ProcessTime 的 ⓪ 档（TrimSpace 后为空）⇒ nil ⇒ 结局同样是 NULL。
+//   - **配了但算不出**（误配 `not-a-time` / 小数前缀 / 负数档 `-5h`，issues/137 C+D）⇒ ProcessTime
+//     给 nil ⇒ NULL，沿用任务级既有的"落穿即没有到期时间"语义，**不许兜底 now()**（issues/126 红线）。
+//   - 写进去的必须是**求值结果**（判据 1）：本栈这一列是 `*time.Time`，落库经
+//     `repository/jdbc/jdbc.go:405` 的 INSERT 直接绑进 `DATETIME(3)`；把原串搬过去在
+//     160 那台 `@@sql_mode` 含 STRICT_TRANS_TABLES 的 MySQL 上是服务端硬错（兄弟栈 rust/php
+//     本轮实测拿到的是 1292/22007 `Incorrect datetime value: '2h' for column 'expire_time'`），
+//     连库都进不去 ⇒ 求值这一步没有"先存原串回头再解析"的余地。
+//
+// args 语义（判据 2）：调用方传的是发起腿里那份**发起参数** `vars`
+// （`mergeVars(args, nil)` 之后又被 `addUserInfo` / `addAutoGenTitle` 就地注入 u_* 与 autoGenTitle，
+// engine_impl.go:64-66），对齐 java 那边同被这两个 add* 就地改写过的同一个 `args` 对象。
+// 于是变量档能命中 `u_userId` 这类**引擎注入**的键，而不只是调用方原始入参——
+// 传错成原始 args 会让这一档跨栈给出不同答案。
+//
+// 求值器与任务级四处写点**共用同一个** ProcessTime（判据 5），档位顺序与语义一字未改；
+// owner 2026-09-28 口径「实例的处理方式和任务的差不多吧，算法一致」（issues/137 §状态行 A）。
+func applyInstanceExpireTime(inst *model.ProcessInstance, expr string, args map[string]interface{}) {
+	if inst == nil || expr == "" {
+		return
+	}
+	inst.ExpireTime = ProcessTime(expr, args)
 }
 
 // expireExprOf 读任务节点上配的到期表达式；未配 / 配成 null ⇒ ""（走"保持 NULL"分支）。

@@ -5,10 +5,18 @@ import "time"
 
 // ─── Flow Model (LogicFlow JSON) ──────────────────────────────────────────────
 
+// FlowModel 流程定义 JSON 的**根对象**（LogicFlow 图）。
+//
+// ExpireTime 是 spec 02 §根对象（jeeflow-doc `docs/spec/02-flow-definition.md:21/55`）里的
+// 「流程期望完成时间」——根上的 `expireTime` 键，与任务节点 `properties.expireTime`（issues/126
+// 那一族四处建单写点）**不同一层**：这一项喂的是实例那一列 `wf_process_instance.expire_time`
+// （issues/137 A · 批二 §3-4，A 案＝列值＝本表达式的**求值结果**，写点在 engine.StartProcessInstanceByID）。
+// 本栈没有独立的模型解析阶段（java 是 LfModel→ProcessModel 那一跳），根键直接由 json.Unmarshal 收进来。
 type FlowModel struct {
 	Name        string     `json:"name"`
 	DisplayName string     `json:"displayName"`
 	Type        string     `json:"type"`
+	ExpireTime  string     `json:"expireTime"`
 	Nodes       []FlowNode `json:"nodes"`
 	Edges       []FlowEdge `json:"edges"`
 }

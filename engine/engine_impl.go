@@ -68,6 +68,13 @@ func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int6
 	now := time.Now()
 	// 聚合根工厂创建实例
 	inst := model.NewProcessInstance(e.nextID(), defineID, operator, vars, now)
+	// issues/137 A · 批二 §3-4（A 案）：实例级 expire_time ＝定义**顶层** expireTime 表达式的
+	// **求值结果**（时刻），不是原串。位置逐字对齐 java JeeflowEngineImpl:93-96——
+	// 聚合根创建之后、saveInstance 之前：发起腿此后不再有第二次 UpdateInstance（DOING 实例），
+	// 挂在 SaveInstance 之后就只是改了内存里的聚合对象，落库那一列仍是 NULL。
+	// args 传 vars（发起参数那份，addUserInfo/addAutoGenTitle 已注入 u_* 与 autoGenTitle），
+	// 不是原始 args；没配 / 算不出 ⇒ 保持 NULL（见 applyInstanceExpireTime）。
+	applyInstanceExpireTime(inst, flow.ExpireTime, vars)
 	e.repo.SaveInstance(ctx, inst)
 	// PROCESS_INSTANCE_START(1)：实例行 insert 之后 fire（§11.3 触发时机列）
 	e.fireEvent(ProcessEvent{Type: EventProcessInstanceStart, InstanceID: inst.ID, Operator: operator})
