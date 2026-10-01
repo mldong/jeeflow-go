@@ -563,6 +563,78 @@ func TestExpireTimeNegativeRelativeExpressionOtherTiersUnaffected(t *testing.T) 
 	}
 }
 
+// TestExpireTimePaddedRelativePrefixStillApplies issues/137 E（owner 2026-10-01 拍"统一 trim" ·
+// spec/04 §相对档前缀允许两端空白；基准＝java `ExpireTimeOnCreateTest
+// .paddedRelativePrefixStillApplies` `bf1f401`）：**前缀两端的空白不影响这一档**。
+//
+// 到期表达式是设计器手填 / JSON 搬运的字符串，`" 2h"` 夹一个空格是常态。各栈整数解析对空白的
+// 容忍度天然不同（java `Integer.parseInt`、python `int()`、.NET `TryParse` 默认就收前后空白；
+// go 在 `strconv.Atoi` 前显式 `TrimSpace`；rust `.trim()`；php 的正则 `^…$` 锚死、本轮补了 trim），
+// 所以**判点是"不许出现别家算得出、这一家算不出"**。本栈 `relativeTime` 一直在前缀上 TrimSpace ⇒
+// 本格的职责是把那处合规钉成有名字的判据：谁把 `strings.TrimSpace(expr[:len(expr)-1])` 摘掉，①当场红。
+//
+// 三条分界（判据形状与 137 D 那几格同尺：同一行 expire − create 落进偏移带宽，不是"非空"空判）：
+// ① 前缀带空白（空格 / 数字与单位符之间两形走建单路径，tab 那形走 ⑤ 的求值器档——见 ⑤ 注释）
+//    ⇒ 照旧 ≈2h；`d` 档走另一条 `AddDate` 通路，同一把尺子 ⇒ `" 2d"` 也该 ≈48h；
+// ② **单位符后面**带空白 `"2h "` ⇒ 末位不是 s/m/h/d、认不出单位 ⇒ 落穿绝对档 ⇒ NULL
+//    （这一格钉住"裁的边界只到前缀"：整串去空白后它就变成合法的 `2h` 了，而"整体裁空白"没立过法）；
+// ③ `" 2.5h"` ⇒ 裁完空白照样是小数误配 ⇒ 仍 NULL（trim 不是把"裁空白"顺手做成"裁容错"）。
+func TestExpireTimePaddedRelativePrefixStillApplies(t *testing.T) {
+	// ① 建单路径：前缀带空格两形 + 天档同尺（tab 那一形走 ⑤ 的求值器档——JSON 串字面量里
+	//    不能塞裸 tab，见下面注释）
+	pads := []struct {
+		expr string
+		want time.Duration
+	}{
+		{" 2h", 2 * time.Hour},
+		{"2 h", 2 * time.Hour},
+		{" 2d", 48 * time.Hour},
+	}
+	for i, p := range pads {
+		name := fmt.Sprintf("exp137e_pad%d", i)
+		eng, repo, defID := expHarness(t, name, expFlowWith(name,
+			expSpec{"approve", `"assignee":"zhangsan","expireTime":"` + p.expr + `"`}))
+		inst := expStart(t, eng, defID, map[string]interface{}{"BUSINESS_NO": "B137E"})
+		expMustDelta(t, expMustDoing(t, repo, inst.ID, "approve", 1)[0], p.want)
+	}
+
+	// ②③④ 求值器档：单位符后空白 / 小数 / 带空白的负数档一律 NULL，且**不许**兜底成当前时间
+	for _, expr := range []string{"2h ", "2d ", "+2h  ", " 2.5h", " -5h", " -5d", " -30s"} {
+		if got := engine.ProcessTime(expr, nil); got != nil {
+			t.Errorf("表达式 %q 该算不出（落穿 ⇒ NULL），实得 %v；"+
+				"单位符后带空白那几格若算出了值，说明裁空白被做成了\"整个表达式去空白\"", expr, *got)
+		}
+	}
+
+	// ⑤ 对照面（证明上面那些 NULL 不是"相对档整体坏了"造成的假绿）：无空白的 2h/+2h 与
+	//    前缀带 tab 的 2h 照旧 ≈now+2h（tab 走求值器档：expFlowWith 是把 properties 片段
+	//    **裸拼**进 JSON 的，串字面量里塞裸 tab 会先撞 `invalid character '\t' in string literal`，
+	//    那测的是 JSON 语法不是空白档 ⇒ 空白三形里的 tab 在这一档补上，判点仍是 TrimSpace 那一处）
+	for _, expr := range []string{"2h", "+2h", "\t2h"} {
+		got := engine.ProcessTime(expr, nil)
+		if got == nil {
+			t.Fatalf("对照：%q 必须仍算得出（判空白没动判点）", expr)
+		}
+		if d := got.Sub(time.Now()); d < 2*time.Hour-5*time.Second || d > 2*time.Hour+60*time.Second {
+			t.Errorf("对照：%q 实得 now%v，应≈now+2h", expr, d)
+		}
+	}
+
+	// ⑥ 裁的只到**相对档前缀**：变量档的键名与绝对档的串同样不 trim
+	//（这一格与 ② 合起来是"整串 trim"变异的两个试金石：真在 ProcessTime 开头 trim 整串，
+	//  这里会命中变量档、② 会算出 2h，两格同时红）
+	vars := map[string]interface{}{"dueAt": "2026-12-31 10:00:00"}
+	if got := engine.ProcessTime(" dueAt ", vars); got != nil {
+		t.Errorf(`变量档键名不 trim ⇒ " dueAt " 取不到 dueAt，实得 %v`, *got)
+	}
+	if got := engine.ProcessTime("dueAt", vars); got == nil || !got.Equal(expAt(t, "2026-12-31 10:00:00")) {
+		t.Errorf(`对照：精确键名 "dueAt" 照旧命中变量值，实得 %v`, got)
+	}
+	if got := engine.ProcessTime(" 2026-12-31 10:00:00", nil); got != nil {
+		t.Errorf("绝对档的字符串本身不 trim，实得 %v", *got)
+	}
+}
+
 var expFixed = time.Date(2030, 6, 7, 8, 9, 10, 0, time.Local)
 
 func expWantNil(t *testing.T, why string, v *time.Time) {
