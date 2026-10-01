@@ -48,9 +48,10 @@ const (
 // expire−create≈0），一旦让 now() 当兜底，L2-27 那格「同一行 expire−create 必须≈表达式偏移」
 // 就永远抓不到东西。
 //
-// 与 Java 的两处语言差异（都不改变判点）：
-//   - Java `Integer.parseInt` 遇 "xh" 这类坏前缀抛 NumberFormatException；Go 无异常 ⇒ 落穿到
-//     绝对档 ⇒ 结果仍是 nil（两栈都不会因此拿到 now() 或假时刻）。
+// 与 Java 的两处形状差（都不改变判点；其中第 1 条**已不再是差异**）：
+//   - 坏前缀（节点误配成 "xh"／"2.5h"／"3hh"）**落穿到绝对档 ⇒ 结果仍是 nil**＝**八栈一致**口径
+//     （issues/137 C）。⚠️ 旧文那句"Java `Integer.parseInt` 会抛 NumberFormatException 打断建单"
+//     **已过期**——java 参考实现已改成同款落穿（jeeflow-java `6bdf41b`，随 1.8.36 发出），Go 只是无异常而已。
 //   - Java 毫秒档只认 `Long`；Go 里 JSON 数字一律解成 float64 ⇒ 整数值（含 int/int64/整值 float64）
 //     同档处理，非整数值（Java 的 Double 档）按"类型不认识"落穿，与 Java 对 Double 的行为一致。
 func ProcessTime(expr string, args map[string]interface{}) *time.Time {
