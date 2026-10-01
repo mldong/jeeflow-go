@@ -81,10 +81,14 @@ func New(e *engine.EngineImpl, repo spi.ProcessRepository, ext spi.ProcessExtRep
 
 // Flow 统一入口（action 清单见规范 06-facade；事件契约见规范 11-events）
 func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]interface{}) {
-	// 扩展仓储未配置等内部 panic 收敛为业务错误
+	// 扩展仓储未配置等内部 panic 收敛为业务错误。
+	// issues/137 §3-1（spec 06-facade.md §2.12）：收敛 ≠ 原文外透 —— panic 值同样要过判别式
+	// （旧形状 errorResult(fmt.Sprintf("%v", p)) 会把 nil 解引用的
+	// 「runtime error: invalid memory address or nil pointer dereference」直接糊到用户脸上）。
+	// 门面自己写的那句「未配置 ProcessExtRepository（扩展仓储）」是引擎契约文案，照旧逐字透出。
 	defer func() {
 		if p := recover(); p != nil {
-			r = errorResult(fmt.Sprintf("%v", p))
+			r = errorResult(outwardPanicMsg(action, p))
 		}
 	}()
 	if args == nil {
@@ -191,7 +195,12 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 		return errorResult("未知 action: " + action)
 	}
 	if err != nil {
-		return errorResult(err.Error())
+		// issues/137 §3-1（spec 06-facade.md §2.12）：门面是所有内部 error 的共性通道，
+		// 但"捕获到 ≠ 原文外透"。判别式（isForeignDetail，见 internal_failure.go）判
+		// 「这段文案是谁写的」：引擎自己写的契约文案逐字透出（八栈＋十三壳＋前端 toast 都按原文对齐，
+		// 收窄就是静默改契约面），运行时/解析器/驱动/第三方 provider 写的原文换成固定文案
+		// msgInternalFailure，原文只进日志与错误链（判据与副作用各自可测）。
+		return errorResult(outwardFailureMsg(action, err))
 	}
 	// issues/38 E9 出口统一：id 类字段转 string（对齐 Node 全程 string / Java 集成层
 	// Jackson ToStringSerializer）——前端 JS number 无法承载雪花 id（>2^53）
@@ -2176,11 +2185,18 @@ const msgReadFlowDefineJSONFailed = "读取流程定义 JSON 失败"
 
 // facadeFixedError 对外 msg 与内部 cause **分离**的错误（issues/139）。
 //
-// 为什么不在包装文案上动手（`fmt.Errorf("固定文案: %w", err)` 做不到）：门面顶层出口是
-// `errorResult(err.Error())`（facade.go:192），Error() 里拼了什么，msg 字段就是什么——
-// `%w` 只保证错误链可解，不让 Error() 变短。要"msg 逐字固定、异常只留在错误对象链"，
-// 就得让 Error() 本身只返回固定文案，cause 靠 Unwrap 交给调用方/日志。
-// 这正好复刻 Java 那侧 getMessage()/getCause() 的分工，出口映射一行都不用改。
+// 为什么不在包装文案上动手（`fmt.Errorf("固定文案: %w", err)` 做不到）：门面顶层出口取的就是
+// `Error()`，Error() 里拼了什么，msg 字段就是什么——`%w` 只保证错误链可解，不让 Error() 变短。
+// 要"msg 逐字固定、异常只留在错误对象链"，就得让 Error() 本身只返回固定文案，cause 靠 Unwrap
+// 交给调用方/日志。这正好复刻 Java 那侧 getMessage()/getCause() 的分工。
+//
+// issues/137 §3-1（spec 06-facade.md §2.12）起它还多一个身份：**判别式第 2 条「契约异常族」在 go 侧的
+// 唯一落点**。go 没有异常类型，本模块也只有这一个具名 error 类型（核法：grep 锚定行首的
+// `^func .*) Error\(\) string`，全仓只命中下面那一行；别用不锚定的形状去 grep，会命中注释里的转述
+// 自造假阳性），而它的语义恰好就是"这段 msg 是引擎写给外面看的、原文只在链上"
+// ⇒ isForeignDetail 见到它一律逐字透出、
+// **且不下探它的 cause**（cause 里躺着的正是 *json.SyntaxError 那类外来类型，下探就会把
+// msgReadFlowDefineJSONFailed 这条跨栈逐字契约文案误判成内部细节）。不另造第二个载体类型。
 type facadeFixedError struct {
 	msg   string
 	cause error
