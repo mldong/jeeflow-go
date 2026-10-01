@@ -50,6 +50,33 @@ type ProcessRepository interface {
 	// 同样不得把空归属值灌进 wf_process_task_actor.actor_id——那是 issues/129 那族
 	// "空 operator 读全库"的上游进水口（spec §2.11 硬要求①「两层都挡」）。
 	AddTaskActor(ctx context.Context, taskID int64, actors []string) error
+
+	// RemoveTaskActor 移除任务参与者（摘人／转办摘原人／门面 processTask/removeTaskActor 都落这一支）。
+	//
+	// **归属值删除腿义务**（issues/137 §3-6 · spec 06-facade.md §processTask/removeTaskActor 语义 6
+	// ＋ §2.11 写点表末行，owner 2026-10-02 拍「两形并集」）——**与上面 [ProcessRepository.AddTaskActor]
+	// 的写侧义务不同，别照抄**（写侧只落 trim 形；删除腿要「原值 ∪ trim 值」两形）：
+	//  1. **空值一律丢弃、不参与匹配**：nil／空串／纯空白都不得进 DELETE，否则历史 actor_id 空串
+	//     脏行会被批量误删（那是替脏数据做掉唯一痕迹）；
+	//  2. **非空值同时以「原值」与「trim 值」两形匹配**（按字面去重、保序）。只取 trim 形 ⇒ 门面按
+	//     语义 6 交出的历史脏行原值 " 9101 " 被削成 9101，真库 NO PAD 排序规则下那一行删不掉而门面
+	//     报成功（**假成功**：被摘的人待办还在）；只取原值 ⇒ 绕过门面直连仓储的调用方传 " 8601 "
+	//     时删不掉写侧归一后落库的规范行 8601（issues/142 §9.2 那一路）。两形并集同时满足两侧，
+	//     且按 §2.11 归一口径 " 9101 " 与 9101 本就是同一个人，两行都删才是"摘掉这个人"的正确结果，
+	//     不构成误删；
+	//  3. **展开后为空 ⇒ 早退，一条 DELETE 都不发**——空并集不得退化成"清空该任务全部参与者"
+	//     （那是语义 5「至少需保留一名参与人」的仓储侧对偶）。
+	//
+	// 判据本体只有一枚＝[ActorDeleteForms]（八栈同名件，java StringUtils.actorDeleteForms／
+	// node spi.actorDeleteForms／py spi.actor_delete_forms／php CcActorUtil::deleteForms／
+	// rs model::actor_delete_forms／moon @model.actor_delete_forms／c# PageQuery.ActorDeleteForms），
+	// trim 与判空仍复用 [NormalizeActors] 那一枚，**不要在仓储里抄第二份**（两份判据迟早分叉）。
+	// ⚠️ 反向哨兵：判空一律 trim(x) == ""，"0" 是合法 id 必须留下，"0" 与 "00" 是两个不同的人
+	// （严禁借语言自带的假值判据）。去重按**字面**做，" 9101 " 与 "  9101  " 是两种不同的原值形，都要保留。
+	// ⚠️ nil 元素由**调用方**在形态拆解那一层就丢掉，严禁先 fmt.Sprint 成 "<nil>" 再传进来。
+	//
+	// SQL 仓与内存仓在同一条判据上必须给同一个答案（issues/117 场景 27 那把尺子）。
+	// **主键另判一档**：taskID 是主键不是归属值，缺失/空/0 由**调用方**响亮报错，同 AddTaskActor 末段。
 	RemoveTaskActor(ctx context.Context, taskID int64, actors []string) error
 
 	// CreateCcInstance 建 cc 行（逐抄送人一行）。

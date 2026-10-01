@@ -305,12 +305,31 @@ func (r *Repository) AddTaskActor(ctx context.Context, taskID int64, actors []st
 	return nil
 }
 
+// RemoveTaskActor 移除任务参与者（内存仓，**删除腿**）。
+//
+// issues/137 §3-6（spec 06-facade.md §processTask/removeTaskActor 语义 6 ＋ §2.11 写点表末行，
+// owner 2026-10-02 拍「两形并集」）：删除值先过 [spi.ActorDeleteForms] 一枚单点——
+// ① 空值（nil/空串/纯空白）一律丢弃、不参与匹配，否则历史 actor_id 空串 脏行会被批量误删
+// （那是替脏数据做掉唯一痕迹）；② 非空值同时以「原值」与「trim 值」两形匹配：只取 trim 形 ⇒
+// 门面按语义 6 交出的脏行原值 " 9101 " 被削成 9101，真库 NO PAD 排序规则下那一行删不掉而门面
+// 报成功（**假成功**：被摘的人待办还在）；只取原值（本仓改前就是这一派：裸传 actors）⇒ 绕过门面
+// 直连仓储的调用方传 " 8601 " 删不掉写侧归一后的规范行（issues/142 §9.2 那一路）；
+// ③ 展开后为空 ⇒ 早退，一次删除都不发生（不得退化成"清空该任务全部参与者"）。
+//
+// ⚠️ 与上面 [Repository.AddTaskActor] 的**写侧义务不同**（写侧只落 trim 形），别照抄。
+// ⚠️ 反向哨兵：判空只吃"trim 后为空"，"0" 是合法 id，且 "0" 与 "00" 是两个人。
+// ⚠️ 主键 taskID 不套用本判据（§2.11「主键类参数另判一档」）。与 JDBC 仓同一条判据、
+// 两仓必须同答案（issues/117 场景 27 那把尺子）。
 func (r *Repository) RemoveTaskActor(ctx context.Context, taskID int64, actors []string) error {
+	forms := spi.ActorDeleteForms(actors...) // 删除腿单点：丢空＋「原值 ∪ trim 值」两形并集
+	if len(forms) == 0 {
+		return nil // ③ 早退：一条删除都不做（不是"清空该任务全部参与者"）
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	remove := make(map[string]bool)
-	for _, a := range actors {
-		remove[a] = true
+	remove := make(map[string]bool, len(forms))
+	for _, a := range forms {
+		remove[a] = true // 按字面等值命中（同 SQL 那句 `actor_id IN (...)`）
 	}
 	var kept []string
 	for _, a := range r.actors[taskID] {

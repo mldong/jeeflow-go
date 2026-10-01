@@ -652,14 +652,33 @@ func (r *Repository) AddTaskActor(ctx context.Context, taskID int64, actors []st
 	return r.insertTaskActors(ctx, r.conn(ctx), taskID, toAdd)
 }
 
+// RemoveTaskActor 移除任务参与者（SQL 仓，**删除腿**）。
+//
+// issues/137 §3-6（spec 06-facade.md §processTask/removeTaskActor 语义 6 ＋ §2.11 写点表末行，
+// owner 2026-10-02 拍「两形并集」）：删除值先过 [spi.ActorDeleteForms] 一枚单点，`IN` 的占位符
+// 数量按展开后的并集长度算——
+// ① 空值（nil/空串/纯空白）一律不喂 DELETE，否则历史 actor_id 空串 脏行会被批量误删
+// （那是替脏数据做掉唯一痕迹，issues/129 那族"空归属值读全库"的删除位对偶）；
+// ② 非空值同时以「原值」与「trim 值」两形进 IN：只取 trim 形 ⇒ 门面按语义 6 交出的脏行原值
+// " 9101 " 被削成 9101，真库（MySQL 8.0 NO PAD 系排序规则连尾部空格都算进比较、5.7 PAD SPACE 系
+// 只忽略尾部，前导空格在两系下都算）那一行删不掉而门面报成功（**假成功**：被摘的人待办还在）；
+// 只取原值（本仓改前就是这一派：裸传 actors）⇒ 绕过门面直连仓储的调用方传 " 8601 " 删不掉
+// 写侧归一后落库的规范行（issues/142 §9.2 那一路）；
+// ③ 展开后为空 ⇒ 早退，**一条 DELETE 都不发**（不得退化成"清空该任务全部参与者"）。
+//
+// ⚠️ 与上面 [Repository.AddTaskActor] 的**写侧义务不同**（写侧只落 trim 形），别照抄。
+// ⚠️ 反向哨兵：判空只吃"trim 后为空"，"0" 是合法 id，且 "0" 与 "00" 是两个人。
+// ⚠️ 主键 taskID 不套用本判据（§2.11「主键类参数另判一档」）。与内存仓同一条判据、
+// 两仓必须同答案（issues/117 场景 27 那把尺子）。
 func (r *Repository) RemoveTaskActor(ctx context.Context, taskID int64, actors []string) error {
-	if len(actors) == 0 {
-		return nil
+	forms := spi.ActorDeleteForms(actors...) // 删除腿单点：丢空＋「原值 ∪ trim 值」两形并集
+	if len(forms) == 0 {
+		return nil // ③ 早退：一条 DELETE 都不发
 	}
 	c := r.conn(ctx)
-	sqlStr := "DELETE FROM wf_process_task_actor WHERE process_task_id = ? AND actor_id IN (?" + repeatPlaceholder(len(actors)-1) + ")"
+	sqlStr := "DELETE FROM wf_process_task_actor WHERE process_task_id = ? AND actor_id IN (?" + repeatPlaceholder(len(forms)-1) + ")"
 	args := []interface{}{taskID}
-	for _, a := range actors {
+	for _, a := range forms {
 		args = append(args, a)
 	}
 	_, err := c.ExecContext(ctx, sqlStr, args...)
