@@ -36,9 +36,11 @@ const (
 //	   "yyyy-MM-dd HH:mm:ss" 字符串 → 该时刻；字符串解析失败 → **nil**（不是 now，也不落穿）；
 //	   值类型不认识（bool / map / slice / nil / 非整数数值…）→ **落穿**到后面两档
 //	   （Java/C# 都是落穿，不得改成提前 return nil）
-//	② 以 s|m|h|d 结尾且前缀是整数 ⇒ 当前时间 + N 秒/分/时/天
+//	② 以 s|m|h|d 结尾且前缀是**非负**整数 ⇒ 当前时间 + N 秒/分/时/天
 //	   （**d 走日历加天 AddDate(0,0,n)**，不乘 86400——跨夏令时两者不等价，
-//	   Java 用 Calendar.add(DAY_OF_MONTH) 同一量纲）
+//	   Java 用 Calendar.add(DAY_OF_MONTH) 同一量纲。
+//	   前缀为负（`-5h`/`-5d`）算**不合法**，与坏前缀一样落穿到 ③ ⇒ 结果 nil（issues/137 D，
+//	   owner 2026-10-01 拍"判非负"：放行负偏移＝建单即逾期）；带 '+' 的前缀照旧合法）
 //	③ 否则把表达式本身按 "yyyy-MM-dd HH:mm:ss" 解析 → 该时刻；失败 → nil
 //
 // **任何一档都不允许返回 now()**：本案病灶恰是"非空但错"的占位 now()（建单即逾期、
@@ -92,13 +94,26 @@ func epochMillis(ms int64) *time.Time {
 	return &t
 }
 
-// relativeTime 相对档 Ns/Nm/Nh/Nd；前缀非整数或后缀不识别 ⇒ ok=false（交回调用方走绝对档）
+// relativeTime 相对档 Ns/Nm/Nh/Nd；前缀非整数**或前缀是负数**或后缀不识别 ⇒ ok=false（交回调用方走绝对档）
 func relativeTime(expr string, base time.Time) (time.Time, bool) {
 	if len(expr) < 2 {
 		return time.Time{}, false
 	}
 	n, err := strconv.Atoi(strings.TrimSpace(expr[:len(expr)-1]))
 	if err != nil {
+		return time.Time{}, false
+	}
+	// issues/137 D（owner 2026-10-01 拍"判非负"）：**负数前缀同样算不合法**，按"解析不出来"处理
+	// ——ok=false 交回调用方落穿绝对档，仍解析不出即 nil（NULL）。两条理由（对齐 java
+	// FlowUtil.parseIntOrNull）：
+	//   1. **任何一档都不许退回当前时间**：放行 `-5h` 算出的是一个**过去**的时刻 ⇒ 新建的行当场就
+	//      逾期，比"没配到期时间"更难发现，也正是 issues/126 占位 now() 病灶的同一形状。
+	//   2. **只裁负、不裁加号**：判负发生在 Atoi **之后**，不是在词法上剥掉符号位。各栈整数解析
+	//      （python `[+-]?`、node `[-+]?\d+`、php `[+-]?\d{1,18}`、go 的 Atoi）都收 '+'，
+	//      把 '+' 一并裁掉等于新造一处跨栈分叉——`+2h` 仍是合法的 now+7200s。
+	// 判点位置：四档（s/m/h/d）的单位分派在下面的 switch，前缀解析**只有这一处共用**（`d` 档走
+	// AddDate 用的也是同一个 n，另加天数分支）⇒ 这一判同时拦住四档，没有漏网的那一档。
+	if n < 0 {
 		return time.Time{}, false
 	}
 	// 按字节取末位是安全的：s/m/h/d 都是 ASCII，UTF-8 续字节一律 >=0x80，不会误匹配多字节字符

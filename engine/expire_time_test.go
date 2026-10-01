@@ -16,6 +16,9 @@
 //
 // ⚠️ 本文件对更早的既有用例只新增断言，没改它们的期望值；上面"表达式来源两档"那几格
 //    属于 issues/126 本批自己的用例，09-28 二轮按基准把夹具改成双节点不同表达式。
+//    **唯一一处改期望值**：TestProcessTimeThreeTiers 的「相对档-负偏移 -1h」格，按
+//    issues/137 D（owner 2026-10-01 拍"判非负"）从"回拨生效"翻成"NULL"，原算术覆盖用
+//    正数天档（1d/+1d/31d/45d，见 TestProcessTimeDayTierCalendarAcrossMonth）补回。
 package engine_test
 
 import (
@@ -441,8 +444,22 @@ func TestProcessTimeThreeTiers(t *testing.T) {
 		{"相对档-分", "45m", nil, func(t *testing.T, v *time.Time) { expWantFromNow(t, 45*time.Minute, v) }},
 		{"相对档-时", "2h", nil, func(t *testing.T, v *time.Time) { expWantFromNow(t, 2*time.Hour, v) }},
 		{"相对档-天(日历加)", "3d", nil, func(t *testing.T, v *time.Time) { expWantFromNow(t, 72*time.Hour, v) }},
-		{"相对档-负偏移", "-1h", nil, func(t *testing.T, v *time.Time) { expWantFromNow(t, -time.Hour, v) }},
+		// issues/137 D owner 2026-10-01 拍判非负：原断 -1h 回拨生效＝放行负偏移的病灶形状，本格按裁定翻面
+		// （负数前缀算不出 ⇒ 落穿绝对档 ⇒ 仍解析不出即 NULL；绝不允许退化成 now()）。
+		{"相对档-负偏移", "-1h", nil, func(t *testing.T, v *time.Time) { expWantNil(t, "负数时档按裁定不合法", v) }},
+		// 四档各自的负数格（判点在 relativeTime 的**唯一**前缀解析处，四档共用 ⇒ 每档钉一格，防"只拦 h"）
+		{"相对档-负秒落穿为NULL", "-30s", nil, func(t *testing.T, v *time.Time) { expWantNil(t, "负数秒档", v) }},
+		{"相对档-负分落穿为NULL", "-45m", nil, func(t *testing.T, v *time.Time) { expWantNil(t, "负数分档", v) }},
+		{"相对档-负时落穿为NULL", "-5h", nil, func(t *testing.T, v *time.Time) { expWantNil(t, "负数时档", v) }},
+		{"相对档-负天落穿为NULL", "-5d", nil, func(t *testing.T, v *time.Time) { expWantNil(t, "负数天档(日历加会倒退)", v) }},
+		// 正向对照（保证上面四格不是恒真，也证明"只裁负不裁加号"）：'+' 前缀照旧是合法偏移
+		{"相对档-加号时档仍合法", "+2h", nil, func(t *testing.T, v *time.Time) { expWantFromNow(t, 2*time.Hour, v) }},
+		{"相对档-加号天档仍合法", "+1d", nil, func(t *testing.T, v *time.Time) { expWantFromNow(t, 24*time.Hour, v) }},
+		// 被翻面那格原来的算术覆盖（负偏移走 base.Add/AddDate 的通路）用正数补回，覆盖不缩水：
+		// 31d 跨月/跨季的日历加法见下面 TestProcessTimeDayTierCalendarAcrossMonth 逐日核对
+		{"相对档-大天档进月", "31d", nil, func(t *testing.T, v *time.Time) { expWantFromNow(t, 31*24*time.Hour, v) }},
 		{"相对档-前缀非整数不出值", "xh", nil, func(t *testing.T, v *time.Time) { expWantNil(t, "前缀非整数", v) }},
+		{"相对档-小数前缀落穿", "2.5h", nil, func(t *testing.T, v *time.Time) { expWantNil(t, "前缀是小数", v) }},
 		{"绝对档", "2027-03-04 05:06:07", nil, func(t *testing.T, v *time.Time) { expWantAt(t, "2027-03-04 05:06:07", v) }},
 		{"绝对档-带日期无时分秒解析不出", "2027-03-04", nil, func(t *testing.T, v *time.Time) { expWantNil(t, "缺时分秒", v) }},
 		{"解析不出", "not-a-time", nil, func(t *testing.T, v *time.Time) { expWantNil(t, "垃圾串", v) }},
@@ -464,6 +481,85 @@ func TestProcessTimeDayTierIsCalendarBased(t *testing.T) {
 	if got := v.AddDate(0, 0, -5); got.Year() != time.Now().Year() || got.Month() != time.Now().Month() ||
 		got.Day() != time.Now().Day() {
 		t.Errorf("5d 减回 5 个日历日应落回今天，实得 %v", got)
+	}
+}
+
+// TestProcessTimeDayTierCalendarAcrossMonth 正数天档的日历加法算术（跨月/跨季，含 '+' 前缀档）。
+//
+// 来历：issues/137 D 把求值器表里「相对档-负偏移 -1h」那格翻成 NULL（见 TestProcessTimeThreeTiers
+// 旁的裁定注释）后，本栈相对档里**唯一**跑过大整数 base.Add/AddDate 的符号位通路就没了 ⇒
+// 这份算术覆盖用正数补回，不让它随翻面缩水：31d / 45d 从月内任意一天起算都**必然**跨至少一个
+// 月界（月最长 31 天），1d/+1d 另钉"加号前缀走的是同一条加法"。
+// 判的是量纲与符号通路（无 DST 时区里 AddDate 与 86400×N 数值相同，真要区分墙上/瞬时加法靠
+// 注入钟那一档——即上面 TestProcessTimeDayTierIsCalendarBased 与 java/moon 的固定时刻格）。
+func TestProcessTimeDayTierCalendarAcrossMonth(t *testing.T) {
+	base := time.Now()
+	for _, c := range []struct {
+		expr string
+		n    int
+	}{{"1d", 1}, {"+1d", 1}, {"31d", 31}, {"45d", 45}} {
+		v := engine.ProcessTime(c.expr, nil)
+		if v == nil {
+			t.Fatalf("%s 算出了空：正向对照档不得被「判非负」误伤", c.expr)
+		}
+		want := base.AddDate(0, 0, c.n)
+		if d := v.Sub(want); d < -2*time.Second || d > 2*time.Second {
+			t.Errorf("%s = %v，期望 = now 日历加 %d 天 %v（实差 %v）", c.expr, *v, c.n, want, d)
+		}
+		if back := v.AddDate(0, 0, -c.n); back.Year() != base.Year() || back.Month() != base.Month() ||
+			back.Day() != base.Day() {
+			t.Errorf("%s 减回 %d 个日历日应落回今天 %v，实得 %v",
+				c.expr, c.n, base.Format(expLayout), back.Format(expLayout))
+		}
+	}
+}
+
+// TestExpireTimeNegativeRelativeExpressionStaysNull issues/137 D（owner 2026-10-01 拍"判非负"）
+// 的建单路径判点，形状照 Java 基准 ExpireTimeOnCreateTest.negativeRelativeExpressionStaysNull。
+//
+// 四档（s/m/h/d）各钉一格负数表达式 ⇒ 行照常建，但 expire_time 必须保持 NULL：
+// 落穿绝对档后仍解析不出即"没有到期时间"，**不许退化成 now()**（issues/126 红线），
+// 更不许放行负偏移算出一个**过去**的时刻（那等于新建的行当场即逾期，比没配更难发现）。
+// d 档单独一格是必需的：它走 AddDate(0,0,-5) 的历日倒退，与 s/m/h 的 Duration 通路不同形，
+// 判点虽共用 relativeTime 里那一处前缀解析，格子按档分开才拦得住"只改一档"的实现。
+// 末格 `+2h` 是**正向对照**（≈now+7200s）：没有它，上面四格会被"相对档整档返回空"
+// 这种错误实现也判绿（恒真），也证明判负没顺手把加号一起裁掉。
+func TestExpireTimeNegativeRelativeExpressionStaysNull(t *testing.T) {
+	for i, expr := range []string{"-5h", "-5d", "-30s", "-45m"} {
+		name := fmt.Sprintf("exp137d_neg%d", i)
+		eng, repo, defID := expHarness(t, name, expFlowWith(name,
+			expSpec{"approve", `"assignee":"zhangsan","expireTime":"` + expr + `"`}))
+		inst := expStart(t, eng, defID, map[string]interface{}{"BUSINESS_NO": "B137D"})
+		expMustNull(t, expMustDoing(t, repo, inst.ID, "approve", 1)[0], "负数相对档 "+expr+" 应落穿成 NULL")
+	}
+
+	plusName := "exp137d_plus"
+	eng, repo, defID := expHarness(t, plusName, expFlowWith(plusName,
+		expSpec{"approve", `"assignee":"zhangsan","expireTime":"+2h"`}))
+	inst := expStart(t, eng, defID, map[string]interface{}{"BUSINESS_NO": "B137DP"})
+	expMustDelta(t, expMustDoing(t, repo, inst.ID, "approve", 1)[0], 2*time.Hour)
+}
+
+// 变量档与绝对档不受"判非负"影响（判点只在 relativeTime 的前缀解析处，档位顺序也没动）：
+// 键名就叫 "-5h" 的变量照旧取变量值（变量档优先于相对档），绝对时刻串照旧解析成功。
+// 两个节点各起一份夹具——线性流程里第二个节点要等第一个办结才会有行，合在一条链上判不了。
+func TestExpireTimeNegativeRelativeExpressionOtherTiersUnaffected(t *testing.T) {
+	varName := "exp137d_var"
+	eng, repo, defID := expHarness(t, varName, expFlowWith(varName,
+		expSpec{"approve", `"assignee":"zhangsan","expireTime":"-5h"`}))
+	inst := expStart(t, eng, defID, map[string]interface{}{"-5h": "2028-08-08 08:08:08"})
+	vr := expMustDoing(t, repo, inst.ID, "approve", 1)[0]
+	if vr.ExpireTime == nil || !vr.ExpireTime.Equal(expAt(t, "2028-08-08 08:08:08")) {
+		t.Errorf("变量档：表达式 \"-5h\" 命中同名变量时应取变量值，实得 %v", vr.ExpireTime)
+	}
+
+	absName := "exp137d_abs"
+	eng2, repo2, defID2 := expHarness(t, absName, expFlowWith(absName,
+		expSpec{"approve", `"assignee":"zhangsan","expireTime":"2026-12-31 10:00:00"`}))
+	inst2 := expStart(t, eng2, defID2, map[string]interface{}{})
+	ar := expMustDoing(t, repo2, inst2.ID, "approve", 1)[0]
+	if ar.ExpireTime == nil || !ar.ExpireTime.Equal(expAt(t, "2026-12-31 10:00:00")) {
+		t.Errorf("绝对档：不受判非负影响，实得 %v", ar.ExpireTime)
 	}
 }
 
