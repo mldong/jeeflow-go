@@ -177,6 +177,8 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 		err = f.taskAddActor(args)
 	case "processTask/transfer":
 		err = f.taskTransfer(args)
+	case "processTask/removeTaskActor":
+		err = f.taskRemoveActor(args)
 	case "processTask/latest":
 		data, err = f.taskLatest(args)
 	case "processInstance/stats/overview":
@@ -1750,6 +1752,117 @@ func (f *Facade) taskTransfer(args map[string]interface{}) error {
 		Type: engine.EventTaskTransfer, InstanceID: task.ProcessInstanceID, TaskID: task.ID,
 		NodeID: task.TaskName, Operator: operator, FromActor: fromActor, ToActor: toActor,
 	})
+	return nil
+}
+
+// taskRemoveActor 摘除参与人（issues/115 残留 · 门面第 47 个 action，
+// spec 06-facade.md §processTask/removeTaskActor）。SPI 侧 RemoveTaskActor 早就是必选方法、
+// 两仓都实现，本 action 补的只是"上门面"这一段（Java 基准 taskRemoveActor 同批）。
+//
+// 三个兄弟 action 的分工先钉死，免得后来人把三条混用：
+//   - processTask/surrogate、processTask/addCandidate（本栈同体，都落 taskAddActor）＝**只加**；
+//   - processTask/transfer＝**换人**（摘 A 并加 B，写 submitType=7 + tf_transferHistory 留痕 + fire 码 7）；
+//   - 本 action＝**只摘不加、零留痕**：删掉 actorIds 在本任务的参与者行，不新建任务、不写任何任务变量、
+//     不覆写任务 actor_id/operator 列，也**不 fire 事件**——issues/132 §11.3 定稿的事件集里没有"摘人"
+//     这一码，码 7 TASK_TRANSFER 的语义是"参与者被替换"，只摘不加却发码 7 等于把没发生的转办写进事件流。
+//
+// 守卫次序（spec 同节末尾钉死，逐栈一致，门禁按 msg 断言，不接受本栈自行重排）：
+// operator 必填 → processTaskId/actorIds 缺失 → 任务不存在 → 无权限 → 非进行中 → 摘空下限 → 落库。
+// operator 排在最前：参数全缺时若先报缺参数，鉴权缺口会被参数报错藏起来。
+func (f *Facade) taskRemoveActor(args map[string]interface{}) error {
+	// operator 硬必填（严禁缺省回落 user1，与 transfer/withdraw 同口径）。归一走本栈既有单点
+	// singleActorArg → spi.NormalizeActors（trim＋丢空＋折叠），不另抄第二把尺子（§2.11）。
+	operator := singleActorArg(args["operator"])
+	if operator == "" {
+		return errors.New("operator 必填")
+	}
+	// 缺参数档文案是本 action 的**专属**逐字串 `processTaskId/actorIds 缺失`（spec 语义 8：
+	// 缺键/空串/纯空白/0/负数同一句），**不是** taskIDArg 那句「processTaskId 缺失或非法」；
+	// 主键的**判据**仍复用 taskIDArg（空串/非数值/显式 0/负数都在那里响亮报错，
+	// §2.11「主键类参数另判一档」），只把 msg 折进本族文案。
+	// ⚠️ 唯一不折的一档：超 2^53 的 float 是"精度已经丢了"另一种事实，必须原样透出
+	// taskIDArg 的既有报错——java `toLong`、node `toId`、python `_to_int` 都留着这条护栏
+	// （issues/38 E9·82）；把它伪装成"参数没传"，调用方就看不出自己传的是浮点雪花 id。
+	// actorIds 两形（数组/逗号串）过同一枚单点 toStringSlice2；归一后丢完为空 ⇒ 同一条文案。
+	// 两条都不落库，空串元素也绝不会被喂进 DELETE（历史 actor_id='' 脏行因此安全）。
+	taskID, err := taskIDArg(args)
+	if err != nil {
+		if strings.Contains(err.Error(), "超出 float64 精确范围") {
+			return err
+		}
+		return errors.New("processTaskId/actorIds 缺失")
+	}
+	// 负数那一档 taskIDArg 管不到（它只显性拒 0，`toInt64(-1)` 是合法 int64）⇒ 在这里补判一次。
+	// 不加这一句，负数会一路走到 FindTaskByID 再落「任务不存在」，与 spec 语义 8 的
+	// 「缺键/空串/纯空白/0/负数同一句缺参数文案」分叉（兄弟 action 沿用 taskIDArg 现状，不回改）。
+	if taskID < 0 {
+		return errors.New("processTaskId/actorIds 缺失")
+	}
+	actors := toStringSlice2(args["actorIds"])
+	if len(actors) == 0 {
+		return errors.New("processTaskId/actorIds 缺失")
+	}
+	ctx := context.Background()
+	task, err := f.repo.FindTaskByID(ctx, taskID)
+	if err != nil || task == nil {
+		return errors.New("任务不存在")
+	}
+	// 归属判据同 transfer：被摘集合必须含操作人本人（入参已归一，比较才咬得上），或 operator 是
+	// flow.auto / flow.admin 哨兵（大小写不敏感沿用本栈既有 strings.EqualFold 写法）。
+	// transfer 能"摘 A 加 B"是因为 A 就是操作人本人；本 action 不得成为借道摘他人的口子。
+	targets := make(map[string]bool, len(actors))
+	for _, a := range actors {
+		targets[a] = true
+	}
+	if !targets[operator] &&
+		!strings.EqualFold(operator, engine.KeyAutoExecute) &&
+		!strings.EqualFold(operator, engine.KeyAdminID) {
+		return errors.New("无权限摘除该任务参与人")
+	}
+	// 前置态：仅进行中（DOING=10）任务可摘人。已办结/废弃/撤回的历史参与人行是 approvalRecord 的
+	// 取证依据（它读全状态任务行），摘它等于改写审批历史。
+	if task.TaskState != model.TaskStateDoing {
+		return errors.New("任务非进行中，不可摘除参与人")
+	}
+	// 以参与者关系表为判据（内存/SQL 两仓同源），任务副本 ActorIDs 一并去重纳入（仓储不水合时的兜底，
+	// 与 transfer 同形状）——不这么做的话"库里没人"会被当成"摘空也没关系"，下限判据直接失效。
+	current, err := f.repo.FindTaskActors(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	rows := dedupStrs(append(append([]string{}, current...), task.ActorIDs...))
+	// 语义 6「匹配取归一值、DELETE 取行上的原值」（§2.11 硬要求②的**删除腿**）：库里的行可能是
+	// 修复前落下的未 trim 原值 " leader "，入参 "leader" 必须判成同一个人**并真删掉它**——所以
+	// 匹配用归一形、喂给仓储的是那一行的原值。只拿归一值去 DELETE 会"判成同一人却一条没删"，
+	// 门面报成功而被摘的人待办还在，是**假成功**（本栈 transfer 已按同一形状修过，见上面那段注释）。
+	//
+	// 语义 5「不得摘空」的下限按**能办单的人数**算（remaining 只数归一后非空的行）：历史
+	// actor_id=''/纯空白脏行谁也办不了单，拿它撑住下限等于让"摘空"伪装成成功。
+	// 判据是**集合差**（当前参与者 − 归一后入参），不是"入参条数"——否则 actorIds 里混进非参与者
+	// 的 id 就能绕过这条下限。
+	var toDelete []string
+	remaining := 0
+	for _, row := range rows {
+		n := singleActorArg(row)
+		if n == "" {
+			continue // 归一后为空的历史脏行：既不匹配任何入参，也不计入"一个人"
+		}
+		if targets[n] {
+			toDelete = append(toDelete, row)
+			continue
+		}
+		remaining++
+	}
+	if len(toDelete) > 0 && remaining == 0 {
+		return errors.New("至少需保留一名参与人")
+	}
+	// 语义 7「幂等」：一个都没命中 ⇒ 空操作、成功信封（前端双点/集成层重放第二次不再报错）。
+	// 需要"人不在任务里就报错"请用 transfer（它有「原办理人不是该任务参与人」那档判据）。
+	if len(toDelete) > 0 {
+		if err := f.repo.RemoveTaskActor(ctx, taskID, toDelete); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
