@@ -981,29 +981,13 @@ func formKeyOf(node *model.FlowNode) string {
 }
 
 func (e *EngineImpl) resolveActors(node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}) []string {
-	// 1a. Registry 按名称解析（推荐，对标 Spring IoC）
-	if e.registry != nil {
-		handlerName, _ := node.Properties["assignmentHandler"].(string)
-		if handlerName != "" {
-			if h := e.registry.ResolveAssignment(handlerName); h != nil {
-				return h.Assign(node, inst, operator)
-			}
-		}
-	}
-	// 1b. Extensions 兼容模式（旧 API）
-	if e.ext != nil && e.ext.AssignmentHandler != nil {
-		handlerName, _ := node.Properties["assignmentHandler"].(string)
-		if actors := e.ext.AssignmentHandler(handlerName, node, inst); len(actors) > 0 {
-			return actors
-		}
-	}
-	// 2. 动态指定下一节点处理人优先（v1.0.1：对齐 boot3 tf_nextNodeOperator）
+	// 1. 动态指定下一节点处理人优先（v1.0.1：对齐 boot3 tf_nextNodeOperator）
 	if v, ok := vars[KeyNextNodeOperator]; ok {
 		return valueToActors(v, true)
 	}
-	// 3. 固定指派 assignee——token 即变量 key，能替换就换，换不了就是字面量（v1.0.1 对齐 boot3 args.get(token, token)）
+	// 2. 固定指派 assignee——token 即变量 key，能替换就换，换不了就是字面量（v1.0.1 对齐 boot3 args.get(token, token)）
+	var actors []string
 	if v, ok := node.Properties["assignee"].(string); ok && v != "" {
-		var actors []string
 		for _, p := range strings.Split(v, ",") {
 			p = strings.TrimSpace(p)
 			if p == "" {
@@ -1019,7 +1003,31 @@ func (e *EngineImpl) resolveActors(node *model.FlowNode, inst *model.ProcessInst
 				actors = append(actors, p)
 			}
 		}
+	}
+	if len(actors) > 0 {
 		return actors
+	}
+	// 3. 动态指派处理器 assignmentHandler——**只在 assignee 解析为空时才生效**（对齐 java
+	//    CreateTaskHandler.java:120-141 的 `if (actors.isEmpty())`）。
+	//    ⚠️ issues/100：改前三档顺序是 handler(1a)→handler(1b)→动态指派→assignee，且 handler 命中即无条件
+	//    `return`，于是节点同时配 assignmentHandler 与 assignee／tf_nextNodeOperator 时后两档被整档吞掉，
+	//    与 java／php／python／rust／csharp／moon 六栈相反（那六栈动态指派最先、handler 兜底）。
+	//    现按 java 序重排，handler 仍是"节点没配 assignee 时的扩展点"，老流只要没同时配就行为不变。
+	// 3a. Registry 按名称解析（推荐，对标 Spring IoC）
+	if e.registry != nil {
+		handlerName, _ := node.Properties["assignmentHandler"].(string)
+		if handlerName != "" {
+			if h := e.registry.ResolveAssignment(handlerName); h != nil {
+				return h.Assign(node, inst, operator)
+			}
+		}
+	}
+	// 3b. Extensions 兼容模式（旧 API）
+	if e.ext != nil && e.ext.AssignmentHandler != nil {
+		handlerName, _ := node.Properties["assignmentHandler"].(string)
+		if actors := e.ext.AssignmentHandler(handlerName, node, inst); len(actors) > 0 {
+			return actors
+		}
 	}
 	return nil
 }
