@@ -886,9 +886,16 @@ func (f *Facade) designRedeploy(args map[string]interface{}) (interface{}, error
 func (f *Facade) surrogatePage(args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
 	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
-	if v, ok := args["operator"]; ok {
-		query.Filters = map[string]interface{}{"operator": toStr(v, "")}
-	}
+	// issues/152 ②：t.operator 是**归属列**，与 Java JeeflowFacade.surrogatePage 的
+	// `query.add("t.operator", "EQ", operatorArg(args))` 同形注入（spec 06-facade.md §4.5 归属不变式 /
+	// §2.5 归属列表已把 processSurrogate/page 列入）——引擎自己保证「我的委托」只看自己授出的行，
+	// 不再靠集成壳注入 operator 才成立（换宿主／直调 SPI 就退化成全库台账）。
+	// 本栈改前是「只在显式带 operator 键时走 Filters 等值过滤」，缺键／空串一律不过滤（issues/152 §6
+	// 记的"go 假值不过滤出全量"那一格，实际两形都有）；改后归属条件必带，值走 §2.5 归一
+	// （缺键／空串／全空白 ⇒ demo 缺省 user1），仓储层第二道兜底见 memory/ext.go 与
+	// repository/jdbc/ext.go。
+	query.Conditions = append(query.Conditions,
+		spi.Condition{Column: "t.operator", Operator: "EQ", Value: operatorArg(args)})
 	rows, total, err := ext.PageSurrogates(context.Background(), query)
 	if err != nil {
 		return nil, err
@@ -961,12 +968,19 @@ func (f *Facade) surrogateDetail(args map[string]interface{}) (interface{}, erro
 	return surrogateRowToMap(surrogate), nil
 }
 
-// applySurrogateFields 委托写入公共字段。授权人（operator）仅在显式传入时覆盖，
+// applySurrogateFields 委托写入公共字段。授权人（operator）仅在**显式给了非空值**时覆盖，
 // 避免 update 时清空原授权人（前端编辑表单不带 operator；集成层注入时 operator=授权人，覆盖无害）
 func applySurrogateFields(s *model.ProcessSurrogate, args map[string]interface{}, operator string) {
 	s.ProcessName = toStr(args["processName"], "")
 	if v, ok := args["operator"]; ok {
-		s.Operator = toStr(v, "")
+		// issues/152 ③：只认非空的显式值。空串／全空白**不得**落进 operator——那种行是「死行」，
+		// GetSurrogate 的 `WHERE operator = ?` 永不命中，台账看得见、待办永远不并人
+		// （spec 06-facade.md §2.5 空串＝缺键同档；§4.5「新建时授权人」⚠️ 段）。
+		// 空白档因此什么都不写：save 路径的 s.Operator 已由调用方预置成归一值（缺省 user1），
+		// update 路径保持原授权人（spec 06:1108 那条缺省保留原值，本轮不动）。
+		if explicit := toStr(v, ""); strings.TrimSpace(explicit) != "" {
+			s.Operator = explicit
+		}
 	}
 	s.Surrogate = toStr(args["surrogate"], "")
 	s.StartTime = parseSurrogateTime(args["startTime"])

@@ -20,9 +20,11 @@ import (
 	"context"
 	"database/sql"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
+	"github.com/mldong/jeeflow-go/model"
 	"github.com/mldong/jeeflow-go/repository/jdbc"
 	"github.com/mldong/jeeflow-go/spi"
 )
@@ -226,5 +228,120 @@ func TestIssue129JdbcBuildWhereOwnershipBlankIsEmptyPage(t *testing.T) {
 			t.Fatalf("非归属列 t.business_no LIKE %v 应被当作没填（可选过滤照旧，2 行），got rows=%d total=%d err=%v",
 				v, len(rows), total, err)
 		}
+	}
+}
+
+// ═══ issues/152 ② · 委托分页（扩展仓储）归属不变式的 SQL 侧取证 ═══════════════════
+//
+// spec 06-facade.md §4.5「processSurrogate/page 归属不变式」第二层：绕过门面直调
+// `PageSurrogates` 时，落在归属列 t.operator 上的空值 ⇒ **空页**，绝不允许"这条条件不加"
+// 退化成全库台账；内存仓一路（facade/facade_test.go 的
+// TestIssue152MemoryPageSurrogatesBlankOwnershipIsEmptyPage）必须给同一个答案（条款 6）。
+// 落点在 repository/jdbc/ext.go 两处：
+//   - buildExtWhere 的归属列空值 EQ ⇒ `AND 1=0`（与核心仓 buildWhere 同一把尺子，
+//     复用同一个 ownershipColumns/blankCondValue，不抄第二份）；
+//   - PageSurrogates 的 Filters 形（本栈归属的第二形，Java 只有 conditions 一形）空值同样 `AND 1=0`。
+// 哨兵 leg 钉"只收归属列"：buildExtWhere 同时服务 PageDesigns，且 m_LIKE_* 那套"空值当没填"
+// 的通用放行必须原样保留。
+//
+// 跑法：go test ./repository/jdbc/ -run 'TestIssue152Jdbc'（sqlite :memory:，不连 160）
+
+// openSurrogate152 建 wf_process_surrogate（列名对齐 repository/jdbc/ext.go 的 surrogateCols
+// 与 schema-mysql.sql；类型按本文件 sqlite 习惯）
+func openSurrogate152(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(),
+		`CREATE TABLE IF NOT EXISTS wf_process_surrogate (
+			id INTEGER PRIMARY KEY, process_name TEXT, operator TEXT NOT NULL, surrogate TEXT NOT NULL,
+			start_time TIMESTAMP, end_time TIMESTAMP, enabled INTEGER DEFAULT 1,
+			create_time TIMESTAMP, create_user TEXT, update_time TIMESTAMP, update_user TEXT)`); err != nil {
+		t.Fatalf("create wf_process_surrogate: %v", err)
+	}
+}
+
+func TestIssue152JdbcSurrogatePageBlankOwnershipIsEmptyPage(t *testing.T) {
+	db := openSQLite129(t)
+	defer db.Close()
+	openSurrogate152(t, db)
+	ext := jdbc.NewExt(db)
+	ctx := context.Background()
+
+	now := time.Now().Truncate(time.Millisecond)
+	start, end := now.Add(-time.Hour), now.Add(time.Hour)
+	if err := ext.SaveSurrogate(ctx, &model.ProcessSurrogate{
+		Operator: "op152-own", Surrogate: "ag152", ProcessName: "leave",
+		StartTime: &start, EndTime: &end, Enabled: 1,
+		CreateUser: "go-test", UpdateUser: "go-test",
+	}); err != nil {
+		t.Fatalf("save surrogate: %v", err)
+	}
+	// 夹具刻意再放一行 **operator='' 的死行**（issues/152 ③ 的产物形状）：这一行让空值档的
+	// 两种旧答案都露馅——"条件被整个丢掉"会把它连同正常行一起放出全库台账，
+	// "按真实值比对 `t.operator = ''`"会单独把它捞出来（1 行）。按 §4.5 归属不变式两档都必须 0 行。
+	if err := ext.SaveSurrogate(ctx, &model.ProcessSurrogate{
+		Operator: "", Surrogate: "ag152-dead", ProcessName: "dead-flow",
+		StartTime: &start, EndTime: &end, Enabled: 1,
+		CreateUser: "go-test", UpdateUser: "go-test",
+	}); err != nil {
+		t.Fatalf("save dead-row surrogate: %v", err)
+	}
+	var seeded int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM wf_process_surrogate`).Scan(&seeded); err != nil || seeded != 2 {
+		t.Fatalf("前置失效：台账应有 2 行（1 行真实授权人 + 1 行 operator='' 死行）, got %d err=%v", seeded, err)
+	}
+
+	totalByCond := func(v interface{}) int {
+		t.Helper()
+		_, total, err := ext.PageSurrogates(ctx, spi.PageQuery{PageNum: 1, PageSize: 50,
+			Conditions: []spi.Condition{{Column: "t.operator", Operator: "EQ", Value: v}}})
+		if err != nil {
+			t.Fatalf("PageSurrogates(t.operator EQ %v): %v", v, err)
+		}
+		return total
+	}
+	totalByFilter := func(v interface{}) int {
+		t.Helper()
+		_, total, err := ext.PageSurrogates(ctx, spi.PageQuery{PageNum: 1, PageSize: 50,
+			Filters: map[string]interface{}{"operator": v}})
+		if err != nil {
+			t.Fatalf("PageSurrogates(Filters[operator]=%v): %v", v, err)
+		}
+		return total
+	}
+
+	// 阳性对照（两形）：真实归属值必须出行，否则下面的 0==0 是自等假绿
+	if n := totalByCond("op152-own"); n != 1 {
+		t.Fatalf("前置失效：t.operator EQ 'op152-own' 应有 1 行, got %d", n)
+	}
+	if n := totalByFilter("op152-own"); n != 1 {
+		t.Fatalf("前置失效：Filters[operator]='op152-own' 应有 1 行, got %d", n)
+	}
+
+	for _, v := range []interface{}{"", "   ", nil} {
+		if n := totalByCond(v); n != 0 {
+			t.Fatalf("归属列 t.operator EQ %v ⇒ 空页（AND 1=0），实得 %d 行 ⇒ 条件被整个丢掉、退化成全库台账", v, n)
+		}
+		if n := totalByFilter(v); n != 0 {
+			t.Fatalf("Filters[operator] %v ⇒ 空页，实得 %d 行", v, n)
+		}
+	}
+
+	// 哨兵：非归属列的空值条件仍按"没填/全匹配"放行（可选过滤没被一起收紧成"空值即空页"）。
+	// 期望 2 ＝ 夹具的两行都在（真实授权人行 + operator='' 死行）——这一格恰恰证明
+	// "空值当没填"那条通用放行原样保留，本案只收归属列。
+	for _, v := range []interface{}{"", nil} {
+		if _, total, err := ext.PageSurrogates(ctx, spi.PageQuery{PageNum: 1, PageSize: 50,
+			Conditions: []spi.Condition{{Column: "t.operator", Operator: "EQ", Value: "op152-own"},
+				{Column: "t.process_name", Operator: "LIKE", Value: v}}}); err != nil || total != 1 {
+			t.Fatalf("非归属列 t.process_name LIKE %v 应照常按没填处理（op152-own 名下 1 行），got total=%d err=%v", v, total, err)
+		}
+	}
+	if _, total, err := ext.PageSurrogates(ctx, spi.PageQuery{PageNum: 1, PageSize: 50}); err != nil || total != 0 {
+		t.Fatalf("归属条件整条没给＝缺失档 ⇒ 空页（与内存仓同判据），got total=%d err=%v", total, err)
+	}
+	if _, total, err := ext.PageSurrogates(ctx, spi.PageQuery{PageNum: 1, PageSize: 50,
+		Conditions: []spi.Condition{{Column: "t.operator", Operator: "EQ", Value: "op152-own"},
+			{Column: "t.surrogate", Operator: "EQ", Value: "ag152"}}}); err != nil || total != 1 {
+		t.Fatalf("归属列真实值 + 第二条非归属真实值应命中 1 行, got total=%d err=%v", total, err)
 	}
 }

@@ -229,6 +229,21 @@ var surrogateWhitelist = map[string]bool{
 }
 
 // buildExtWhere m_ 条件 WHERE 构建（白名单 + 参数化）
+// surrogateOwnershipGiven 委托分页归属列 operator 有没有给**有效**值（issues/152 ②）。
+// 两形：Filters 的 "operator" 键、Conditions 里 t.operator 的那条 EQ；给了但是空值 ⇒ False，
+// 两形都没给（缺失档）⇒ 同样 False（spec 06 §2.5 缺失与空值同判）。与 memory/ext.go 逐字同尺子。
+func surrogateOwnershipGiven(query spi.PageQuery) bool {
+	if v, ok := query.Filters["operator"]; ok {
+		return !blankCondValue(v)
+	}
+	for _, c := range query.Conditions {
+		if c.Column == "t.operator" && (c.Operator == "" || strings.EqualFold(c.Operator, "EQ")) {
+			return !blankCondValue(c.Value)
+		}
+	}
+	return false
+}
+
 func buildExtWhere(conditions []spi.Condition, whitelist map[string]bool) (string, []interface{}) {
 	var b strings.Builder
 	var params []interface{}
@@ -237,6 +252,14 @@ func buildExtWhere(conditions []spi.Condition, whitelist map[string]bool) (strin
 			continue
 		}
 		val := c.Value
+		// issues/152 ②（spec 06-facade.md §4.5 归属不变式，与核心仓 buildWhere 同一条尺子）：
+		// 落在**归属列**上的 EQ 条件值为空 ⇒ 空页（AND 1=0），不是"这条条件不加"。
+		// 只收归属列——下面两句"空值当作没填"是 m_LIKE_* 等**可选过滤**的通用放行，
+		// 照字面改成"空值即空页"会把可选过滤一起改坏。
+		if blankCondValue(val) && strings.EqualFold(c.Operator, "EQ") && ownershipColumns[c.Column] {
+			b.WriteString(" AND 1=0")
+			continue
+		}
 		if val == nil {
 			continue
 		}
@@ -272,9 +295,28 @@ func (r *ExtRepository) PageSurrogates(ctx context.Context, query spi.PageQuery)
 	sqlStr := "SELECT " + surrogateCols + " FROM wf_process_surrogate t WHERE 1=1"
 	args := []interface{}{}
 	args2 := []interface{}{}
+	// issues/152 ②：归属条件缺失档（两形都没给）⇒ 空页，与 memory 仓同判据（条款 6）。
+	if !surrogateOwnershipGiven(query) {
+		countStr += " AND 1=0"
+		sqlStr += " AND 1=0"
+	}
 	for col, val := range query.Filters {
 		switch col {
-		case "operator", "surrogate", "process_name", "enabled":
+		case "operator":
+			// issues/152 ②：Filters 是本栈委托分页归属的第二形（Java 只有 conditions 一形）。
+			// 给了这一形就是"按归属过滤"，空值形态（nil／空串／全空白）⇒ 空页，
+			// 不得拼成 `t.operator = ''`（会漏掉／撞上死行，且与内存仓判据分叉）。
+			// 与 memory/ext.go 的 surrogateOwnershipGiven 同一条判据（条款 6 双仓同答案）。
+			if blankCondValue(val) {
+				countStr += " AND 1=0"
+				sqlStr += " AND 1=0"
+				continue
+			}
+			countStr += " AND t.operator = ?"
+			sqlStr += " AND t.operator = ?"
+			args2 = append(args2, val)
+			args = append(args, val)
+		case "surrogate", "process_name", "enabled":
 			countStr += " AND t." + col + " = ?"
 			sqlStr += " AND t." + col + " = ?"
 			args2 = append(args2, val)

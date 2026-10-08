@@ -53,7 +53,10 @@ var seedFinished = []seedRow{
 	{12, "userB", map[string]interface{}{"deptLeader": "user1"}, nil},
 }
 
-// 委托 8 条：processSurrogate/page 无 operator 过滤 → 8 用户委托菜单全非空
+// 委托 8 条：8 个授权人各一条，谁登录「我的委托」都非空。
+// issues/152 ② 起 processSurrogate/page 的归属条件由**门面**注入（t.operator EQ §2.5 归一值：
+// 不带 operator ⇒ demo 缺省 user1），分页只看自己授出的行，不再退化成全库台账
+// （旧注释那句"无 operator 过滤 → 8 用户委托菜单全非空"说的就是改前那个全库答案）。
 var seedSurrogates = [][2]string{
 	{"user1", "userA"}, {"userA", "userB"}, {"userB", "userC"}, {"userC", "leader"},
 	{"leader", "manager"}, {"manager", "director"}, {"director", "boss"}, {"boss", "user1"},

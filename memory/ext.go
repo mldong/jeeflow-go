@@ -4,6 +4,7 @@ package memory
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -171,6 +172,16 @@ func (r *ExtRepository) RemoveSurrogate(ctx context.Context, id int64) error {
 func (r *ExtRepository) PageSurrogates(ctx context.Context, query spi.PageQuery) ([]*model.ProcessSurrogate, int, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	// issues/152 ②（spec 06-facade.md §4.5 归属不变式 · 条款 6 双仓同答案）：委托分页的归属列
+	// t.operator 给了**空值形态**（nil／空串／全空白）⇒ 空页，绝不折叠成"这条不过滤"放出全库台账。
+	// 本栈归属有两形（与 Python 同形，Java 只有 conditions 一形）：
+	//   - Filters 的 "operator" 键：改前 val==nil 被 continue 跳过＝不过滤，本函数下面那句判掉；
+	//   - Conditions 的 t.operator EQ：已由 matchConditions 的 ownershipColumns 空值档拦住
+	//     （memory/repository.go，issues/129 案 A 第二层那把尺子），这里不重复第二份判据。
+	// 门面已把缺键／空串归一成缺省 user1（facade.operatorArg），这一道防的是绕过门面直调仓储的调用方。
+	if !surrogateOwnershipGiven(query) {
+		return []*model.ProcessSurrogate{}, 0, nil
+	}
 	// 对齐 JDBC PageSurrogates（issues/82-7）：Filters（operator/surrogate/process_name/enabled）
 	// + m_ 条件（matchConditions，列白名单 t.*）+ t.id DESC 排序 + 分页切片
 	var matched []*model.ProcessSurrogate
@@ -186,6 +197,23 @@ func (r *ExtRepository) PageSurrogates(ctx context.Context, query spi.PageQuery)
 	}
 	sort.Slice(matched, func(i, j int) bool { return matched[i].ID > matched[j].ID })
 	return slicePage(matched, query), len(matched), nil
+}
+
+// surrogateOwnershipGiven Filters 形的委托归属有没有给**有效**值（issues/152 ②）。
+// 没给这一形（键缺失）不算空值档——SQL 侧同样不拼这条谓词，两仓保持一致；
+// 给了但是空值形态 ⇒ false ⇒ 空页，与 JDBC PageSurrogates 的 `AND 1=0` 同一条判据。
+func surrogateOwnershipGiven(query spi.PageQuery) bool {
+	if v, ok := query.Filters["operator"]; ok {
+		return conditionValueEffective(v)
+	}
+	for _, c := range query.Conditions {
+		if c.Column == "t.operator" && (c.Operator == "" || strings.EqualFold(c.Operator, "EQ")) {
+			return conditionValueEffective(c.Value)
+		}
+	}
+	// 两形都没给 ⇒ 归属条件**缺失** ⇒ 空页（spec 06 §2.5「条件缺失或为空值时返回空页」，
+	// 缺失档与空值档同判；java/csharp/moon/rust 同侧）。绝不"这条不加"放出全库台账。
+	return false
 }
 
 // matchSurrogateFilters Filters 简单条件（对齐 JDBC operator/surrogate/process_name/enabled 白名单）

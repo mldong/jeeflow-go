@@ -3945,3 +3945,282 @@ func TestTransferAndWithdrawEventLegs(t *testing.T) {
 		}
 	}
 }
+
+// ═══ issues/152 · 档 4（save 授权人归一）＋档 5（page 归属不变式）· 门面层（内存仓一路）═══
+//
+// 契约条文＝spec 06-facade.md §4.5「processSurrogate/page 归属不变式」＋ §4.5「新建时授权人」⚠️ 段
+// ＋ §2.5 归属列表（本轮新增 processSurrogate/page 一行）。形状照 java 参考实现
+// SurrogateAutoApplyTest 的同批用例（档 4 两格 + 档 5 三格）。
+//
+// 档 1/2/3 本栈既有用例已钉住，本轮不重复造（现读定位）：
+//   档 1 精确优先／精确判否兜底全流程 ⇒ engine/surrogate_test.go
+//       TestSurrogateIneffectiveExactRowStillFallsBackToAllFlow（六格：窗外/已过期/enabled=0/
+//       enabled=2/自委托 ⇒ 兜底 lisi；正向对照"精确生效⇒用精确的 wangwu"即"精确接管"那一腿），
+//       SQL 侧同数据集在 repository/jdbc/surrogate_test.go 同名用例；
+//   档 2 最新一条 enabled=0 ⇒ 不并人（也不复活更旧那条）⇒ 两侧 TestSurrogateNewestRowDecidesNoMerge
+//       的 A3 格，B 格是同夹具正向对照；
+//   档 3 最新一条 surrogate == operator ⇒ 不出人 ⇒ 同上 A5 格，另有
+//       TestSurrogateAutoApplyNegativeCases 的"自委托"格与 internal/surrparity 四判据对拍
+//       （内存仓 memory/ext_parity_test.go ＋ SQL 仓 repository/jdbc/surrogate_test.go 共用期望表）。
+
+// surr152FlowContent task1 的 assignee＝user1：§2.5 归一缺省授权人正好是 user1，
+// 档 4 的正面判据（"该行能被该缺省用户的后续待办命中"）要用它建单。
+const surr152FlowContent = `{"name":"surr152","displayName":"委托归属流程","type":"approval",
+ "nodes":[
+  {"id":"start","type":"snaker:start","properties":{},"text":{"value":"开始"}},
+  {"id":"apply","type":"snaker:task","properties":{"assignee":"applicant","taskType":0,"performType":0},"text":{"value":"发起申请"}},
+  {"id":"task1","type":"snaker:task","properties":{"assignee":"user1","taskType":0,"performType":0},"text":{"value":"上级审批"}},
+  {"id":"end","type":"snaker:end","properties":{},"text":{"value":"结束"}}],
+ "edges":[
+  {"id":"e0","sourceNodeId":"start","targetNodeId":"apply","properties":{}},
+  {"id":"e1","sourceNodeId":"apply","targetNodeId":"task1","properties":{}},
+  {"id":"e2","sourceNodeId":"task1","targetNodeId":"end","properties":{}}]}`
+
+// surr152Deploy 部署 surr152 流程，返回 defineId
+func surr152Deploy(t *testing.T, f *facade.Facade) int64 {
+	t.Helper()
+	r := f.Flow("processDefine/deploy", map[string]interface{}{"content": surr152FlowContent})
+	mustOk(t, r)
+	return mustI64(r["data"].(map[string]interface{})["processDefineId"])
+}
+
+// surr152SaveRaw 走门面 processSurrogate/save。operator 传 nil ⇒ **不带这个键**
+// （区别于显式传空串/全空白，两档都得钉：spec 06 §2.5 把它们折成同一档）
+func surr152SaveRaw(t *testing.T, f *facade.Facade, operator interface{}) int64 {
+	t.Helper()
+	body := map[string]interface{}{
+		"processName": "surr152", "surrogate": "agent152",
+		"startTime": "2000-01-01 00:00:00", "endTime": "2099-12-31 23:59:59",
+	}
+	if operator != nil {
+		body["operator"] = operator
+	}
+	r := f.Flow("processSurrogate/save", body)
+	mustOk(t, r)
+	return mustI64(r["data"].(map[string]interface{})["id"])
+}
+
+// surr152RowOf 走门面 processSurrogate/detail 读回行（断言落在持久值上，issues/113 教训）
+func surr152RowOf(t *testing.T, f *facade.Facade, id int64) map[string]interface{} {
+	t.Helper()
+	r := f.Flow("processSurrogate/detail", map[string]interface{}{"id": id})
+	mustOk(t, r)
+	row, ok := r["data"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("detail data 应为行对象, 实得 %v", r["data"])
+	}
+	return row
+}
+
+// surr152PageRows 走门面 processSurrogate/page。operator 传 nil ⇒ 不带这个键
+func surr152PageRows(t *testing.T, f *facade.Facade, operator interface{}) []map[string]interface{} {
+	t.Helper()
+	body := map[string]interface{}{"pageNum": 1, "pageSize": 50}
+	if operator != nil {
+		body["operator"] = operator
+	}
+	r := f.Flow("processSurrogate/page", body)
+	mustOk(t, r)
+	rowsAny, ok := r["data"].(map[string]interface{})["rows"].([]interface{})
+	if !ok {
+		t.Fatalf("page rows 形状异常: %v", r["data"])
+	}
+	out := make([]map[string]interface{}, 0, len(rowsAny))
+	for _, x := range rowsAny {
+		m, ok := x.(map[string]interface{})
+		if !ok {
+			t.Fatalf("page 行应为对象, 实得 %T", x)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// surr152Seed 直调内存扩展仓储放一条委托台账行（绕过门面写侧，只喂分页/判据用）
+func surr152Seed(t *testing.T, ext *memory.ExtRepository, operator, agent, processName string) {
+	t.Helper()
+	now := time.Now()
+	start, end := now.Add(-time.Hour), now.Add(time.Hour)
+	if err := ext.SaveSurrogate(context.Background(), &model.ProcessSurrogate{
+		Operator: operator, Surrogate: agent, ProcessName: processName,
+		StartTime: &start, EndTime: &end, Enabled: 1,
+	}); err != nil {
+		t.Fatalf("seed surrogate: %v", err)
+	}
+}
+
+// surr152ActorsAs 以 who 建单，读回 task1 的持久参与者行
+func surr152ActorsAs(t *testing.T, f *facade.Facade, repo *memory.Repository, defineID int64, who string) []string {
+	t.Helper()
+	r := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": defineID, "operator": who,
+	})
+	mustOk(t, r)
+	instID := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
+	taskID := doingTaskID(t, repo, instID, "task1")
+	if taskID == 0 {
+		t.Fatalf("夹具前置：应有 task1 进行中任务（实例 %d）", instID)
+	}
+	actors, err := repo.FindTaskActors(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("读回参与者: %v", err)
+	}
+	return actors
+}
+
+// TestIssue152SurrogateSaveWithoutOperatorKeyLandsOnNormalizedOperator 档 4 缺键腿：
+// save 不带 operator ⇒ 行落在 §2.5 归一缺省 user1 上，且**能被该缺省用户的后续待办命中**
+// （正面判据：以 user1 建单，代理人真进参与者表）。
+// 改前红：Go 门面 applySurrogateFields 的 `if v, ok := args["operator"]; ok` 那半不吃归一，
+// 而 save 的缺省是"不带键就保留预置的 user1"，但分页/写侧的空白档仍写空串；本格与下一格
+// 一起把"绝不落空串行"钉住（空串行是死行：GetSurrogate 的 `WHERE operator = ?` 永不命中它）。
+func TestIssue152SurrogateSaveWithoutOperatorKeyLandsOnNormalizedOperator(t *testing.T) {
+	f, repo, _ := setupFacade()
+	defineID := surr152Deploy(t, f)
+
+	id := surr152SaveRaw(t, f, nil) // 缺键档
+	if got := surr152RowOf(t, f, id)["operator"]; got != "user1" {
+		t.Fatalf("缺 operator 键的 save 必须落在 §2.5 归一缺省 user1 上，实得 %q（空串＝死行，判据永不命中）", got)
+	}
+	actors := surr152ActorsAs(t, f, repo, defineID, "user1")
+	if !containsStr2(actors, "agent152") {
+		t.Fatalf("该行必须能被归一后授权人（user1）的后续待办命中，读回参与者 %q", actors)
+	}
+	if !containsStr2(actors, "user1") {
+		t.Fatalf("委托不是转办，授权人须保留，读回 %q", actors)
+	}
+}
+
+// TestIssue152SurrogateSaveBlankOperatorDoesNotWriteDeadRow 档 4 空白腿（＋正向对照）：
+// 显式传空串／全空白同样走归一（spec 06 §2.5「空串＝缺键同档」），不得落进 operator；
+// 真实非空值照旧原样收下（归一不是无条件覆写）。
+func TestIssue152SurrogateSaveBlankOperatorDoesNotWriteDeadRow(t *testing.T) {
+	f, _, _ := setupFacade()
+	for _, blank := range []string{"", "   ", "\t"} {
+		id := surr152SaveRaw(t, f, blank)
+		if got := surr152RowOf(t, f, id)["operator"]; got != "user1" {
+			t.Fatalf("空白档 operator %q 必须走归一落 user1，不得写进库（死行），实得 %v", blank, got)
+		}
+	}
+	// 正向对照：非空显式值不受影响
+	id := surr152SaveRaw(t, f, "op-real")
+	if got := surr152RowOf(t, f, id)["operator"]; got != "op-real" {
+		t.Fatalf("显式非空 operator 必须原样落库（归一只收空值档），实得 %v", got)
+	}
+}
+
+// TestIssue152SurrogatePageShowsOnlyOwnRows 档 5 第一腿：带 operator ⇒ 只看自己授出的行。
+// surr152LedgerHasRows 夹具守卫：按授权人逐条读回。
+// fail-closed 之后"整表不带归属条件读"不再是合法通道（spec 06 §4.5 归属不变式：缺失档与空值档同判），
+// 所以"库里确有这些行"必须由**归属有效**的读法来证。
+func surr152LedgerHasRows(t *testing.T, ext *memory.ExtRepository, ops ...string) {
+	t.Helper()
+	for _, op := range ops {
+		_, total, err := ext.PageSurrogates(context.Background(), spi.PageQuery{PageNum: 1, PageSize: 50,
+			Conditions: []spi.Condition{{Column: "t.operator", Operator: "EQ", Value: op}}})
+		if err != nil || total < 1 {
+			t.Fatalf("前置失效：授权人 %s 名下应有行, got total=%d err=%v", op, total, err)
+		}
+	}
+}
+
+func TestIssue152SurrogatePageShowsOnlyOwnRows(t *testing.T) {
+	f, _, ext := setupFacade()
+	surr152Seed(t, ext, "op-mine", "agentA", "surr152")
+	surr152Seed(t, ext, "op-others", "agentB", "surr152")
+	// 夹具守卫：库里确有两条不同授权人的行（否则 1==1 是自等假绿）
+	surr152LedgerHasRows(t, ext, "op-mine", "op-others")
+	rows := surr152PageRows(t, f, "op-mine")
+	if len(rows) != 1 {
+		t.Fatalf("分页只能看自己授出的委托（实得 %d 行：%v）", len(rows), rows)
+	}
+	if rows[0]["operator"] != "op-mine" {
+		t.Fatalf("命中行应为 op-mine，实得 %v", rows[0]["operator"])
+	}
+}
+
+// TestIssue152SurrogatePageWithoutOperatorIsNormalizedNotFullLedger 档 5 第二腿：
+// 不带 operator ⇒ 出的是归一缺省 user1 授出的行，**不是全库台账**（本案的病根就在这一格）。
+func TestIssue152SurrogatePageWithoutOperatorIsNormalizedNotFullLedger(t *testing.T) {
+	f, _, ext := setupFacade()
+	surr152Seed(t, ext, "user1", "agentA", "surr152")
+	surr152Seed(t, ext, "op-others", "agentB", "surr152")
+	surr152LedgerHasRows(t, ext, "user1", "op-others")
+	rows := surr152PageRows(t, f, nil)
+	if len(rows) != 1 || rows[0]["operator"] != "user1" {
+		t.Fatalf("缺 operator 不是「不过滤」，是归一到缺省 user1（实得 %d 行：%v）", len(rows), rows)
+	}
+	// 空白档同格（显式空串也不得退化成全库）
+	rows = surr152PageRows(t, f, "")
+	if len(rows) != 1 || rows[0]["operator"] != "user1" {
+		t.Fatalf("空串 operator 与缺键同档 ⇒ 只出 user1 的行，实得 %d 行：%v", len(rows), rows)
+	}
+}
+
+// TestIssue152MemoryPageSurrogatesBlankOwnershipIsEmptyPage 档 5 第三腿（第二层兜底 · 内存仓）：
+// 绕过门面直调仓储，归属列给空值形态 ⇒ **空页**，与 SQL 仓同答案（spec 06 §4.5 条款 6）。
+// 本栈归属有两形（Filters 的 operator 键 / Conditions 的 t.operator EQ），两形都判。
+// 哨兵 leg 钉"只收归属列"：非归属列（t.process_name）的空值条件仍按"没填"放行，
+// 没被一起改成"空值即空页"。
+func TestIssue152MemoryPageSurrogatesBlankOwnershipIsEmptyPage(t *testing.T) {
+	ext := memory.NewExt()
+	surr152Seed(t, ext, "op-mine", "agentA", "surr152")
+	// 夹具再放一行 **operator='' 的死行**（档 4 的坏形状）：空值档若"按真实值比对"就会单独
+	// 把它捞出来（1 行），若"条件当没填"会把两行都放出全库台账（2 行）；§4.5 归属不变式两档都必须是 0 行。
+	surr152Seed(t, ext, "", "agentDead", "dead-flow")
+	ctx := context.Background()
+
+	count := func(q spi.PageQuery) int {
+		t.Helper()
+		_, total, err := ext.PageSurrogates(ctx, q)
+		if err != nil {
+			t.Fatalf("PageSurrogates: %v", err)
+		}
+		return total
+	}
+	rows := func(q spi.PageQuery) []*model.ProcessSurrogate {
+		t.Helper()
+		r, _, err := ext.PageSurrogates(ctx, q)
+		if err != nil {
+			t.Fatalf("PageSurrogates: %v", err)
+		}
+		return r
+	}
+	byCond := func(v interface{}) spi.PageQuery {
+		return spi.PageQuery{PageNum: 1, PageSize: 50,
+			Conditions: []spi.Condition{{Column: "t.operator", Operator: "EQ", Value: v}}}
+	}
+	byFilter := func(v interface{}) spi.PageQuery {
+		return spi.PageQuery{PageNum: 1, PageSize: 50,
+			Filters: map[string]interface{}{"operator": v}}
+	}
+
+	// 阳性对照：同一列的真实值必须出行（否则下面的 0==0 是自等）
+	if n := count(byCond("op-mine")); n != 1 {
+		t.Fatalf("前置失效：t.operator EQ 'op-mine' 应有 1 行, got %d", n)
+	}
+	if n := count(byFilter("op-mine")); n != 1 {
+		t.Fatalf("前置失效：Filters[operator]='op-mine' 应有 1 行, got %d", n)
+	}
+	for _, v := range []interface{}{"", "   ", nil} {
+		if n := count(byCond(v)); n != 0 {
+			t.Fatalf("归属列 EQ %v ⇒ 空页，实得 %d 行（退化成「这条不加」＝全库台账）", v, n)
+		}
+		if n := count(byFilter(v)); n != 0 {
+			t.Fatalf("Filters[operator] %v ⇒ 空页，实得 %d 行", v, n)
+		}
+	}
+	// 哨兵：非归属列的空值条件仍被当作没填（可选过滤照旧，两行都出，含死行）
+	if n := count(spi.PageQuery{PageNum: 1, PageSize: 50,
+		Conditions: []spi.Condition{{Column: "t.operator", Operator: "EQ", Value: "op-mine"},
+			{Column: "t.process_name", Operator: "LIKE", Value: ""}}}); n != 1 {
+		t.Fatalf("非归属列 t.process_name LIKE '' 应仍按没填处理（op-mine 名下 1 行），实得 %d ⇒ 本案把通用放行一起收紧了", n)
+	}
+	if n := count(spi.PageQuery{PageNum: 1, PageSize: 50}); n != 0 {
+		t.Fatalf("归属条件整条没给＝缺失档 ⇒ 空页（spec 06 §2.5 缺失与空值同判），实得 %d", n)
+	}
+	if r := rows(spi.PageQuery{PageNum: 1, PageSize: 50,
+		Conditions: []spi.Condition{{Column: "t.operator", Operator: "EQ", Value: ""}}}); r != nil && len(r) != 0 {
+		t.Fatalf("空值档不得返回任何行，实得 %d", len(r))
+	}
+}

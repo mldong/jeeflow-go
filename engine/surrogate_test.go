@@ -368,7 +368,11 @@ func TestSurrogateExplicitDisable(t *testing.T) {
 		t.Fatalf("显式关闭后不应并入代理人，读回 %v", actors)
 	}
 	// 关闭只影响运行期，台账照常可查
-	if _, total, err := ext.PageSurrogates(context.Background(), spi.PageQuery{PageNum: 1, PageSize: 10}); err != nil || total != 1 {
+	// 台账仍可查，但读法要带归属值：spec 06 §4.5 归属不变式之后，
+	// "整条归属条件都没给"属缺失档 ⇒ 空页（与 §2.5 抄送侧同一条尺子）。
+	_, total, err := ext.PageSurrogates(context.Background(), spi.PageQuery{PageNum: 1, PageSize: 10,
+		Conditions: []spi.Condition{{Column: "t.operator", Operator: "EQ", Value: "zhangsan"}}})
+	if err != nil || total != 1 {
 		t.Fatalf("关闭运行期后台账应仍可查: total=%d err=%v", total, err)
 	}
 
