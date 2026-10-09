@@ -1326,6 +1326,12 @@ func (f *Facade) approvalRecord(args map[string]interface{}) (interface{}, error
 	rows := make([]map[string]interface{}, 0, len(his))
 	for _, t := range his {
 		rows = append(rows, map[string]interface{}{
+			// issues/154④：审批记录九键之首＝任务行主键，且**显式**字符串化——19 位雪花 id
+			// 出 number 会被 JS 截精度（同 issues/75/92 那族坑）。本栈虽有出口 stringifyIDs
+			// pass（issues/38 E9），但引擎不得依赖兜底通道：宿主换序列化姿势 / pass 漏键名
+			// 形状（复数 id 数组那类）都会静默退回 number，对齐 java
+			// `String.valueOf(t.getTaskId())` 的显式档。
+			"id":       strconv.FormatInt(t.ID, 10),
 			"taskName": t.TaskName, "displayName": t.DisplayName,
 			"taskType": t.TaskType, "performType": t.PerformType,
 			"taskState": t.TaskState, "operator": t.ActorID,

@@ -259,6 +259,16 @@ func TestFlowSimpleEndToEnd(t *testing.T) {
 	if len(allTasks[0].ActorIDs) == 0 {
 		t.Fatalf("actor relation not persisted: %+v", allTasks[0])
 	}
+
+	// ── issues/154①：审批记录取数路（FindHistoryTasks → 门面 approvalRecord）行序必须
+	// 按 id 单调升（雪花 id 单调，同秒并发插入时比 create_time/update_time 确定）。
+	// 判据放在 SQL 仓这条腿上：门面用例走内存仓，内存仓按 map 遍历取行、天然不保证序。
+	for i := 1; i < len(allTasks); i++ {
+		if allTasks[i-1].ID >= allTasks[i].ID {
+			t.Fatalf("FindHistoryTasks 行序非 id ASC: [%d]=%d >= [%d]=%d",
+				i-1, allTasks[i-1].ID, i, allTasks[i].ID)
+		}
+	}
 }
 
 // ─── issues/110：SQL 仓 FindInstanceByID 水合任务 → detail 任务列表非空 ─────────

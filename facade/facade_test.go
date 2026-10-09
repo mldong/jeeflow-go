@@ -776,6 +776,41 @@ func TestFacadeViewEndpoints(t *testing.T) {
 		t.Fatalf("approvalRecord rows = %d, want 2", len(r["data"].([]interface{})))
 	}
 
+	// ── issues/154④：审批记录九键之首＝ id（任务行主键），且必须是**字符串** ──
+	// 19 位雪花 id 出 number 会被 JS 截精度（issues/75/92 那族坑）。行序判据（口径①
+	// ORDER BY id ASC）不在这条用例里断：内存仓 FindHistoryTasks 走 Go map 遍历，
+	// 行序本身不保证（见本报告"现读核对"段）；SQL 仓的行序在 repository/jdbc 用例里核。
+	recRows := r["data"].([]interface{})
+	seenIDs := map[string]bool{}
+	for i, m := range recRows {
+		row, _ := m.(map[string]interface{})
+		idVal, ok := row["id"]
+		if !ok {
+			t.Fatalf("approvalRecord 第 %d 行缺 id 键: %v", i, row)
+		}
+		s, isStr := idVal.(string)
+		if !isStr {
+			t.Fatalf("approvalRecord 第 %d 行 id 必须是字符串，实际 %T=%v", i, idVal, idVal)
+		}
+		if s == "" {
+			t.Fatalf("approvalRecord 第 %d 行 id 为空串: %v", i, row)
+		}
+		seenIDs[s] = true
+	}
+	if len(seenIDs) != len(recRows) {
+		t.Fatalf("approvalRecord 行主键出现重复: %v（行数 %d）", seenIDs, len(recRows))
+	}
+	// id 集合与持久任务行逐一对号（顺序无关）
+	persisted, perr := repo.FindHistoryTasks(context.Background(), instanceID)
+	if perr != nil {
+		t.Fatalf("FindHistoryTasks: %v", perr)
+	}
+	for _, tsk := range persisted {
+		if !seenIDs[strconv.FormatInt(tsk.ID, 10)] {
+			t.Fatalf("approvalRecord 缺任务行 id=%d: %v", tsk.ID, seenIDs)
+		}
+	}
+
 	r = f.Flow("processInstance/highLight", map[string]interface{}{"id": instanceID})
 	if code, _ := r["code"].(int); code != 0 {
 		t.Fatalf("highLight failed: %v", r)
