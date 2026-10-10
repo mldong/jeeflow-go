@@ -40,17 +40,21 @@ var seedInProgress = []seedRow{
 	{8, "user1", nil, nil},
 }
 
-// 已完成 9 条：advance 推到 state=20（分支无关）
+// 已完成 9 条：advance 推到 state=20（分支无关）。
+// issues/166 A（2026-10-11）：F5/F8/F9 补 finalAmount=8000——三行的 deptLeader 本是
+// 15 文件编号时代 11-assignee-vars 的判定变量，flows 目录插入 06-…-expire.json 后
+// define=12 已是 10-mixed-mode（八仓同序），决策边 finalAmount>5000/<=5000 没这把键
+// 无路可走；补键走 e8→boss→end（与旧蒙臂 edges[0] 同形），矩阵"9 行已完成"原意复原。
 var seedFinished = []seedRow{
 	{1, "userA", nil, []string{"user1", "director"}},
 	{8, "userB", nil, []string{"boss", "manager"}},
 	{2, "manager", nil, []string{"boss"}},
 	{10, "director", nil, nil},
-	{12, "userC", map[string]interface{}{"deptLeader": "leader"}, nil},
+	{12, "userC", map[string]interface{}{"deptLeader": "leader", "finalAmount": 8000}, nil},
 	{1, "director", nil, nil},
 	{5, "manager", nil, nil},
-	{12, "userA", map[string]interface{}{"deptLeader": "director"}, nil},
-	{12, "userB", map[string]interface{}{"deptLeader": "user1"}, nil},
+	{12, "userA", map[string]interface{}{"deptLeader": "director", "finalAmount": 8000}, nil},
+	{12, "userB", map[string]interface{}{"deptLeader": "user1", "finalAmount": 8000}, nil},
 }
 
 // 委托 8 条：8 个授权人各一条，谁登录「我的委托」都非空。

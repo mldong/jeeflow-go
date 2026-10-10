@@ -190,28 +190,29 @@ func (e *demoExprEval) Eval(expr string, vars map[string]interface{}) (interface
 		}
 		return false, nil
 	}
-	// 简单数值比较：amount > 1000, amount <= 1000
-	v, ok := vars["amount"]
-	if !ok {
-		return false, nil
-	}
-	amt, ok := toFloat(v)
-	if !ok {
-		return false, nil
-	}
-	switch expr {
-	case "amount > 1000":
-		return amt > 1000, nil
-	case "amount >= 1000":
-		return amt >= 1000, nil
-	case "amount < 1000":
-		return amt < 1000, nil
-	case "amount <= 1000":
-		return amt <= 1000, nil
-	case "amount == 1000":
-		return amt == 1000, nil
-	case "amount != 1000":
-		return amt != 1000, nil
+	// 简单数值比较：<变量> <运算符> <数字>，任意变量名（issues/166：种子 mixed-mode 的决策边
+	// 是 finalAmount > 5000 / <= 5000——旧形状硬编码只认 amount，种子修好后 F5/F8/F9 在这里
+	// 双双求 false、撞上 164 的零命中报错；generalize 成与 # 分支同一把尺子）
+	if m := demoCsRe.FindStringSubmatch(expr); m != nil {
+		val, _ := strconv.ParseFloat(m[3], 64)
+		av, ok := toFloat(vars[m[1]])
+		if !ok {
+			return false, nil
+		}
+		switch m[2] {
+		case ">":
+			return av > val, nil
+		case ">=":
+			return av >= val, nil
+		case "<":
+			return av < val, nil
+		case "<=":
+			return av <= val, nil
+		case "==":
+			return av == val, nil
+		case "!=":
+			return av != val, nil
+		}
 	}
 	return false, nil
 }

@@ -234,7 +234,12 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 			// 统一走 executeNode：结束节点也经节点执行链（拦截器/事件完整触发），
 			// executeNode 内部 TypeEnd 分支完成聚合根 Finish + 事件发布
 			// 建单不变量（issues/121 P1）：新任务的 parent＝本次刚办结的当前任务
-			e.executeNode(ctx, flow, inst, node, operator, vars, task.ID)
+			// issues/164：下游节点错误必须上抛（决策零命中 NOT_FOUND_NEXT_NODE 同档就
+			// 从这里冒到门面出口）——旧形状此处的 error 被丢弃 ⇒ 即便引擎报了错，
+			// 办理人看到的仍是 code=0"成功"（静默停住的管道半边）
+			if err := e.executeNode(ctx, flow, inst, node, operator, vars, task.ID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
@@ -829,7 +834,12 @@ func (e *EngineImpl) evaluateDecision(ctx context.Context, flow *model.FlowModel
 			}
 		}
 	}
-	return nil
+	// issues/164 A：零命中（两条 expr 边全 false / 变量缺失 / 零出边 / 自定义处理器未命中）
+	// ⇒ 显式报错，对齐 java `DecisionModel.exec` 尾部 `NOT_FOUND_NEXT_NODE`（20010001，
+	// 文案逐字；python issues/161 已走同一条路）。旧形状此处 return nil＝令牌不前进也不报错，
+	// 办理人看到 code=0"成功"、实例挂在 state=10 却没有任何人的待办（僵尸实例，issues/166
+	// 的种子三行就是被它骗过去的）。门面出口照旧统一 code=99999999 + msg 逐字。
+	return fmt.Errorf("decision节点无法确定下一步执行路线")
 }
 
 func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node *model.FlowNode, inst *model.ProcessInstance, operator string, vars map[string]interface{}, parentTaskID int64) error {
