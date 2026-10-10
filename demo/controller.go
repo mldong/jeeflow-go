@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -157,7 +159,37 @@ func (g *demoIDGen) NextID() int64 { g.n++; return g.n }
 
 type demoExprEval struct{}
 
+var demoCsRe = regexp.MustCompile(`^\s*#?(\w+)\s*(>=|<=|!=|==|>|<)\s*(\d+(?:\.\d+)?)\s*$`)
+
 func (e *demoExprEval) Eval(expr string, vars map[string]interface{}) (interface{}, error) {
+	// issues/163：`#` 前缀门控变量（会签放行条件，如 `#nrOfCompletedInstances>=2`）——
+	// 引擎并行分支已把 nrOfInstances / nrOfActivateInstances / nrOfCompletedInstances
+	// 以裸名并进求值原料（rust gate_vars 同款），剥掉 `#` 按裸名查即可（查不到判 false，
+	// 与 java SpEL catch ⇒ false 同档）
+	if strings.HasPrefix(strings.TrimSpace(expr), "#") {
+		if m := demoCsRe.FindStringSubmatch(expr); m != nil {
+			val, _ := strconv.ParseFloat(m[3], 64)
+			av, ok := toFloat(vars[m[1]])
+			if !ok {
+				return false, nil
+			}
+			switch m[2] {
+			case ">":
+				return av > val, nil
+			case ">=":
+				return av >= val, nil
+			case "<":
+				return av < val, nil
+			case "<=":
+				return av <= val, nil
+			case "==":
+				return av == val, nil
+			case "!=":
+				return av != val, nil
+			}
+		}
+		return false, nil
+	}
 	// 简单数值比较：amount > 1000, amount <= 1000
 	v, ok := vars["amount"]
 	if !ok {

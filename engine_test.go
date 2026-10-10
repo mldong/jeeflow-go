@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -44,7 +46,33 @@ func (g *testIDGen) NextID() int64 { g.n++; return g.n }
 
 type testExprEval struct{}
 
+// issues/163：会签门控 `#nrOf...` 求值——引擎以裸名并进求值原料，求值器剥 # 后查。
+var gateRe = regexp.MustCompile(`^\s*#(\w+)\s*(>=|<=|!=|==|>|<)\s*(\d+(?:\.\d+)?)\s*$`)
+
 func (e *testExprEval) Eval(expr string, vars map[string]interface{}) (interface{}, error) {
+	if m := gateRe.FindStringSubmatch(expr); m != nil {
+		raw, ok := vars[m[1]]
+		if !ok {
+			return false, nil
+		}
+		used := toFloat(raw)
+		val, _ := strconv.ParseFloat(m[3], 64)
+		switch m[2] {
+		case ">":
+			return used > val, nil
+		case ">=":
+			return used >= val, nil
+		case "<":
+			return used < val, nil
+		case "<=":
+			return used <= val, nil
+		case "==":
+			return used == val, nil
+		case "!=":
+			return used != val, nil
+		}
+		return false, nil
+	}
 	if v, ok := vars["amount"]; ok {
 		amt := toFloat(v)
 		if expr == "amount > 1000" {
@@ -282,6 +310,9 @@ func Test06CountersignSequential(t *testing.T) {
 	}
 }
 
+// issues/163：07 定义完成条件 `#nrOfCompletedInstances==2` 写成设计器的嵌套形
+// （properties.field 子对象），引擎按"顶层优先、嵌套兜底"读取后，两人同意即放行、
+// 剩余两人废弃——与 java JeeflowFullTest.test07CountersignRatio 同形。
 func Test07CountersignRatio(t *testing.T) {
 	eng, repo := setup()
 	def := registerFlow(repo, "07-countersign-ratio.json")
@@ -290,7 +321,7 @@ func Test07CountersignRatio(t *testing.T) {
 	if len(doing) != 4 {
 		t.Fatalf("expected 4, got %d", len(doing))
 	}
-	for _, a := range []string{"userA", "userB", "userC", "userD"} {
+	for _, a := range []string{"userA", "userB"} {
 		d, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
 		task := d[0]
 		repo.AddTaskActor(context.Background(), task.ID, []string{a})
@@ -300,6 +331,10 @@ func Test07CountersignRatio(t *testing.T) {
 	inst, _ = repo.FindInstanceByID(context.Background(), inst.ID)
 	if inst.State != model.InstanceStateDone {
 		t.Fatalf("expected done, got %d", inst.State)
+	}
+	rest, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	if len(rest) != 0 {
+		t.Fatalf("expected 0 doing after merge, got %d", len(rest))
 	}
 }
 
