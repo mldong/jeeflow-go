@@ -1114,7 +1114,7 @@ func (f *Facade) highLight(args map[string]interface{}) (interface{}, error) {
 		var flow model.FlowModel
 		if json.Unmarshal(def.Content, &flow) == nil {
 			nodeProgress = f.buildNodeProgress(&flow, his)
-			f.collectPath(&flow, "start", "", active, &history, &edges, map[string]bool{}, inst.Variables, his)
+			f.collectPath(&flow, "start", active, &history, &edges, map[string]bool{}, inst.Variables, his)
 		}
 	}
 	return map[string]interface{}{
@@ -1228,18 +1228,19 @@ func (f *Facade) buildNodeProgress(flow *model.FlowModel, tasks []*model.Process
 	return progress
 }
 
-// collectPath 从节点沿输出边递归（遇活跃节点停止），补全历史节点与边；
+// collectPath 从节点沿输出边递归（遇活跃节点停止深入），补全历史节点与边；
 // 决策节点输出边带 expr 时用表达式求值过滤（对齐 boot3 recursionModel，issues/06）
-func (f *Facade) collectPath(flow *model.FlowModel, nodeID, edgeName string, active []string,
+//
+// issues/157：边名收录在**源节点循环内**、活跃判断之前（逐字同位于 java
+// `JeeflowFacade.collectPath` 的 `edges.add(tm.getName())`）。此前是把边名当递归实参传的，
+// ⇒ 目标节点当前活跃的那条边既不下钻也不收录，流程图上"进当前待办的那一跳"永远是灰的。
+func (f *Facade) collectPath(flow *model.FlowModel, nodeID string, active []string,
 	history *[]string, edges *[]string, visited map[string]bool,
 	vars map[string]interface{}, historyTasks []*model.ProcessTask) {
 	if visited[nodeID] {
 		return
 	}
 	visited[nodeID] = true
-	if edgeName != "" && !containsStr(*edges, edgeName) {
-		*edges = append(*edges, edgeName)
-	}
 	src := findNodeIn(flow, nodeID)
 	for _, e := range flow.Edges {
 		if e.SourceNodeID != nodeID {
@@ -1253,6 +1254,9 @@ func (f *Facade) collectPath(flow *model.FlowModel, nodeID, edgeName string, act
 				}
 			}
 		}
+		if e.ID != "" && !containsStr(*edges, e.ID) {
+			*edges = append(*edges, e.ID)
+		}
 		target := findNodeIn(flow, e.TargetNodeID)
 		if target == nil {
 			continue
@@ -1261,9 +1265,9 @@ func (f *Facade) collectPath(flow *model.FlowModel, nodeID, edgeName string, act
 			*history = append(*history, target.ID)
 		}
 		if containsStr(active, target.ID) {
-			continue // 遇活跃节点停止深入
+			continue // 遇活跃节点停止深入（边名已在上面收录）
 		}
-		f.collectPath(flow, target.ID, e.ID, active, history, edges, visited, vars, historyTasks)
+		f.collectPath(flow, target.ID, active, history, edges, visited, vars, historyTasks)
 	}
 }
 

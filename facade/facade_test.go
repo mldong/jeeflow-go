@@ -1140,6 +1140,77 @@ func TestHighLightFiltersDecisionBranch(t *testing.T) {
 	}
 }
 
+// ═══ 指向活跃节点的那一跳也要进高亮（issues/157）═══
+
+// 夹具＝03-decision-expr.json：start → apply → task1 → decision1 →(e3 amount>1000 → task2 / e4 → task3) → end。
+// 与上面 03.5 的唯一区别＝本用例**停在分支上**（只办 task1，让 task2 处于活跃）：
+// 03.5 把分支也办完了，活跃集合为空 ⇒ 收录位置错了也照不出来。
+// 边名一旦只靠递归实参收录，e3 这一跳既不下钻也不收录 ⇒ 摘掉修复本用例即红。
+func TestHighLightCollectsEdgeIntoActiveNode(t *testing.T) {
+	f, repo, _ := setupFacade()
+	content := string(flowContent(t, "03-decision-expr.json"))
+	r := f.Flow("processDefine/deploy", map[string]interface{}{"content": content})
+	defineID := mustI64(r["data"].(map[string]interface{})["processDefineId"])
+
+	r = f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": defineID, "operator": "zhangsan", "amount": 5000,
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("startAndExecute failed: %v", r)
+	}
+	instanceID := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
+
+	doing, _ := repo.FindDoingTasks(context.Background(), instanceID, nil)
+	for _, tk := range doing {
+		if tk.TaskName == "task1" {
+			_ = repo.AddTaskActor(context.Background(), tk.ID, []string{"leader"})
+			r = f.Flow("processTask/execute", map[string]interface{}{
+				"processTaskId": tk.ID, "operator": "leader", "submitType": 1,
+			})
+			if code, _ := r["code"].(int); code != 0 {
+				t.Fatalf("execute task1 failed: %v", r)
+			}
+		}
+	}
+	// 夹具形状自证：必须停在 task2 活跃，否则本用例退化成"流已走完"（那是 03.5 的形状，恒真）
+	doing, _ = repo.FindDoingTasks(context.Background(), instanceID, nil)
+	still := []string{}
+	for _, tk := range doing {
+		still = append(still, tk.TaskName)
+	}
+	if len(still) != 1 || still[0] != "task2" {
+		t.Fatalf("夹具应停在 task2 活跃，实际: %v", still)
+	}
+
+	r = f.Flow("processInstance/highLight", map[string]interface{}{"id": instanceID})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("highLight failed: %v", r)
+	}
+	hl := r["data"].(map[string]interface{})
+	histEdges := toStrings(hl["historyEdgeNames"].([]interface{}))
+	activeNodes := toStrings(hl["activeNodeNames"].([]interface{}))
+	histNodes := toStrings(hl["historyNodeNames"].([]interface{}))
+
+	if !containsStr2(activeNodes, "task2") {
+		t.Fatalf("task2 应为活跃节点: %v", activeNodes)
+	}
+	if !containsStr2(histEdges, "e3") {
+		t.Fatalf("指向活跃节点 task2 的分支边 e3 没进高亮（issues/157）: %v", histEdges)
+	}
+	for _, e := range []string{"e0", "e_apply_1", "e2"} {
+		if !containsStr2(histEdges, e) {
+			t.Fatalf("线性腿边名 %s 缺失: %v", e, histEdges)
+		}
+	}
+	// e4＝没走的分支边；e5＝活跃节点自己的出边（遇活跃停止深入，不该收）
+	if containsStr2(histEdges, "e4") || containsStr2(histEdges, "e5") {
+		t.Fatalf("e4/e5 不应高亮: %v", histEdges)
+	}
+	if containsStr2(histNodes, "task3") {
+		t.Fatalf("未走分支节点 task3 不应进 historyNodeNames: %v", histNodes)
+	}
+}
+
 // ═══ 三个 detail 返回 jsonObject（issues/05-1）═══
 
 func TestDetailJsonObject(t *testing.T) {
