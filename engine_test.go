@@ -382,7 +382,7 @@ func Test10InterceptorAndEvents(t *testing.T) {
 			}, order: 1},
 		},
 		Listeners: []engine.ProcessEventListener{
-			func(evt engine.ProcessEvent) {
+			func(_ context.Context, evt engine.ProcessEvent) {
 				switch evt.Type {
 				case engine.EventProcessStart:
 					events = append(events, "start")
@@ -425,7 +425,7 @@ func Test14TaskCreateEvent(t *testing.T) {
 		var creates []engine.ProcessEvent
 		eng.SetExtensions(&engine.Extensions{
 			Listeners: []engine.ProcessEventListener{
-				func(evt engine.ProcessEvent) {
+				func(_ context.Context, evt engine.ProcessEvent) {
 					if evt.Type == engine.EventTaskCreate {
 						creates = append(creates, evt)
 					}
@@ -461,7 +461,7 @@ func Test14TaskCreateEvent(t *testing.T) {
 		var creates []engine.ProcessEvent
 		eng.SetExtensions(&engine.Extensions{
 			Listeners: []engine.ProcessEventListener{
-				func(evt engine.ProcessEvent) {
+				func(_ context.Context, evt engine.ProcessEvent) {
 					if evt.Type == engine.EventTaskCreate {
 						creates = append(creates, evt)
 					}
@@ -1099,7 +1099,7 @@ func errRollback(ctx context.Context, t *testing.T, eng *engine.EngineImpl, task
 // recordEvents 挂一支"把事件按到达顺序记下来"的监听器（§11.5 订阅形状＝列表）。
 func recordEvents(eng *engine.EngineImpl, sink *[]engine.ProcessEvent) {
 	eng.SetExtensions(&engine.Extensions{
-		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+		Listeners: []engine.ProcessEventListener{func(_ context.Context, evt engine.ProcessEvent) {
 			*sink = append(*sink, evt)
 		}},
 	})
@@ -1257,7 +1257,7 @@ func TestCcCreateOnExecuteLeg(t *testing.T) {
 		var ccEvts []engine.ProcessEvent
 		var rowsAtFire []int
 		eng.SetExtensions(&engine.Extensions{
-			Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+			Listeners: []engine.ProcessEventListener{func(_ context.Context, evt engine.ProcessEvent) {
 				if evt.Type != engine.EventCCCreate {
 					return
 				}
@@ -1462,8 +1462,8 @@ func TestListenerPanicDoesNotBreakMainFlow(t *testing.T) {
 	def := registerFlow(repo, "01-simple.json")
 	var secondCalled int
 	eng.SetExtensions(&engine.Extensions{Listeners: []engine.ProcessEventListener{
-		func(evt engine.ProcessEvent) { panic("listener boom") },
-		func(evt engine.ProcessEvent) { secondCalled++ },
+		func(_ context.Context, evt engine.ProcessEvent) { panic("listener boom") },
+		func(_ context.Context, evt engine.ProcessEvent) { secondCalled++ },
 	}})
 
 	inst, err := eng.StartProcessInstanceByID(ctx, def.ID, "applicant", nil)

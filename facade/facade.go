@@ -459,7 +459,7 @@ func (f *Facade) withdraw(ctx context.Context, args map[string]interface{}) erro
 	// 监听器（站内信/待办清理）按"办结"给发起人推一条错通知。
 	// 办结（executeNode TypeEnd → state 20/45）与拒绝（ExecuteAndJumpToEnd → state 45）两支的码 2
 	// 是"流程自己走到终点"，本轮不动。
-	f.engine.FireEvent(engine.ProcessEvent{
+	f.engine.FireEvent(ctx, engine.ProcessEvent{
 		Type: engine.EventTaskWithdraw, InstanceID: instanceID, Operator: operator,
 	})
 	return nil
@@ -1450,7 +1450,7 @@ func (f *Facade) createCCInstance(ctx context.Context, args map[string]interface
 	// 入参＝**实际新建的子集**而不是原始 actors（issues/141 G2）：重复抄送没发生"创建"
 	// ⇒ 不发码 4；子集为空整支不 fire（不空转、也不照旧全量 fire）。
 	for _, actor := range created {
-		f.engine.FireEvent(engine.ProcessEvent{
+		f.engine.FireEvent(ctx, engine.ProcessEvent{
 			Type: engine.EventCCCreate, InstanceID: instanceID, CcActorID: actor,
 		})
 	}
@@ -1830,7 +1830,7 @@ func (f *Facade) taskTransfer(ctx context.Context, args map[string]interface{}) 
 	}
 	// TASK_TRANSFER(7) / spec §11.3：任务参与者被替换并**落库之后** fire 一次
 	// （fromActor/toActor/operator 直传载荷，监听器免反查参与者表）。
-	f.engine.FireEvent(engine.ProcessEvent{
+	f.engine.FireEvent(ctx, engine.ProcessEvent{
 		Type: engine.EventTaskTransfer, InstanceID: task.ProcessInstanceID, TaskID: task.ID,
 		NodeID: task.TaskName, Operator: operator, FromActor: fromActor, ToActor: toActor,
 	})

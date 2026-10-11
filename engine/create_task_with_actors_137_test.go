@@ -69,7 +69,7 @@ func c137Harness(listeners *[]string) (*EngineImpl, *memory.Repository) {
 	repo := memory.New()
 	e := New(repo, c137UserProv{}, &c137IDGen{}, nil)
 	if listeners != nil {
-		e.SetExtensions(&Extensions{Listeners: []ProcessEventListener{func(evt ProcessEvent) {
+		e.SetExtensions(&Extensions{Listeners: []ProcessEventListener{func(_ context.Context, evt ProcessEvent) {
 			*listeners = append(*listeners, fmt.Sprintf("type=%d node=%s task=%d ops=[%s]",
 				int(evt.Type), evt.NodeID, evt.TaskID, strings.Join(evt.Actors, ",")))
 		}}})

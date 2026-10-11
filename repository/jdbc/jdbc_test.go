@@ -1155,7 +1155,7 @@ func TestCcOnExecuteLegPersistsRowsAndEvents(t *testing.T) {
 	var ccEvts []engine.ProcessEvent
 	var writesAtFire []int
 	eng.SetExtensions(&engine.Extensions{
-		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+		Listeners: []engine.ProcessEventListener{func(_ context.Context, evt engine.ProcessEvent) {
 			if evt.Type != engine.EventCCCreate {
 				return
 			}

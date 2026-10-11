@@ -88,7 +88,7 @@ func c142Setup(t *testing.T, name, content string, attachRegistry bool) *c142Har
 	var events []string
 	eng := engine.New(repo, c142UserProv{}, &c142IDGen{}, nil)
 	eng.SetExtensions(&engine.Extensions{
-		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+		Listeners: []engine.ProcessEventListener{func(_ context.Context, evt engine.ProcessEvent) {
 			events = append(events, fmt.Sprintf("%s:%s", evt.Type.SpecName(), evt.NodeID))
 		}},
 	})

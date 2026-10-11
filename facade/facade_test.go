@@ -2599,7 +2599,7 @@ func TestCCCreateEventPerActor(t *testing.T) {
 	var ccEvents []engine.ProcessEvent
 	eng.SetExtensions(&engine.Extensions{
 		Listeners: []engine.ProcessEventListener{
-			func(evt engine.ProcessEvent) {
+			func(_ context.Context, evt engine.ProcessEvent) {
 				if evt.Type == engine.EventCCCreate {
 					ccEvents = append(ccEvents, evt)
 				}
@@ -2677,7 +2677,7 @@ func TestCCCreateEventNoListenerPureIncremental(t *testing.T) {
 		t.Fatalf("无监听器时 cc 实例仍应落库: total=%d", total)
 	}
 	// 直接 FireEvent：无监听器零副作用、不抛错
-	eng.FireEvent(engine.ProcessEvent{Type: engine.EventCCCreate, InstanceID: instID, CcActorID: "cc_only"})
+	eng.FireEvent(context.Background(), engine.ProcessEvent{Type: engine.EventCCCreate, InstanceID: instID, CcActorID: "cc_only"})
 }
 
 // ═══ 撤回鉴权 / 转办（issues/114 · issues/115，spec 06 §processInstance/withdraw · §processTask/transfer）═══
@@ -3753,7 +3753,7 @@ func TestGateEventSequenceWithCcLeg(t *testing.T) {
 
 	var evts []engine.ProcessEvent
 	eng.SetExtensions(&engine.Extensions{
-		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+		Listeners: []engine.ProcessEventListener{func(_ context.Context, evt engine.ProcessEvent) {
 			evts = append(evts, evt)
 		}},
 	})
@@ -3891,7 +3891,7 @@ func TestCcLegStartAndManualLegsUnaffectedByNarrowing(t *testing.T) {
 
 	var evts []engine.ProcessEvent
 	eng.SetExtensions(&engine.Extensions{
-		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) { evts = append(evts, evt) }},
+		Listeners: []engine.ProcessEventListener{func(_ context.Context, evt engine.ProcessEvent) { evts = append(evts, evt) }},
 	})
 	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})
 	mustOk(t, r0)
@@ -4017,7 +4017,7 @@ func TestTransferAndWithdrawEventLegs(t *testing.T) {
 	var evts []engine.ProcessEvent
 	var transferActors []string
 	eng.SetExtensions(&engine.Extensions{
-		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+		Listeners: []engine.ProcessEventListener{func(_ context.Context, evt engine.ProcessEvent) {
 			if evt.Type == engine.EventTaskTransfer {
 				// fire 时机核（§11.2 原则 3）：此刻参与者表应已是 toActor、不再是 fromActor
 				transferActors, _ = repo.FindTaskActors(ctx, evt.TaskID)

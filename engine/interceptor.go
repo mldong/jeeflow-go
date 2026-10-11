@@ -201,7 +201,13 @@ func (p ProcessEvent) Payload() map[string]interface{} {
 // ProcessEventListener 事件监听器。
 // 订阅形状＝**监听器列表**（§11.2 原则 4 / §11.5）：一次 fire 送给全部已注册监听器，
 // 注册顺序＝回调顺序，不得"后注册覆盖前注册"。
-type ProcessEventListener func(event ProcessEvent)
+//
+// audit8 R9 145-3 补：监听器随事件收到**动作 ctx**（事务内 fire 时即绑定事务连接的 ctx）。
+// 「事件到达后反查任务/实例」的监听器（站内信腿等）必须用这个 ctx 走仓储——与 java
+// （事务线程绑定）／node（ALS 环境绑定）同宽；自造 context.Background() 会走池连接，
+// 读不到动作内未提交的行（spec/12 §12.2 接缝：同连接反查读到未提交数据＝预期行为，
+// 另一条连接读不到——集成方按此选型；2026-10-11 L2-11 实测的缺件路径即选错档）。
+type ProcessEventListener func(ctx context.Context, event ProcessEvent)
 
 // ─── Engine Extensions ─────────────────────────────────────────────────────────
 
@@ -295,7 +301,7 @@ func (e *EngineImpl) firePostInterceptors(ctx context.Context, node *model.FlowN
 // fireEvent 发布事件。
 // 兜底语义（issues/104 P2 统一口径）：单监听器 panic 只记录不传播——
 // 不得影响引擎主流程，也不得中断后续监听器（对齐 PHP per-listener catch）。
-func (e *EngineImpl) fireEvent(evt ProcessEvent) {
+func (e *EngineImpl) fireEvent(ctx context.Context, evt ProcessEvent) {
 	if e.ext == nil { return }
 	for _, l := range e.ext.Listeners {
 		func() {
@@ -305,7 +311,7 @@ func (e *EngineImpl) fireEvent(evt ProcessEvent) {
 						int(evt.Type), evt.Type.SpecName(), evt.InstanceID, r)
 				}
 			}()
-			l(evt)
+			l(ctx, evt)
 		}()
 	}
 }
@@ -313,8 +319,9 @@ func (e *EngineImpl) fireEvent(evt ProcessEvent) {
 // FireEvent 公开事件发布入口（facade 层事件源调用，issues/102 CC_CREATE）：
 // Go 栈的 cc 实例创建在 facade（CreateCcInstance），fire 通道在引擎侧私有，
 // 故 facade 经此入口发布事件——纯增量：未装配 Extensions/监听器时零副作用。
-func (e *EngineImpl) FireEvent(evt ProcessEvent) {
-	e.fireEvent(evt)
+// audit8 R9 145-3：ctx 随事件透传（门面动作级事务内 fire ⇒ 监听器反查同连接）。
+func (e *EngineImpl) FireEvent(ctx context.Context, evt ProcessEvent) {
+	e.fireEvent(ctx, evt)
 }
 
 // ─── 抄送腿（spec 11-events §11.7 / issues/127）───────────────────────────────
@@ -359,16 +366,17 @@ func (e *EngineImpl) HandleCcActors(ctx context.Context, instanceID int64, opera
 	if len(created) == 0 {
 		return nil // 全是重复抄送 ⇒ 没有"创建"这个事实，整支不发码 4
 	}
-	e.notifyCcCreate(instanceID, created)
+	e.notifyCcCreate(ctx, instanceID, created)
 	return nil
 }
 
 // notifyCcCreate CC_CREATE 逐抄送人 fire（与 CreateCcInstance 逐行 INSERT 一一对应）。
 // Operator 不带——事件体的"操作人"语义留给办理人/发起人，抄送人只走 CcActorID（对齐 Java）。
 // 入参必须是仓储 CreateCcInstanceIfAbsent 返回的实际新建子集（issues/141 G2）。
-func (e *EngineImpl) notifyCcCreate(instanceID int64, actors []string) {
+// audit8 R9 145-3：ctx 透传给监听器（站内信腿反查走同连接）。
+func (e *EngineImpl) notifyCcCreate(ctx context.Context, instanceID int64, actors []string) {
 	for _, actor := range actors {
-		e.fireEvent(ProcessEvent{Type: EventCCCreate, InstanceID: instanceID, CcActorID: actor})
+		e.fireEvent(ctx, ProcessEvent{Type: EventCCCreate, InstanceID: instanceID, CcActorID: actor})
 	}
 }
 

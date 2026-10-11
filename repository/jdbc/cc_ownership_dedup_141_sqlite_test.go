@@ -147,7 +147,7 @@ func newCc141Facade(t *testing.T, db *sql.DB) (*facade.Facade, *jdbc.Repository,
 	eng := engine.New(repo, &noopUserProvider{}, idGen, nil)
 	events := &[]engine.ProcessEvent{}
 	eng.SetExtensions(&engine.Extensions{
-		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+		Listeners: []engine.ProcessEventListener{func(_ context.Context, evt engine.ProcessEvent) {
 			if evt.Type == engine.EventCCCreate {
 				*events = append(*events, evt)
 			}

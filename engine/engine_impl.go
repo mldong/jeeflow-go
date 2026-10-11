@@ -106,7 +106,7 @@ func (e *EngineImpl) startProcessInstanceByIDInner(ctx context.Context, defineID
 	applyInstanceExpireTime(inst, flow.ExpireTime, vars)
 	e.repo.SaveInstance(ctx, inst)
 	// PROCESS_INSTANCE_START(1)：实例行 insert 之后 fire（§11.3 触发时机列）
-	e.fireEvent(ProcessEvent{Type: EventProcessInstanceStart, InstanceID: inst.ID, Operator: operator})
+	e.fireEvent(ctx, ProcessEvent{Type: EventProcessInstanceStart, InstanceID: inst.ID, Operator: operator})
 
 	startNode := findNodeByType(&flow, model.TypeStart)
 	if startNode == nil {
@@ -208,7 +208,7 @@ func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, 
 					// issues/116：顺序会签推进的新任务同样在建单期并入生效委托代理人
 					e.saveNewTask(ctx, nt, e.surrogateProcessName(ctx, flow, inst))
 					// PROCESS_TASK_START：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
-					e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID,
+					e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID,
 						NodeID: curNode.ID, Operator: operator, Actors: nt.ActorIDs})
 					inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
 					return inst, nil
@@ -329,7 +329,7 @@ func (e *EngineImpl) executeAndJumpToEndInner(ctx context.Context, taskID int64,
 	// 实例终态统一 PROCESS_INSTANCE_END(2)，靠载荷 state 分（§11.6：旧 EventProcessReject
 	// 那一支"实例级拒绝"并入 2；任务级退回在 prepareExecuteTask 已发 TASK_REJECT(6)）。
 	// 任务退回(6) 与本支(2) 不互斥——两个事实：任务被拒 + 实例进终态。
-	e.fireEvent(ProcessEvent{Type: EventProcessInstanceEnd, InstanceID: inst.ID,
+	e.fireEvent(ctx, ProcessEvent{Type: EventProcessInstanceEnd, InstanceID: inst.ID,
 		TaskID: taskID, Operator: operator, State: int(inst.State)})
 	inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
 	return inst, nil
@@ -492,7 +492,7 @@ func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, opera
 	if isRejectSubmitType(vars[KeySubmitType]) {
 		evt.Type = EventTaskReject
 	}
-	e.fireEvent(evt)
+	e.fireEvent(ctx, evt)
 
 	// issues/97：实例变量写回排除操作人 u_*，保留 start 注入的发起人 u_*（u_realName 恒为发起人）
 	inst.Variables = mergeExecIntoInstance(baseVars, vars)
@@ -575,7 +575,7 @@ func (e *EngineImpl) rollbackToParent(ctx context.Context, flow *model.FlowModel
 	applyExpireTime(nt, expireExprOf(findNode(flow, task.TaskName)), nt.Variables)
 	pn := e.surrogateProcessName(ctx, flow, inst)
 	e.saveNewTask(ctx, nt, pn)
-	e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID,
+	e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID,
 		NodeID: prev.ID, Operator: operator, Actors: nt.ActorIDs})
 	return nil
 }
@@ -673,7 +673,7 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 		nt := inst.CreateTaskWithActors(e.nextID(), node.ID, node.Text.Value, nil, operator, form, now, parentTaskID, isFirst, pt)
 		applyExpireTime(nt, expr, inst.Variables)
 		e.saveNewTask(ctx, nt, pn)
-		e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+		e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 		return nil
 	}
 
@@ -685,7 +685,7 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 				// issues/126 案 A 写点：并行会签**全员**逐条按节点表达式算到期时间
 				applyExpireTime(nt, expr, inst.Variables)
 				e.saveNewTask(ctx, nt, pn)
-				e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+				e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 			}
 		case "SEQUENTIAL":
 			nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actors[0], operator, form, now, parentTaskID, isFirst, 1)
@@ -698,14 +698,14 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 			// issues/126 案 A 写点：串行会签**首位成员**按节点表达式算到期时间
 			applyExpireTime(nt, expr, inst.Variables)
 			e.saveNewTask(ctx, nt, pn)
-			e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+			e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 		default:
 			for _, actor := range actors {
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
 				// issues/126 案 A 写点：未知 countersignType 兜底分支也按逐人建单，同样要算
 				applyExpireTime(nt, expr, inst.Variables)
 				e.saveNewTask(ctx, nt, pn)
-				e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+				e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 			}
 		}
 		return nil
@@ -717,7 +717,7 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 	// issues/126 案 A 写点：普通建单（显式参与者入口）按节点表达式算到期时间
 	applyExpireTime(nt, expr, inst.Variables)
 	e.saveNewTask(ctx, nt, pn)
-	e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+	e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 	return nil
 }
 
@@ -847,7 +847,7 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 		}
 		// PROCESS_INSTANCE_END(2)：实例 state 落库（20 办结 / 45 拒绝）之后 fire，
 		// state 进载荷——§11.6「实例终态统一 2，办结/拒绝靠 state 分」
-		e.fireEvent(ProcessEvent{Type: EventProcessInstanceEnd, InstanceID: inst.ID,
+		e.fireEvent(ctx, ProcessEvent{Type: EventProcessInstanceEnd, InstanceID: inst.ID,
 			NodeID: node.ID, Operator: operator, State: int(inst.State)})
 		return nil
 	}
@@ -960,7 +960,7 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 		e.saveNewTask(ctx, nt, pn)
 		// 码 3 照发：这条行的事实是"这一格产生了新的待办占位"（java 的 notifyTaskStart
 		// 对 persistTasks 里每一条 saveNewTask 都播，不看参与者空不空）
-		e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+		e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 		return nil
 	}
 
@@ -974,7 +974,7 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 				applyExpireTime(nt, expr, inst.Variables)
 				e.saveNewTask(ctx, nt, pn)
 				// TASK_CREATE：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
-				e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+				e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 			}
 		case "SEQUENTIAL":
 			// 顺序会签任务也是会签任务（issues/57 E29 修正：仅普通分支默认 0）
@@ -988,14 +988,14 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 			// issues/126 案 A 写点：串行会签**首位成员**按节点表达式算到期时间
 			applyExpireTime(nt, expr, inst.Variables)
 			e.saveNewTask(ctx, nt, pn)
-			e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+			e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 		default:
 			for _, actor := range actors {
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
 				// issues/126 案 A 写点：未知 countersignType 兜底分支也按逐人建单，同样要算
 				applyExpireTime(nt, expr, inst.Variables)
 				e.saveNewTask(ctx, nt, pn)
-				e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+				e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 			}
 		}
 		return nil
@@ -1010,7 +1010,7 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 	applyExpireTime(nt, expr, inst.Variables)
 	// issues/116：委托代理在**参与者落库前**并入（见 engine/surrogate.go），随任务一起落库
 	e.saveNewTask(ctx, nt, pn)
-	e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
+	e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID, NodeID: node.ID, Operator: operator, Actors: nt.ActorIDs})
 	return nil
 }
 

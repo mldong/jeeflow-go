@@ -34,7 +34,7 @@ func setupCc141(t *testing.T) (*facade.Facade, *memory.Repository, *[]engine.Pro
 	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
 	events := &[]engine.ProcessEvent{}
 	eng.SetExtensions(&engine.Extensions{
-		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+		Listeners: []engine.ProcessEventListener{func(_ context.Context, evt engine.ProcessEvent) {
 			if evt.Type == engine.EventCCCreate {
 				*events = append(*events, evt)
 			}

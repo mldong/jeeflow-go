@@ -4,7 +4,7 @@
 //
 //	go test ./repository/jdbc/ -run 'TestTxTier145' -v
 //
-// 覆盖六格：
+// 覆盖七格：
 //  1. 空转档——事务内写：同事务连接读得到 / 独立连接提交前读不到 / 回滚后不存在
 //  2. 原子档——引擎入口（ExecuteProcessTask；真实发起作前置）：任务完成写（写#1）之后
 //     抄送漏斗（写#2）注入失败 ⇒ 任务行回到 DOING＋实例仍 DOING＋cc 零残留（动作内写整体回滚）
@@ -16,13 +16,16 @@
 //  5. ext 腿——主仓+扩展仓同 ctx 同事务：回滚双消失 / 提交双落库
 //  6. persist 腿（C99 ⑥）——SYNC 流 + 真 PersistPostInterceptor：writer 注 TxFromCtx ⇒ 业务行随
 //     动作回滚（并入）；不注 ⇒ 行逃逸留存（§12.1 条 4 允许降级运行态＝集成方必须显式接线的理由）
+//  7. 监听器读侧（spec/12 §12.2 接缝"监听器用同一连接反查读到未提交数据"）——
+//     真库监听器收 EventProcessTaskStart：断言事件 ctx 绑定动作事务（TxFromContext 命中）
+//     且同一 ctx 反查 FindTaskByID 读得到动作内未提交的任务行（goframe 壳 L2-11 缺件根因）
 //
 // 注入点＝tier145FlakyRepo 两处（都位于"真中途"且错误真传播）：
 //   - 抄送漏斗 CreateCcInstanceIfAbsent（②③）：任务完成写之后、persist 的 fire 之前；
 //   - 实例终结写 UpdateInstance（⑥）：办理拍的 persist 已写业务行之后（end 节点 Finish 写）。
 //
 // 不注入引擎 SaveTask 的原因：saveNewTask 的调用点全仓吞错，动作不会报失败，做不出判据
-// （吞错属另一族缺陷，不在本切片手术面）。
+// （吞错属另一族缺陷，已另立案 175，不在本切片手术面）。
 //
 // 阳性对照（当轮逐处摘除并已字节级还原；红样原文）：
 //
@@ -32,7 +35,9 @@
 //	  「动作档…实例行必须随动作整体回滚（实得 1）」「persist 腿：并入事务的业务行必须随动作回滚（实得 1）」；
 //	摘门面 inTx ⇒ ③ 红：「动作档…实例行必须随动作整体回滚（实得 1）」；
 //	摘 writer 的 TxFromCtx 命中 ⇒ ①④⑥ 红：「空转档：独立连接提交前必须读不到（实得 1）」
-//	  「归属档：A 回滚后其行必须不在（实得 1）」「persist 腿：…必须随动作回滚（实得 1）」。
+//	  「归属档：A 回滚后其行必须不在（实得 1）」「persist 腿：…必须随动作回滚（实得 1）」；
+//	剔事件 ctx 透传（监听器回调改回 context.Background()）⇒ ⑦ 红：
+//	  「监听器[0] ctx 未绑定动作事务（事件应透传 fire 时点的动作 ctx）」。
 package jdbc_test
 
 import (
@@ -499,5 +504,62 @@ func TestTxTier145PersistWriterJoinsActionTx(t *testing.T) {
 	// ⑥-b 不注入（降级运行态）⇒ 行逃逸留存：锁定对照，证明 ⑥-a 那格测的不是空气
 	if n := run(tagEscape, false); n != 1 {
 		t.Fatalf("persist 腿：未注入 TxFromCtx 时行应逃逸留存 1（降级运行态红样），实得 %d", n)
+	}
+}
+
+// ─── ⑦ 监听器腿（L2-11 机制钉） ──────────────────────────────────────────────
+
+func TestTxTier145ListenerSeesActionDataViaEventCtx(t *testing.T) {
+	// 监听器随事件收到**动作 ctx**；事务内 fire 的监听器用该 ctx 反查，应读得到"动作内未提交"的行
+	// （spec/12 §12.2 接缝"同连接反查"档——与 java 事务线程绑定／node ALS 环境绑定同宽）。
+	// 反察（红样形态）：监听器自造 context.Background() 走池连接 ⇒ 读不到 ⇒ 站内信 TODO 缺件
+	// （2026-10-11 L2-11 真机实测的缺件路径；goframe 候选 49/1 即此）。
+	db := openDB(t)
+	defer db.Close()
+	tier145Cleanup(t, db)
+	defer tier145Cleanup(t, db)
+
+	insertDefine(t, db, "go-simple", loadFlow(t, "01-simple.json"))
+	ctx := context.Background()
+	repo := jdbc.New(db)
+	eng := newEngine(t, repo)
+
+	type obs struct {
+		txBound   bool
+		taskFound bool
+	}
+	var got []obs
+	eng.SetExtensions(&engine.Extensions{
+		Listeners: []engine.ProcessEventListener{
+			func(ctx context.Context, evt engine.ProcessEvent) {
+				if evt.Type != engine.EventProcessTaskStart || evt.TaskID == 0 {
+					return
+				}
+				_, txBound := jdbc.TxFromContext(ctx)
+				task, err := repo.FindTaskByID(ctx, evt.TaskID)
+				if err != nil {
+					t.Errorf("监听器反查读失败: %v", err)
+					return
+				}
+				got = append(got, obs{txBound: txBound, taskFound: task != nil})
+			},
+		},
+	})
+
+	// 裸引擎入口（动作事务由入口自持）——fire 发生在提交之前，正是"读得到未提交"的窗口
+	if _, err := eng.StartProcessInstanceByID(ctx, defineID, "zhangsan", nil); err != nil {
+		t.Fatalf("发起应成功: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatalf("TASK_START 监听器必须被 fire（实得 0 次）")
+	}
+	for i, o := range got {
+		if !o.txBound {
+			t.Fatalf("监听器[%d] ctx 未绑定动作事务（事件应透传 fire 时点的动作 ctx）", i)
+		}
+		if !o.taskFound {
+			t.Fatalf("监听器[%d] 同连接反查必须读到动作内未提交的任务行（实得 nil）——"+
+				"自造 Background 走池连接会读不到（spec/12 §12.2 接缝另一档，L2-11 缺件形态）", i)
+		}
 	}
 }

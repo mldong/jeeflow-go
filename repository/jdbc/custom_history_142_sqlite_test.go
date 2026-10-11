@@ -99,7 +99,7 @@ func c142NewEngine(t *testing.T, db *sql.DB, events *[]string) (*engine.EngineIm
 	eng := engine.New(repo, &noopUserProvider{},
 		&tsIDGen{base: time.Now().UnixMilli()*4000 + testStackSeq*1000}, nil)
 	eng.SetExtensions(&engine.Extensions{
-		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
+		Listeners: []engine.ProcessEventListener{func(_ context.Context, evt engine.ProcessEvent) {
 			if events != nil {
 				*events = append(*events, evt.Type.SpecName()+":"+evt.NodeID)
 			}

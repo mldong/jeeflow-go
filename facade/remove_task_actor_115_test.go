@@ -153,7 +153,7 @@ func r115Setup(t *testing.T) *r115Env {
 	rec := &r115Recorder{}
 	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
 	eng.SetExtensions(&engine.Extensions{
-		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) { rec.add(evt) }},
+		Listeners: []engine.ProcessEventListener{func(_ context.Context, evt engine.ProcessEvent) { rec.add(evt) }},
 	})
 	f := facade.New(eng, repo, extRepo)
 	r0 := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))})

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -9,10 +10,10 @@ import (
 func TestFireEventListenerPanicIsolated(t *testing.T) {
 	var called []string
 	e := &EngineImpl{ext: &Extensions{Listeners: []ProcessEventListener{
-		func(evt ProcessEvent) { panic("boom") },
-		func(evt ProcessEvent) { called = append(called, "second") },
+		func(_ context.Context, evt ProcessEvent) { panic("boom") },
+		func(_ context.Context, evt ProcessEvent) { called = append(called, "second") },
 	}}}
-	e.fireEvent(ProcessEvent{Type: EventProcessStart, InstanceID: 1})
+	e.fireEvent(context.Background(), ProcessEvent{Type: EventProcessStart, InstanceID: 1})
 	if len(called) != 1 {
 		t.Fatalf("panic 后后续监听器应仍被调用，实际 %v", called)
 	}
@@ -113,11 +114,11 @@ func TestProcessEventPayloadSpecKeys(t *testing.T) {
 func TestFireEventBroadcastsToListenersInRegistrationOrder(t *testing.T) {
 	var order []string
 	e := &EngineImpl{ext: &Extensions{Listeners: []ProcessEventListener{
-		func(evt ProcessEvent) { order = append(order, "first") },
-		func(evt ProcessEvent) { order = append(order, "second") },
-		func(evt ProcessEvent) { order = append(order, "third") },
+		func(_ context.Context, evt ProcessEvent) { order = append(order, "first") },
+		func(_ context.Context, evt ProcessEvent) { order = append(order, "second") },
+		func(_ context.Context, evt ProcessEvent) { order = append(order, "third") },
 	}}}
-	e.fireEvent(ProcessEvent{Type: EventCCCreate, InstanceID: 1, CcActorID: "cc"})
+	e.fireEvent(context.Background(), ProcessEvent{Type: EventCCCreate, InstanceID: 1, CcActorID: "cc"})
 	want := []string{"first", "second", "third"}
 	if strings.Join(order, ",") != strings.Join(want, ",") {
 		t.Fatalf("监听器应按注册顺序全部回调，实得 %v want %v", order, want)
@@ -126,6 +127,6 @@ func TestFireEventBroadcastsToListenersInRegistrationOrder(t *testing.T) {
 
 // TestFireEventWithoutListenersIsSafe §11.5「零注册时 fire 必须安全返回（不得空指针/panic）」。
 func TestFireEventWithoutListenersIsSafe(t *testing.T) {
-	(&EngineImpl{}).fireEvent(ProcessEvent{Type: EventTaskTransfer})                // Extensions 未装配
-	(&EngineImpl{ext: &Extensions{}}).fireEvent(ProcessEvent{Type: EventCCCreate}) // 装配了但零监听器
+	(&EngineImpl{}).fireEvent(context.Background(), ProcessEvent{Type: EventTaskTransfer})                // Extensions 未装配
+	(&EngineImpl{ext: &Extensions{}}).fireEvent(context.Background(), ProcessEvent{Type: EventCCCreate}) // 装配了但零监听器
 }
