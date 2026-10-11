@@ -95,106 +95,20 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 	if args == nil {
 		args = map[string]interface{}{}
 	}
+	// audit8 R9 145-3（spec/12 §12.2 原子面）：整次 dispatch 收进一个事务——门面自组复合写
+	// （startAndExecute＝发起＋抄送＋参与者＋办理四拍；redeploy＝define＋design 两拍等）与引擎
+	// 入口写同处一事务，中途失败整体回滚。**信封在事务外生成**：非成功出口先回滚、再由门面
+	// 转错误信封（spec §12.2 宿主外包硬义务①在本栈的等价物——引擎内包这一派本就在错误处回滚）。
+	// 嵌套并入引擎入口自己的包裹（spec §12.2 归属面）；内存仓等无事务载体时显式降级裸跑
+	// （spec §12.1 条 4 允许运行态，不是契约默认值）。
+	ctx := context.Background()
 	var err error
 	var data interface{}
-	switch action {
-	case "processDefine/page":
-		data, err = f.definePage(args)
-	case "processDefine/detail":
-		data, err = f.defineDetail(args)
-	case "processDefine/startAndExecute":
-		data, err = f.startAndExecute(args)
-	case "processDefine/deploy":
-		data, err = f.deploy(args)
-	case "processDefine/redeploy":
-		err = f.redeploy(args)
-	case "processDefine/remove":
-		err = f.removeDefine(args)
-	case "processDefine/upAndDown":
-		err = f.upAndDown(args)
-	case "processInstance/page":
-		data, err = f.instancePage(args)
-	case "processInstance/detail":
-		data, err = f.instanceDetail(args)
-	case "processInstance/startAndExecute":
-		data, err = f.startAndExecute(args)
-	case "processInstance/withdraw":
-		err = f.withdraw(args)
-	case "processTask/execute":
-		err = f.execute(args)
-	case "processTask/todoList":
-		data, err = f.todoList(args)
-	case "processTask/doneList":
-		data, err = f.doneList(args)
-	case "processDesign/page":
-		data, err = f.designPage(args)
-	case "processDesign/detail":
-		data, err = f.designDetail(args)
-	case "processDesign/save":
-		data, err = f.designSave(args)
-	case "processDesign/update":
-		err = f.designUpdate(args)
-	case "processDesign/updateDefine":
-		err = f.designUpdateDefine(args)
-	case "processDesign/remove":
-		err = f.designRemove(args)
-	case "processDesign/deploy":
-		data, err = f.designDeploy(args)
-	case "processDesign/redeploy":
-		data, err = f.designRedeploy(args)
-	case "processDesign/listByType":
-		data, err = f.designListByType(args)
-	case "processInstance/bizData":
-		data, err = f.bizData(args)
-	case "processSurrogate/page":
-		data, err = f.surrogatePage(args)
-	case "processSurrogate/save":
-		data, err = f.surrogateSave(args)
-	case "processSurrogate/update":
-		data, err = f.surrogateUpdate(args) // issues/77
-	case "processSurrogate/detail":
-		data, err = f.surrogateDetail(args) // issues/77
-	case "processSurrogate/remove":
-		err = f.surrogateRemove(args)
-	case "processDefine/getLastByName":
-		data, err = f.getLastByName(args)
-	case "processInstance/highLight":
-		data, err = f.highLight(args)
-	case "processInstance/approvalRecord":
-		data, err = f.approvalRecord(args)
-	case "processInstance/getAssigneeTextData":
-		data, err = f.getAssigneeTextData(args)
-	case "processInstance/createCCInstance":
-		err = f.createCCInstance(args)
-	case "processInstance/updateCCStatus":
-		err = f.updateCCStatus(args)
-	case "processInstance/ccList":
-		data, err = f.ccList(args)
-	case "processTask/detail":
-		data, err = f.taskDetail(args)
-	case "processTask/jumpAbleTaskNameList":
-		data, err = f.jumpAbleTaskNameList(args)
-	case "processTask/candidatePage":
-		data, err = f.candidatePage(args)
-	case "processTask/surrogate":
-		err = f.taskAddActor(args)
-	case "processTask/addCandidate":
-		err = f.taskAddActor(args)
-	case "processTask/transfer":
-		err = f.taskTransfer(args)
-	case "processTask/removeTaskActor":
-		err = f.taskRemoveActor(args)
-	case "processTask/latest":
-		data, err = f.taskLatest(args)
-	case "processInstance/stats/overview":
-		data, err = f.statsOverview(args)
-	case "processInstance/stats/trend":
-		data, err = f.statsTrend(args)
-	case "processInstance/stats/group":
-		data, err = f.statsGroup(args)
-	default:
-		return errorResult("未知 action: " + action)
-	}
+	err = f.inTx(ctx, func(ctx context.Context) error {
+		var derr error
+		data, derr = f.dispatch(ctx, action, args)
+		return derr
+	})
 	if err != nil {
 		// issues/137 §3-1（spec 06-facade.md §2.12）：门面是所有内部 error 的共性通道，
 		// 但"捕获到 ≠ 原文外透"。判别式（isForeignDetail，见 internal_failure.go）判
@@ -208,9 +122,124 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 	return okResult(stringifyIDs(data))
 }
 
+// inTx 门面动作级事务包裹（audit8 R9 145-3，承引擎 InTx）：整次 dispatch 一个事务，
+// 嵌套调用（门面包裹 → 引擎入口包裹）经仓储 WithTx 并入最外层；无引擎/无事务载体显式降级。
+func (f *Facade) inTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	if f.engine != nil {
+		return f.engine.InTx(ctx, fn)
+	}
+	return fn(ctx)
+}
+
+// dispatch 动作分派——一次动作的调用作用域（ctx 为事务包裹内的那一个，spec/12 §12.2 归属面）。
+// 未知 action 返回 error，经 Flow 既有出口转「未知 action: xxx」信封（与旧形式同串，逐字不变）。
+func (f *Facade) dispatch(ctx context.Context, action string, args map[string]interface{}) (interface{}, error) {
+	var err error
+	var data interface{}
+	switch action {
+	case "processDefine/page":
+		data, err = f.definePage(ctx, args)
+	case "processDefine/detail":
+		data, err = f.defineDetail(ctx, args)
+	case "processDefine/startAndExecute":
+		data, err = f.startAndExecute(ctx, args)
+	case "processDefine/deploy":
+		data, err = f.deploy(ctx, args)
+	case "processDefine/redeploy":
+		err = f.redeploy(ctx, args)
+	case "processDefine/remove":
+		err = f.removeDefine(ctx, args)
+	case "processDefine/upAndDown":
+		err = f.upAndDown(ctx, args)
+	case "processInstance/page":
+		data, err = f.instancePage(ctx, args)
+	case "processInstance/detail":
+		data, err = f.instanceDetail(ctx, args)
+	case "processInstance/startAndExecute":
+		data, err = f.startAndExecute(ctx, args)
+	case "processInstance/withdraw":
+		err = f.withdraw(ctx, args)
+	case "processTask/execute":
+		err = f.execute(ctx, args)
+	case "processTask/todoList":
+		data, err = f.todoList(ctx, args)
+	case "processTask/doneList":
+		data, err = f.doneList(ctx, args)
+	case "processDesign/page":
+		data, err = f.designPage(ctx, args)
+	case "processDesign/detail":
+		data, err = f.designDetail(ctx, args)
+	case "processDesign/save":
+		data, err = f.designSave(ctx, args)
+	case "processDesign/update":
+		err = f.designUpdate(ctx, args)
+	case "processDesign/updateDefine":
+		err = f.designUpdateDefine(ctx, args)
+	case "processDesign/remove":
+		err = f.designRemove(ctx, args)
+	case "processDesign/deploy":
+		data, err = f.designDeploy(ctx, args)
+	case "processDesign/redeploy":
+		data, err = f.designRedeploy(ctx, args)
+	case "processDesign/listByType":
+		data, err = f.designListByType(ctx, args)
+	case "processInstance/bizData":
+		data, err = f.bizData(ctx, args)
+	case "processSurrogate/page":
+		data, err = f.surrogatePage(ctx, args)
+	case "processSurrogate/save":
+		data, err = f.surrogateSave(ctx, args)
+	case "processSurrogate/update":
+		data, err = f.surrogateUpdate(ctx, args) // issues/77
+	case "processSurrogate/detail":
+		data, err = f.surrogateDetail(ctx, args) // issues/77
+	case "processSurrogate/remove":
+		err = f.surrogateRemove(ctx, args)
+	case "processDefine/getLastByName":
+		data, err = f.getLastByName(ctx, args)
+	case "processInstance/highLight":
+		data, err = f.highLight(ctx, args)
+	case "processInstance/approvalRecord":
+		data, err = f.approvalRecord(ctx, args)
+	case "processInstance/getAssigneeTextData":
+		data, err = f.getAssigneeTextData(ctx, args)
+	case "processInstance/createCCInstance":
+		err = f.createCCInstance(ctx, args)
+	case "processInstance/updateCCStatus":
+		err = f.updateCCStatus(ctx, args)
+	case "processInstance/ccList":
+		data, err = f.ccList(ctx, args)
+	case "processTask/detail":
+		data, err = f.taskDetail(ctx, args)
+	case "processTask/jumpAbleTaskNameList":
+		data, err = f.jumpAbleTaskNameList(ctx, args)
+	case "processTask/candidatePage":
+		data, err = f.candidatePage(ctx, args)
+	case "processTask/surrogate":
+		err = f.taskAddActor(ctx, args)
+	case "processTask/addCandidate":
+		err = f.taskAddActor(ctx, args)
+	case "processTask/transfer":
+		err = f.taskTransfer(ctx, args)
+	case "processTask/removeTaskActor":
+		err = f.taskRemoveActor(ctx, args)
+	case "processTask/latest":
+		data, err = f.taskLatest(ctx, args)
+	case "processInstance/stats/overview":
+		data, err = f.statsOverview(ctx, args)
+	case "processInstance/stats/trend":
+		data, err = f.statsTrend(ctx, args)
+	case "processInstance/stats/group":
+		data, err = f.statsGroup(ctx, args)
+	default:
+		return nil, fmt.Errorf("未知 action: %s", action)
+	}
+	return data, err
+}
+
 // ═══ 流程定义 / 实例 ═══
 
-func (f *Facade) startAndExecute(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) startAndExecute(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	defineID, err := toInt64(args["processDefineId"])
 	if err != nil {
 		return nil, fmt.Errorf("processDefineId 缺失或非法: %v", err)
@@ -223,7 +252,7 @@ func (f *Facade) startAndExecute(args map[string]interface{}) (interface{}, erro
 		}
 		flowArgs[k] = v
 	}
-	inst, err := f.engine.StartProcessInstanceByID(context.Background(), defineID, operator, flowArgs)
+	inst, err := f.engine.StartProcessInstanceByID(ctx, defineID, operator, flowArgs)
 	if err != nil {
 		return nil, err
 	}
@@ -231,22 +260,22 @@ func (f *Facade) startAndExecute(args map[string]interface{}) (interface{}, erro
 	// 与办理腿（tf_ccActors）、手动腿（createCCInstance）共用引擎侧单一漏斗 HandleCcActors：
 	// 建 wf_process_cc_instance 行 → **落库后**逐抄送人 fire CC_CREATE（基准＝Java handleCcActors
 	// → notifyCcCreate，ccActorId 直传事件体）。不带 f_ccActors ⇒ 零写入零 fire，行为与历史一致。
-	if err := f.engine.HandleCcActors(context.Background(), inst.ID, operator, flowArgs[engine.KeyCcActorsStart]); err != nil {
+	if err := f.engine.HandleCcActors(ctx, inst.ID, operator, flowArgs[engine.KeyCcActorsStart]); err != nil {
 		return nil, err
 	}
 	// startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
-	doing, err := f.repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	doing, err := f.repo.FindDoingTasks(ctx, inst.ID, nil)
 	if err != nil {
 		return nil, err
 	}
 	for _, task := range doing {
-		_ = f.repo.AddTaskActor(context.Background(), task.ID, []string{operator})
+		_ = f.repo.AddTaskActor(ctx, task.ID, []string{operator})
 		flowArgs["submitType"] = 0 // APPLY
 		// 对齐 boot3：f_nextNodeOperator（发起时预指派人）→ tf_nextNodeOperator（引擎执行参数）
 		if v, ok := flowArgs[engine.KeyProcessStartNextNodeOperator]; ok && fmt.Sprintf("%v", v) != "" {
 			flowArgs[engine.KeyNextNodeOperator] = v
 		}
-		if _, err := f.engine.ExecuteProcessTask(context.Background(), task.ID, operator, flowArgs); err != nil {
+		if _, err := f.engine.ExecuteProcessTask(ctx, task.ID, operator, flowArgs); err != nil {
 			return nil, err
 		}
 	}
@@ -254,7 +283,7 @@ func (f *Facade) startAndExecute(args map[string]interface{}) (interface{}, erro
 }
 
 // deploy 版本管理（对齐 boot3）：按 name 查最新定义，存在 version+1 插新记录，否则从 0 起
-func (f *Facade) deploy(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) deploy(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	content, err := contentBytes(args)
 	if err != nil {
 		return nil, err
@@ -268,7 +297,7 @@ func (f *Facade) deploy(args map[string]interface{}) (interface{}, error) {
 		return nil, errors.New("流程定义缺少 name")
 	}
 	version := 0
-	latest, err := f.repo.FindDefineByName(context.Background(), flow.Name)
+	latest, err := f.repo.FindDefineByName(ctx, flow.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -285,13 +314,13 @@ func (f *Facade) deploy(args map[string]interface{}) (interface{}, error) {
 		CreateUser:  toStr(args["operator"], "system"),
 		UpdateUser:  toStr(args["operator"], "system"),
 	}
-	if err := f.repo.SaveDefine(context.Background(), def); err != nil {
+	if err := f.repo.SaveDefine(ctx, def); err != nil {
 		return nil, err
 	}
 	return map[string]interface{}{"processDefineId": def.ID}, nil
 }
 
-func (f *Facade) redeploy(args map[string]interface{}) error {
+func (f *Facade) redeploy(ctx context.Context, args map[string]interface{}) error {
 	defineID, err := toInt64(args["processDefineId"])
 	if err != nil {
 		return fmt.Errorf("processDefineId 缺失或非法: %v", err)
@@ -314,30 +343,30 @@ func (f *Facade) redeploy(args map[string]interface{}) error {
 		Content:     content,
 		UpdateUser:  toStr(args["operator"], "system"),
 	}
-	if old, oerr := f.repo.FindDefineByID(context.Background(), defineID); oerr == nil && old != nil {
+	if old, oerr := f.repo.FindDefineByID(ctx, defineID); oerr == nil && old != nil {
 		def.State = old.State
 		def.Version = old.Version
 		def.CreateTime = old.CreateTime
 		def.CreateUser = old.CreateUser
 	}
-	return f.repo.UpdateDefine(context.Background(), def)
+	return f.repo.UpdateDefine(ctx, def)
 }
 
-func (f *Facade) removeDefine(args map[string]interface{}) error {
+func (f *Facade) removeDefine(ctx context.Context, args map[string]interface{}) error {
 	// issues/28：兼容 {ids} 批量（boot3 前端 IdsParam 惯例）与单 {id}
 	ids, err := idListArgs(args)
 	if err != nil {
 		return err
 	}
 	for _, id := range ids {
-		if err := f.repo.RemoveDefine(context.Background(), id); err != nil {
+		if err := f.repo.RemoveDefine(ctx, id); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (f *Facade) upAndDown(args map[string]interface{}) error {
+func (f *Facade) upAndDown(ctx context.Context, args map[string]interface{}) error {
 	// issues/28：兼容 {ids, opType} 批量；opType/state 二选一
 	state, err := toInt(firstNonNil(args["opType"], args["state"]))
 	if err != nil {
@@ -348,7 +377,7 @@ func (f *Facade) upAndDown(args map[string]interface{}) error {
 		return err
 	}
 	for _, id := range ids {
-		if err := f.repo.UpdateDefineState(context.Background(), id, state); err != nil {
+		if err := f.repo.UpdateDefineState(ctx, id, state); err != nil {
 			return err
 		}
 	}
@@ -366,7 +395,7 @@ func (f *Facade) upAndDown(args map[string]interface{}) error {
 // 是无 error 返回的纯 setter，状态改写序列（doing 任务 → 实例 → UpdateInstance 级联落库）
 // 全在门面里，守卫排在它之前才拦得住。次序与 Java 一致（facade 鉴权 → 聚合根 withdraw 抛错）：
 // 无关第三人撤已办结单先撞归属判据、拿「无权限撤回该流程实例」，不把实例状态递给无权限的人。
-func (f *Facade) withdraw(args map[string]interface{}) error {
+func (f *Facade) withdraw(ctx context.Context, args map[string]interface{}) error {
 	instanceID, err := toInt64(args["id"])
 	if err != nil {
 		return fmt.Errorf("id 缺失或非法: %v", err)
@@ -375,7 +404,7 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 	if operator == "" {
 		return errors.New("operator 必填")
 	}
-	inst, err := f.repo.FindInstanceByID(context.Background(), instanceID)
+	inst, err := f.repo.FindInstanceByID(ctx, instanceID)
 	if err != nil || inst == nil {
 		return errors.New("流程实例不存在")
 	}
@@ -384,11 +413,11 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 	// 且必须把聚合副本重置为仅被撤回项（见下方 inst.Tasks = doing），防级联回写多余任务
 	// ——20（已完成）/40（已终止）的任务行因此不被改写，撤回只作用于整单的进行中任务
 	now := time.Now()
-	doing, err := f.repo.FindDoingTasks(context.Background(), instanceID, nil)
+	doing, err := f.repo.FindDoingTasks(ctx, instanceID, nil)
 	if err != nil {
 		return err
 	}
-	if !f.canWithdrawInstance(inst, doing, operator) {
+	if !f.canWithdrawInstance(ctx, inst, doing, operator) {
 		return errors.New("无权限撤回该流程实例")
 	}
 	// issues/134 案 A · 实例状态守卫（八栈同判据，守卫排在任务行层面既有保护之前）：
@@ -413,7 +442,7 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 	inst.Withdraw(now) // 撤回状态 Withdraw(30) 而非 Reject(45)
 	inst.UpdateUser = operator
 	inst.Tasks = doing
-	if err := f.repo.UpdateInstance(context.Background(), inst); err != nil {
+	if err := f.repo.UpdateInstance(ctx, inst); err != nil {
 		return err
 	}
 	// TASK_WITHDRAW(8) / spec §11.3 码 8：撤回把实例 state 写 30 **落库之后** fire，
@@ -445,7 +474,7 @@ func (f *Facade) withdraw(args map[string]interface{}) error {
 // actorIds"+ auto/admin 放行，**不查实例发起人**（八语言同构缺口），故发起人这一支显式补在这里。
 // 判据 2/3 与 isAllowed 同口径（任务副本 ActorIDs + 参与者表兜底；两仓的 doing 任务查询都会
 // 水合 ActorIDs，仍留仓储兜底以防自定义仓储不水合）。
-func (f *Facade) canWithdrawInstance(inst *model.ProcessInstance, doing []*model.ProcessTask, operator string) bool {
+func (f *Facade) canWithdrawInstance(ctx context.Context, inst *model.ProcessInstance, doing []*model.ProcessTask, operator string) bool {
 	if inst != nil && inst.Operator == operator {
 		return true
 	}
@@ -456,7 +485,7 @@ func (f *Facade) canWithdrawInstance(inst *model.ProcessInstance, doing []*model
 		if t.IsAllowed(operator) {
 			return true
 		}
-		actors, _ := f.repo.FindTaskActors(context.Background(), t.ID)
+		actors, _ := f.repo.FindTaskActors(ctx, t.ID)
 		if containsStr(actors, operator) {
 			return true
 		}
@@ -466,7 +495,7 @@ func (f *Facade) canWithdrawInstance(inst *model.ProcessInstance, doing []*model
 
 // ═══ 流程任务 ═══
 
-func (f *Facade) execute(args map[string]interface{}) error {
+func (f *Facade) execute(ctx context.Context, args map[string]interface{}) error {
 	taskID, err := toInt64(args["processTaskId"])
 	if err != nil {
 		return fmt.Errorf("processTaskId 缺失或非法: %v", err)
@@ -487,28 +516,28 @@ func (f *Facade) execute(args map[string]interface{}) error {
 	// boot3 execute 分发（spec §11.2）
 	switch submitType {
 	case 2: // REJECT
-		_, err = f.engine.ExecuteAndJumpToEnd(context.Background(), taskID, operator, flowArgs)
+		_, err = f.engine.ExecuteAndJumpToEnd(ctx, taskID, operator, flowArgs)
 	case 3: // ROLLBACK
-		_, err = f.engine.ExecuteAndJumpTask(context.Background(), taskID, operator, flowArgs, "")
+		_, err = f.engine.ExecuteAndJumpTask(ctx, taskID, operator, flowArgs, "")
 	case 4: // JUMP
-		_, err = f.engine.ExecuteAndJumpTask(context.Background(), taskID, operator, flowArgs, toStr(args["taskName"], ""))
+		_, err = f.engine.ExecuteAndJumpTask(ctx, taskID, operator, flowArgs, toStr(args["taskName"], ""))
 	case 6: // ROLLBACK_TO_OPERATOR
-		_, err = f.engine.ExecuteAndJumpToFirstTaskNode(context.Background(), taskID, operator, flowArgs)
+		_, err = f.engine.ExecuteAndJumpToFirstTaskNode(ctx, taskID, operator, flowArgs)
 	case 20: // COUNTERSIGN_DISAGREE
 		flowArgs["countersignDisagreeFlag"] = 1
-		_, err = f.engine.ExecuteProcessTask(context.Background(), taskID, operator, flowArgs)
+		_, err = f.engine.ExecuteProcessTask(ctx, taskID, operator, flowArgs)
 	default: // 0 APPLY / 1 AGREE / 5 重新提交
-		_, err = f.engine.ExecuteProcessTask(context.Background(), taskID, operator, flowArgs)
+		_, err = f.engine.ExecuteProcessTask(ctx, taskID, operator, flowArgs)
 	}
 	return err
 }
 
 // ═══ 流程设计（需扩展仓储） ═══
 
-func (f *Facade) designPage(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) designPage(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
 	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
-	rows, total, err := ext.PageDesigns(context.Background(), query)
+	rows, total, err := ext.PageDesigns(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -519,13 +548,13 @@ func (f *Facade) designPage(args map[string]interface{}) (interface{}, error) {
 	return pageData(query.PageNum, query.PageSize, total, out), nil
 }
 
-func (f *Facade) designDetail(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) designDetail(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
 	id, err := toInt64(args["id"])
 	if err != nil {
 		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
-	design, err := ext.FindDesignByID(context.Background(), id)
+	design, err := ext.FindDesignByID(ctx, id)
 	if err != nil || design == nil {
 		return nil, errors.New("流程设计不存在")
 	}
@@ -534,7 +563,7 @@ func (f *Facade) designDetail(args map[string]interface{}) (interface{}, error) 
 		"type": design.Type, "icon": design.Icon, "isDeployed": design.IsDeployed,
 		"remark": design.Remark,
 	}
-	hisList, err := ext.ListDesignHis(context.Background(), id)
+	hisList, err := ext.ListDesignHis(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -566,7 +595,7 @@ func (f *Facade) designDetail(args map[string]interface{}) (interface{}, error) 
 	return data, nil
 }
 
-func (f *Facade) designSave(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) designSave(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
 	operator := operatorArg(args)
 	id, _ := toInt64(args["id"])
@@ -582,9 +611,9 @@ func (f *Facade) designSave(args map[string]interface{}) (interface{}, error) {
 			CreateUser:  operator,
 			UpdateUser:  operator,
 		}
-		err = ext.SaveDesign(context.Background(), design)
+		err = ext.SaveDesign(ctx, design)
 	} else {
-		design, err = ext.FindDesignByID(context.Background(), id)
+		design, err = ext.FindDesignByID(ctx, id)
 		if err != nil || design == nil {
 			return nil, errors.New("流程设计不存在")
 		}
@@ -605,14 +634,14 @@ func (f *Facade) designSave(args map[string]interface{}) (interface{}, error) {
 		if content, cerr := contentBytes(args); cerr == nil && content != nil {
 			design.IsDeployed = 0
 		}
-		err = ext.UpdateDesign(context.Background(), design)
+		err = ext.UpdateDesign(ctx, design)
 	}
 	if err != nil {
 		return nil, err
 	}
 	// 内容快照（设计稿内容存历史表）
 	if content, cerr := contentBytes(args); cerr == nil && content != nil {
-		if herr := ext.SaveDesignHis(context.Background(), &model.ProcessDesignHis{
+		if herr := ext.SaveDesignHis(ctx, &model.ProcessDesignHis{
 			ProcessDesignID: design.ID,
 			Content:         content,
 			CreateUser:      operator,
@@ -623,14 +652,14 @@ func (f *Facade) designSave(args map[string]interface{}) (interface{}, error) {
 	return map[string]interface{}{"id": design.ID}, nil
 }
 
-func (f *Facade) designRemove(args map[string]interface{}) error {
+func (f *Facade) designRemove(ctx context.Context, args map[string]interface{}) error {
 	// issues/28：兼容 {ids} 批量（boot3 前端 IdsParam 惯例）与单 {id}
 	ids, err := idListArgs(args)
 	if err != nil {
 		return err
 	}
 	for _, id := range ids {
-		if err := f.ext().RemoveDesign(context.Background(), id); err != nil {
+		if err := f.ext().RemoveDesign(ctx, id); err != nil {
 			return err
 		}
 	}
@@ -638,16 +667,16 @@ func (f *Facade) designRemove(args map[string]interface{}) error {
 }
 
 // designListByType 按类型分组列出流程设计（issue 30，对齐 Java issues/28）：不依赖框架字典
-func (f *Facade) designListByType(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) designListByType(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
 	query := spi.PageQuery{PageNum: 1, PageSize: 10000, Conditions: parseMQuery(args)}
-	rows, _, err := ext.PageDesigns(context.Background(), query)
+	rows, _, err := ext.PageDesigns(ctx, query)
 	if err != nil {
 		return nil, err
 	}
 	// 每 name 最新 define（version 最大）
 	defQuery := spi.PageQuery{PageNum: 1, PageSize: 10000}
-	defRows, _, err := f.repo.PageDefines(context.Background(), defQuery)
+	defRows, _, err := f.repo.PageDefines(ctx, defQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -671,7 +700,7 @@ func (f *Facade) designListByType(args map[string]interface{}) (interface{}, err
 			item["processDefineId"] = latest.ID
 			item["processDefineState"] = latest.State
 		}
-		if his, err := ext.ListDesignHis(context.Background(), d.ID); err == nil && len(his) > 0 {
+		if his, err := ext.ListDesignHis(ctx, d.ID); err == nil && len(his) > 0 {
 			var graph map[string]interface{}
 			if json.Unmarshal(his[0].Content, &graph) == nil {
 				item["jsonObject"] = graph
@@ -683,16 +712,16 @@ func (f *Facade) designListByType(args map[string]interface{}) (interface{}, err
 }
 
 // bizData 按流程实例回显业务数据（issue 30，对齐 Java issues/28）：metaReader 注入式，未注入清晰报错
-func (f *Facade) bizData(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) bizData(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	instanceID, err := toInt64(firstNonNil(args["processInstanceId"], args["id"]))
 	if err != nil {
 		return nil, errors.New("processInstanceId 缺失")
 	}
-	inst, err := f.repo.FindInstanceByID(context.Background(), instanceID)
+	inst, err := f.repo.FindInstanceByID(ctx, instanceID)
 	if err != nil || inst == nil {
 		return nil, errors.New("流程实例不存在")
 	}
-	def, err := f.repo.FindDefineByID(context.Background(), inst.DefineID)
+	def, err := f.repo.FindDefineByID(ctx, inst.DefineID)
 	if err != nil || def == nil {
 		return nil, errors.New("流程定义不存在")
 	}
@@ -716,17 +745,17 @@ func (f *Facade) bizData(args map[string]interface{}) (interface{}, error) {
 	return f.metaReader.ReadByProcessInstance(tableName, instanceID)
 }
 
-func (f *Facade) designDeploy(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) designDeploy(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
 	id, err := toInt64(args["id"])
 	if err != nil {
 		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
-	design, err := ext.FindDesignByID(context.Background(), id)
+	design, err := ext.FindDesignByID(ctx, id)
 	if err != nil || design == nil {
 		return nil, errors.New("流程设计不存在")
 	}
-	hisList, err := ext.ListDesignHis(context.Background(), id)
+	hisList, err := ext.ListDesignHis(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -734,7 +763,7 @@ func (f *Facade) designDeploy(args map[string]interface{}) (interface{}, error) 
 		return nil, errors.New("流程设计没有内容，无法发布")
 	}
 	// 发布：复用 deploy 版本管理
-	defineID, err := f.deploy(map[string]interface{}{
+	defineID, err := f.deploy(ctx, map[string]interface{}{
 		"content":  hisList[0].Content,
 		"operator": toStr(args["operator"], "system"),
 	})
@@ -743,20 +772,20 @@ func (f *Facade) designDeploy(args map[string]interface{}) (interface{}, error) 
 	}
 	design.IsDeployed = 1
 	design.UpdateUser = toStr(args["operator"], "system")
-	if err := ext.UpdateDesign(context.Background(), design); err != nil {
+	if err := ext.UpdateDesign(ctx, design); err != nil {
 		return nil, err
 	}
 	return defineID, nil
 }
 
 // designUpdate 修改流程设计基本信息（对齐 boot3 ProcessDesignController.update，不写设计稿快照）
-func (f *Facade) designUpdate(args map[string]interface{}) error {
+func (f *Facade) designUpdate(ctx context.Context, args map[string]interface{}) error {
 	ext := f.ext()
 	id, err := toInt64(args["id"])
 	if err != nil {
 		return fmt.Errorf("id 缺失或非法: %v", err)
 	}
-	design, err := ext.FindDesignByID(context.Background(), id)
+	design, err := ext.FindDesignByID(ctx, id)
 	if err != nil || design == nil {
 		return errors.New("流程设计不存在")
 	}
@@ -776,17 +805,17 @@ func (f *Facade) designUpdate(args map[string]interface{}) error {
 		design.Remark = toStr(v, "")
 	}
 	design.UpdateUser = toStr(args["operator"], "system")
-	return ext.UpdateDesign(context.Background(), design)
+	return ext.UpdateDesign(ctx, design)
 }
 
 // designUpdateDefine 更新流程设计定义（设计稿保存，issues/08）：content 快照入库 + 同步基本信息 + 置未部署
-func (f *Facade) designUpdateDefine(args map[string]interface{}) error {
+func (f *Facade) designUpdateDefine(ctx context.Context, args map[string]interface{}) error {
 	ext := f.ext()
 	designID, err := toInt64(args["processDesignId"])
 	if err != nil {
 		return fmt.Errorf("processDesignId 缺失或非法: %v", err)
 	}
-	design, err := ext.FindDesignByID(context.Background(), designID)
+	design, err := ext.FindDesignByID(ctx, designID)
 	if err != nil || design == nil {
 		return errors.New("流程设计不存在")
 	}
@@ -795,12 +824,12 @@ func (f *Facade) designUpdateDefine(args map[string]interface{}) error {
 		return errors.New("content 缺失")
 	}
 	// 与最新一条相同则不重复入库（对齐 boot3 updateDefine）
-	hisList, err := ext.ListDesignHis(context.Background(), designID)
+	hisList, err := ext.ListDesignHis(ctx, designID)
 	if err != nil {
 		return err
 	}
 	if len(hisList) == 0 || !bytes.Equal(hisList[0].Content, content) {
-		if err := ext.SaveDesignHis(context.Background(), &model.ProcessDesignHis{
+		if err := ext.SaveDesignHis(ctx, &model.ProcessDesignHis{
 			ProcessDesignID: designID,
 			Content:         content,
 			CreateUser:      toStr(args["operator"], "system"),
@@ -823,21 +852,21 @@ func (f *Facade) designUpdateDefine(args map[string]interface{}) error {
 	}
 	design.IsDeployed = 0
 	design.UpdateUser = toStr(args["operator"], "system")
-	return ext.UpdateDesign(context.Background(), design)
+	return ext.UpdateDesign(ctx, design)
 }
 
 // designRedeploy 重新部署流程定义（issues/08）：替换最新定义内容 + 置已部署（对齐 boot3 redeploy）
-func (f *Facade) designRedeploy(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) designRedeploy(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
 	designID, err := toInt64(args["id"])
 	if err != nil {
 		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
-	design, err := ext.FindDesignByID(context.Background(), designID)
+	design, err := ext.FindDesignByID(ctx, designID)
 	if err != nil || design == nil {
 		return nil, errors.New("流程设计不存在")
 	}
-	hisList, err := ext.ListDesignHis(context.Background(), designID)
+	hisList, err := ext.ListDesignHis(ctx, designID)
 	if err != nil {
 		return nil, err
 	}
@@ -854,10 +883,10 @@ func (f *Facade) designRedeploy(args map[string]interface{}) (interface{}, error
 		return nil, errors.New("流程定义缺少 name")
 	}
 	// 按 name 取最新定义：有则替换内容（version 不变），无则新建（对齐 boot3 redeploy）
-	last, lerr := f.repo.FindDefineByName(context.Background(), flow.Name)
+	last, lerr := f.repo.FindDefineByName(ctx, flow.Name)
 	var defineID int64
 	if lerr != nil || last == nil {
-		def, derr := f.deploy(map[string]interface{}{
+		def, derr := f.deploy(ctx, map[string]interface{}{
 			"content":  content,
 			"operator": toStr(args["operator"], "system"),
 		})
@@ -868,7 +897,7 @@ func (f *Facade) designRedeploy(args map[string]interface{}) (interface{}, error
 			defineID, _ = m["processDefineId"].(int64)
 		}
 	} else {
-		if err := f.repo.UpdateDefine(context.Background(), &model.ProcessDefine{
+		if err := f.repo.UpdateDefine(ctx, &model.ProcessDefine{
 			ID:          last.ID,
 			Name:        flow.Name,
 			DisplayName: flow.DisplayName,
@@ -888,7 +917,7 @@ func (f *Facade) designRedeploy(args map[string]interface{}) (interface{}, error
 	}
 	design.IsDeployed = 1
 	design.UpdateUser = toStr(args["operator"], "system")
-	if err := ext.UpdateDesign(context.Background(), design); err != nil {
+	if err := ext.UpdateDesign(ctx, design); err != nil {
 		return nil, err
 	}
 	return map[string]interface{}{"processDefineId": defineID}, nil
@@ -896,7 +925,7 @@ func (f *Facade) designRedeploy(args map[string]interface{}) (interface{}, error
 
 // ═══ 委托代理（需扩展仓储） ═══
 
-func (f *Facade) surrogatePage(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) surrogatePage(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
 	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
 	// issues/152 ②：t.operator 是**归属列**，与 Java JeeflowFacade.surrogatePage 的
@@ -909,7 +938,7 @@ func (f *Facade) surrogatePage(args map[string]interface{}) (interface{}, error)
 	// repository/jdbc/ext.go。
 	query.Conditions = append(query.Conditions,
 		spi.Condition{Column: "t.operator", Operator: "EQ", Value: operatorArg(args)})
-	rows, total, err := ext.PageSurrogates(context.Background(), query)
+	rows, total, err := ext.PageSurrogates(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -920,7 +949,7 @@ func (f *Facade) surrogatePage(args map[string]interface{}) (interface{}, error)
 	return pageData(query.PageNum, query.PageSize, total, out), nil
 }
 
-func (f *Facade) surrogateSave(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) surrogateSave(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
 	operator := operatorArg(args)
 	id, _ := toInt64(args["id"])
@@ -933,14 +962,14 @@ func (f *Facade) surrogateSave(args map[string]interface{}) (interface{}, error)
 			UpdateUser: operator,
 		}
 		applySurrogateFields(surrogate, args, operator)
-		err = ext.SaveSurrogate(context.Background(), surrogate)
+		err = ext.SaveSurrogate(ctx, surrogate)
 	} else {
-		surrogate, err = ext.FindSurrogateByID(context.Background(), id)
+		surrogate, err = ext.FindSurrogateByID(ctx, id)
 		if err != nil || surrogate == nil {
 			return nil, errors.New("委托记录不存在")
 		}
 		applySurrogateFields(surrogate, args, operator)
-		err = ext.UpdateSurrogate(context.Background(), surrogate)
+		err = ext.UpdateSurrogate(ctx, surrogate)
 	}
 	if err != nil {
 		return nil, err
@@ -949,19 +978,19 @@ func (f *Facade) surrogateSave(args map[string]interface{}) (interface{}, error)
 }
 
 // surrogateUpdate 委托更新（issues/77）：按 id 全字段更新，id 不存在报错
-func (f *Facade) surrogateUpdate(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) surrogateUpdate(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	ext := f.ext()
 	id, err := toInt64(args["id"])
 	if err != nil {
 		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
-	surrogate, err := ext.FindSurrogateByID(context.Background(), id)
+	surrogate, err := ext.FindSurrogateByID(ctx, id)
 	if err != nil || surrogate == nil {
 		return nil, errors.New("委托记录不存在")
 	}
 	operator := operatorArg(args)
 	applySurrogateFields(surrogate, args, operator)
-	err = ext.UpdateSurrogate(context.Background(), surrogate)
+	err = ext.UpdateSurrogate(ctx, surrogate)
 	if err != nil {
 		return nil, err
 	}
@@ -969,12 +998,12 @@ func (f *Facade) surrogateUpdate(args map[string]interface{}) (interface{}, erro
 }
 
 // surrogateDetail 委托详情（issues/77）：按 id 查单条，返回行结构（时间格式化）
-func (f *Facade) surrogateDetail(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) surrogateDetail(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	id, err := toInt64(args["id"])
 	if err != nil {
 		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
-	surrogate, err := f.ext().FindSurrogateByID(context.Background(), id)
+	surrogate, err := f.ext().FindSurrogateByID(ctx, id)
 	if err != nil || surrogate == nil {
 		return nil, errors.New("委托记录不存在")
 	}
@@ -1057,14 +1086,14 @@ func surrogateRowToMap(s *model.ProcessSurrogate) map[string]interface{} {
 	}
 }
 
-func (f *Facade) surrogateRemove(args map[string]interface{}) error {
+func (f *Facade) surrogateRemove(ctx context.Context, args map[string]interface{}) error {
 	// issues/95：前端「我的委托」行内/批量删除统一发 {ids}，与 define/design remove 同惯例
 	ids, err := idListArgs(args)
 	if err != nil {
 		return err
 	}
 	for _, id := range ids {
-		if err := f.ext().RemoveSurrogate(context.Background(), id); err != nil {
+		if err := f.ext().RemoveSurrogate(ctx, id); err != nil {
 			return err
 		}
 	}
@@ -1073,9 +1102,9 @@ func (f *Facade) surrogateRemove(args map[string]interface{}) error {
 
 // ═══ 视图端点（v1.2.0） ═══
 
-func (f *Facade) getLastByName(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) getLastByName(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	name := toStr(args["processDefineName"], "")
-	def, err := f.repo.FindDefineByName(context.Background(), name)
+	def, err := f.repo.FindDefineByName(ctx, name)
 	if err != nil || def == nil {
 		return nil, fmt.Errorf("流程定义不存在: %s", name)
 	}
@@ -1094,12 +1123,12 @@ func (f *Facade) getLastByName(args map[string]interface{}) (interface{}, error)
 	}, nil
 }
 
-func (f *Facade) highLight(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) highLight(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	instanceID, err := toInt64(args["id"])
 	if err != nil {
 		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
-	inst, err := f.repo.FindInstanceByID(context.Background(), instanceID)
+	inst, err := f.repo.FindInstanceByID(ctx, instanceID)
 	if err != nil || inst == nil {
 		return nil, errors.New("流程实例不存在")
 	}
@@ -1107,14 +1136,14 @@ func (f *Facade) highLight(args map[string]interface{}) (interface{}, error) {
 	history := []string{}
 	edges := []string{}
 	// 活跃节点 = 进行中任务
-	doing, _ := f.repo.FindDoingTasks(context.Background(), instanceID, nil)
+	doing, _ := f.repo.FindDoingTasks(ctx, instanceID, nil)
 	for _, t := range doing {
 		if !containsStr(active, t.TaskName) {
 			active = append(active, t.TaskName)
 		}
 	}
 	// 历史节点 = 全部任务（排除活跃）+ 模型路径补全
-	his, _ := f.repo.FindHistoryTasks(context.Background(), instanceID)
+	his, _ := f.repo.FindHistoryTasks(ctx, instanceID)
 	for _, t := range his {
 		if !containsStr(active, t.TaskName) && !containsStr(history, t.TaskName) {
 			history = append(history, t.TaskName)
@@ -1122,7 +1151,7 @@ func (f *Facade) highLight(args map[string]interface{}) (interface{}, error) {
 	}
 	// 路径补全：start 沿 edges 递归，遇活跃节点停止；决策分支按表达式求值过滤（issues/06）
 	nodeProgress := map[string]interface{}{}
-	def, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID)
+	def, _ := f.repo.FindDefineByID(ctx, inst.DefineID)
 	if def != nil {
 		var flow model.FlowModel
 		// issues/162 的 go 腿（owner 10-11 拍口径＝保留降级面＋落一条可诊断日志，形状照 python
@@ -1339,12 +1368,12 @@ func containsStr(list []string, s string) bool {
 	return false
 }
 
-func (f *Facade) approvalRecord(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) approvalRecord(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	instanceID, err := toInt64(args["id"])
 	if err != nil {
 		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
-	his, err := f.repo.FindHistoryTasks(context.Background(), instanceID)
+	his, err := f.repo.FindHistoryTasks(ctx, instanceID)
 	if err != nil {
 		return nil, err
 	}
@@ -1367,7 +1396,7 @@ func (f *Facade) approvalRecord(args map[string]interface{}) (interface{}, error
 	return rows, nil
 }
 
-func (f *Facade) getAssigneeTextData(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) getAssigneeTextData(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	instanceID, err := toInt64(args["id"])
 	if err != nil {
 		return nil, fmt.Errorf("id 缺失或非法: %v", err)
@@ -1377,9 +1406,9 @@ func (f *Facade) getAssigneeTextData(args map[string]interface{}) (interface{}, 
 		includeNodeName = v
 	}
 	rows := []map[string]interface{}{}
-	doing, _ := f.repo.FindDoingTasks(context.Background(), instanceID, nil)
+	doing, _ := f.repo.FindDoingTasks(ctx, instanceID, nil)
 	for _, t := range doing {
-		actors, _ := f.repo.FindTaskActors(context.Background(), t.ID)
+		actors, _ := f.repo.FindTaskActors(ctx, t.ID)
 		for _, actor := range actors {
 			label := actor
 			if includeNodeName {
@@ -1391,7 +1420,7 @@ func (f *Facade) getAssigneeTextData(args map[string]interface{}) (interface{}, 
 	return rows, nil
 }
 
-func (f *Facade) createCCInstance(args map[string]interface{}) error {
+func (f *Facade) createCCInstance(ctx context.Context, args map[string]interface{}) error {
 	instanceID, err := toInt64(args["processInstanceId"])
 	if err != nil {
 		return fmt.Errorf("processInstanceId 缺失或非法: %v", err)
@@ -1411,7 +1440,7 @@ func (f *Facade) createCCInstance(args map[string]interface{}) error {
 	// issues/141 G2 写侧判重＝幂等空操作（spec 06 §4）：手动腿与引擎腿（f_/tf_ 两条）共用
 	// 同一条判据（spec §11.7「三条入口同一支」）——同一 (实例, 人) 已有 cc 行时跳过，
 	// 不新增行、不重置未读、不更新原行时间。
-	created, err := f.repo.CreateCcInstanceIfAbsent(context.Background(), instanceID, operator, actors...)
+	created, err := f.repo.CreateCcInstanceIfAbsent(ctx, instanceID, operator, actors...)
 	if err != nil {
 		return err
 	}
@@ -1428,7 +1457,7 @@ func (f *Facade) createCCInstance(args map[string]interface{}) error {
 	return nil
 }
 
-func (f *Facade) updateCCStatus(args map[string]interface{}) error {
+func (f *Facade) updateCCStatus(ctx context.Context, args map[string]interface{}) error {
 	instanceID, err := toInt64(args["processInstanceId"])
 	if err != nil {
 		return fmt.Errorf("processInstanceId 缺失或非法: %v", err)
@@ -1438,14 +1467,14 @@ func (f *Facade) updateCCStatus(args map[string]interface{}) error {
 	// no-op 报成功），而空 operator 会把 state=1 打到历史 actor_id 为空串 的脏行上（issues/129 病根）。
 	// operatorArg 已把"空串/缺键"回落 demo 缺省 user1（issues/129 案 A），这里补的是 trim 那半。
 	operator := singleActorArg(operatorArg(args))
-	return f.repo.UpdateCcStatus(context.Background(), instanceID, operator)
+	return f.repo.UpdateCcStatus(ctx, instanceID, operator)
 }
 
 // ccList 我的抄送分页（v1.3.0）：operator 作为抄送人过滤
-func (f *Facade) ccList(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) ccList(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
 	actorID := operatorArg(args)
-	rows, total, err := f.repo.PageCcInstances(context.Background(), query, actorID)
+	rows, total, err := f.repo.PageCcInstances(ctx, query, actorID)
 	if err != nil {
 		return nil, err
 	}
@@ -1456,17 +1485,17 @@ func (f *Facade) ccList(args map[string]interface{}) (interface{}, error) {
 	return pageData(query.PageNum, query.PageSize, total, out), nil
 }
 
-func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) taskDetail(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	taskID, err := toInt64(args["id"])
 	if err != nil {
 		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
 	operator := operatorArg(args)
-	task, err := f.repo.FindTaskByID(context.Background(), taskID)
+	task, err := f.repo.FindTaskByID(ctx, taskID)
 	if err != nil || task == nil {
 		return nil, errors.New("任务不存在")
 	}
-	actors, _ := f.repo.FindTaskActors(context.Background(), taskID)
+	actors, _ := f.repo.FindTaskActors(ctx, taskID)
 	// issues/82-5：任务级 ext.isFirstTaskNode（前端 detail.vue 双兜底 record.ext?.isFirstTaskNode）
 	// issues/121 P1：改成「行上值优先、缺键才回退现算」——引擎建单时已把标记落库（已办结的历史行同样
 	// 有效）；存量行没这个键才回退下面那条带 doing 判定的现算，现算只够展示用，引擎内部判定不得用它。
@@ -1488,9 +1517,9 @@ func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 		"taskFormData": formDataOf(task.Variables, "tf_"), // issues/15 + 对齐 java taskDetail 顶层出口（issues/124 G4）
 	}
 	// taskModel：流程定义中对应节点
-	inst, _ := f.repo.FindInstanceByID(context.Background(), task.ProcessInstanceID)
+	inst, _ := f.repo.FindInstanceByID(ctx, task.ProcessInstanceID)
 	if inst != nil {
-		def, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID)
+		def, _ := f.repo.FindDefineByID(ctx, inst.DefineID)
 		if def != nil {
 			graph := map[string]interface{}{}
 			if json.Unmarshal(def.Content, &graph) == nil && len(graph) > 0 {
@@ -1524,12 +1553,12 @@ func (f *Facade) taskDetail(args map[string]interface{}) (interface{}, error) {
 	return vo, nil
 }
 
-func (f *Facade) jumpAbleTaskNameList(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) jumpAbleTaskNameList(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	instanceID, err := toInt64(args["processInstanceId"])
 	if err != nil {
 		return nil, fmt.Errorf("processInstanceId 缺失或非法: %v", err)
 	}
-	done, _ := f.repo.FindDoneTasks(context.Background(), instanceID, nil)
+	done, _ := f.repo.FindDoneTasks(ctx, instanceID, nil)
 	rows := []map[string]interface{}{}
 	seen := map[string]bool{}
 	for _, t := range done {
@@ -1544,7 +1573,7 @@ func (f *Facade) jumpAbleTaskNameList(args map[string]interface{}) (interface{},
 	return rows, nil
 }
 
-func (f *Facade) candidatePage(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) candidatePage(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	taskID, err := toInt64(args["processTaskId"])
 	if err != nil {
 		taskID, err = toInt64(args["id"])
@@ -1552,17 +1581,17 @@ func (f *Facade) candidatePage(args map[string]interface{}) (interface{}, error)
 	if err != nil {
 		return nil, errors.New("processTaskId 缺失")
 	}
-	task, err := f.repo.FindTaskByID(context.Background(), taskID)
+	task, err := f.repo.FindTaskByID(ctx, taskID)
 	if err != nil || task == nil {
 		return nil, errors.New("任务不存在")
 	}
-	inst, _ := f.repo.FindInstanceByID(context.Background(), task.ProcessInstanceID)
+	inst, _ := f.repo.FindInstanceByID(ctx, task.ProcessInstanceID)
 	if inst == nil {
 		return nil, errors.New("流程实例不存在")
 	}
 	// 模型候选解析：当前任务的后继任务节点的 candidateUsers / candidateGroups 配置
 	var candidates []string
-	def, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID)
+	def, _ := f.repo.FindDefineByID(ctx, inst.DefineID)
 	if def != nil {
 		var flow model.FlowModel
 		if json.Unmarshal(def.Content, &flow) == nil {
@@ -1649,7 +1678,7 @@ func (f *Facade) nextTaskCandidates(flow *model.FlowModel, taskName string) []st
 	return result
 }
 
-func (f *Facade) taskAddActor(args map[string]interface{}) error {
+func (f *Facade) taskAddActor(ctx context.Context, args map[string]interface{}) error {
 	taskID, err := taskIDArg(args)
 	if err != nil {
 		return err
@@ -1661,7 +1690,7 @@ func (f *Facade) taskAddActor(args map[string]interface{}) error {
 	if len(actors) == 0 {
 		return errors.New("actorIds 缺失")
 	}
-	return f.repo.AddTaskActor(context.Background(), taskID, actors)
+	return f.repo.AddTaskActor(ctx, taskID, actors)
 }
 
 // taskIDArg 任务主键入参（spec 06-facade.md §2.11「主键类参数另判一档」）。
@@ -1687,7 +1716,7 @@ func taskIDArg(args map[string]interface{}) (int64, error) {
 //
 // 与 surrogate/addCandidate 的区别：那两个 action 只追加（加签，原参与人保留可办），本 action 才摘人。
 // 鉴权：operator == fromActor（只能转自己那一条待办），或 operator ∈ {flow.auto, flow.admin}。
-func (f *Facade) taskTransfer(args map[string]interface{}) error {
+func (f *Facade) taskTransfer(ctx context.Context, args map[string]interface{}) error {
 	taskID, err := taskIDArg(args)
 	if err != nil {
 		return err
@@ -1713,7 +1742,6 @@ func (f *Facade) taskTransfer(args map[string]interface{}) error {
 		!strings.EqualFold(operator, engine.KeyAdminID) {
 		return errors.New("无权限转办该任务")
 	}
-	ctx := context.Background()
 	task, err := f.repo.FindTaskByID(ctx, taskID)
 	if err != nil || task == nil {
 		return errors.New("任务不存在")
@@ -1823,7 +1851,7 @@ func (f *Facade) taskTransfer(args map[string]interface{}) error {
 // 守卫次序（spec 同节末尾钉死，逐栈一致，门禁按 msg 断言，不接受本栈自行重排）：
 // operator 必填 → processTaskId/actorIds 缺失 → 任务不存在 → 无权限 → 非进行中 → 摘空下限 → 落库。
 // operator 排在最前：参数全缺时若先报缺参数，鉴权缺口会被参数报错藏起来。
-func (f *Facade) taskRemoveActor(args map[string]interface{}) error {
+func (f *Facade) taskRemoveActor(ctx context.Context, args map[string]interface{}) error {
 	// operator 硬必填（严禁缺省回落 user1，与 transfer/withdraw 同口径）。归一走本栈既有单点
 	// singleActorArg → spi.NormalizeActors（trim＋丢空＋折叠），不另抄第二把尺子（§2.11）。
 	operator := singleActorArg(args["operator"])
@@ -1856,7 +1884,6 @@ func (f *Facade) taskRemoveActor(args map[string]interface{}) error {
 	if len(actors) == 0 {
 		return errors.New("processTaskId/actorIds 缺失")
 	}
-	ctx := context.Background()
 	task, err := f.repo.FindTaskByID(ctx, taskID)
 	if err != nil || task == nil {
 		return errors.New("任务不存在")
@@ -1972,12 +1999,12 @@ func removeStr(list []string, s string) []string {
 	return out
 }
 
-func (f *Facade) taskLatest(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) taskLatest(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	instanceID, err := toInt64(args["processInstanceId"])
 	if err != nil {
 		return nil, fmt.Errorf("processInstanceId 缺失或非法: %v", err)
 	}
-	doing, _ := f.repo.FindDoingTasks(context.Background(), instanceID, nil)
+	doing, _ := f.repo.FindDoingTasks(ctx, instanceID, nil)
 	if len(doing) == 0 {
 		return nil, nil
 	}
@@ -2330,9 +2357,9 @@ func toIntDef(v interface{}, def int) int {
 // ═══ 基础分页/详情（v1.5.0 补齐，对齐 Java 门面）═══
 
 // definePage 流程定义分页
-func (f *Facade) definePage(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) definePage(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
-	rows, total, err := f.repo.PageDefines(context.Background(), query)
+	rows, total, err := f.repo.PageDefines(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -2344,12 +2371,12 @@ func (f *Facade) definePage(args map[string]interface{}) (interface{}, error) {
 }
 
 // defineDetail 流程定义详情
-func (f *Facade) defineDetail(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) defineDetail(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	id, err := toInt64(args["id"])
 	if err != nil {
 		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
-	def, err := f.repo.FindDefineByID(context.Background(), id)
+	def, err := f.repo.FindDefineByID(ctx, id)
 	if err != nil || def == nil {
 		return nil, errors.New("流程定义不存在")
 	}
@@ -2369,10 +2396,10 @@ func (f *Facade) defineDetail(args map[string]interface{}) (interface{}, error) 
 }
 
 // instancePage 我发起的流程实例分页（operator 过滤）
-func (f *Facade) instancePage(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) instancePage(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
 	operator := operatorArg(args)
-	rows, total, err := f.repo.PageInstances(context.Background(), query, operator)
+	rows, total, err := f.repo.PageInstances(ctx, query, operator)
 	if err != nil {
 		return nil, err
 	}
@@ -2384,12 +2411,12 @@ func (f *Facade) instancePage(args map[string]interface{}) (interface{}, error) 
 }
 
 // instanceDetail 流程实例详情（含任务列表）
-func (f *Facade) instanceDetail(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) instanceDetail(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	id, err := toInt64(args["id"])
 	if err != nil {
 		return nil, fmt.Errorf("id 缺失或非法: %v", err)
 	}
-	inst, err := f.repo.FindInstanceByID(context.Background(), id)
+	inst, err := f.repo.FindInstanceByID(ctx, id)
 	if err != nil || inst == nil {
 		return nil, errors.New("流程实例不存在")
 	}
@@ -2405,7 +2432,7 @@ func (f *Facade) instanceDetail(args map[string]interface{}) (interface{}, error
 		"createTime": inst.CreateTime, "createUser": inst.CreateUser,
 	}
 	var graph map[string]interface{}
-	if def0, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID); def0 != nil {
+	if def0, _ := f.repo.FindDefineByID(ctx, inst.DefineID); def0 != nil {
 		data["displayName"] = def0.DisplayName // issues/15
 		data["name"] = def0.Name
 		data["version"] = def0.Version
@@ -2477,10 +2504,10 @@ func firstTaskNodeIDOf(graph map[string]interface{}) string {
 }
 
 // todoList 我的待办分页（operator 作为抄送…待办人过滤，对齐 Java pta.actor_id EQ）
-func (f *Facade) todoList(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) todoList(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
 	actorID := operatorArg(args)
-	rows, total, err := f.repo.PageTodoTasks(context.Background(), query, actorID)
+	rows, total, err := f.repo.PageTodoTasks(ctx, query, actorID)
 	if err != nil {
 		return nil, err
 	}
@@ -2492,10 +2519,10 @@ func (f *Facade) todoList(args map[string]interface{}) (interface{}, error) {
 }
 
 // doneList 我的已办分页（operator 过滤，非进行中任务）
-func (f *Facade) doneList(args map[string]interface{}) (interface{}, error) {
+func (f *Facade) doneList(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	query := spi.PageQuery{PageNum: toIntDef(args["pageNum"], 1), PageSize: toIntDef(args["pageSize"], 10), Conditions: parseMQuery(args)}
 	operator := operatorArg(args)
-	rows, total, err := f.repo.PageDoneTasks(context.Background(), query, operator)
+	rows, total, err := f.repo.PageDoneTasks(ctx, query, operator)
 	if err != nil {
 		return nil, err
 	}
@@ -2759,8 +2786,7 @@ var (
 )
 
 // statsOverview 总览统计
-func (f *Facade) statsOverview(args map[string]interface{}) (interface{}, error) {
-	ctx := context.Background()
+func (f *Facade) statsOverview(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	start := parseSurrogateTime(args["start"])
 	end := parseSurrogateTime(args["end"])
 
@@ -2837,8 +2863,7 @@ func (f *Facade) statsOverview(args map[string]interface{}) (interface{}, error)
 }
 
 // statsTrend 趋势统计
-func (f *Facade) statsTrend(args map[string]interface{}) (interface{}, error) {
-	ctx := context.Background()
+func (f *Facade) statsTrend(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	start := parseSurrogateTime(args["start"])
 	end := parseSurrogateTime(args["end"])
 	granularity := toStr(args["granularity"], "")
@@ -2898,8 +2923,7 @@ func (f *Facade) statsTrend(args map[string]interface{}) (interface{}, error) {
 }
 
 // statsGroup 分组统计
-func (f *Facade) statsGroup(args map[string]interface{}) (interface{}, error) {
-	ctx := context.Background()
+func (f *Facade) statsGroup(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	start := parseSurrogateTime(args["start"])
 	end := parseSurrogateTime(args["end"])
 	dimension := toStr(args["dimension"], "define")

@@ -501,10 +501,10 @@ type testInterceptor struct {
 	order int
 }
 
-func (ic *testInterceptor) PreHandle(node *model.FlowNode, inst *model.ProcessInstance) bool {
+func (ic *testInterceptor) PreHandle(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance) bool {
 	return ic.pre(node, inst)
 }
-func (ic *testInterceptor) PostHandle(node *model.FlowNode, inst *model.ProcessInstance) {
+func (ic *testInterceptor) PostHandle(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance) {
 	ic.post(node, inst)
 }
 func (ic *testInterceptor) Order() int { return ic.order }

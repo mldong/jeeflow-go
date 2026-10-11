@@ -129,7 +129,7 @@ func (e *EngineImpl) saveNewTask(ctx context.Context, nt *model.ProcessTask, pro
 //
 // 回落路径读定义行（含 content BLOB）按 defineId 缓存，与 resolveInterceptors 同一姿势：
 // 逐次 execution 解析一次后复用，不得逐任务解析。
-func (e *EngineImpl) surrogateProcessName(flow *model.FlowModel, inst *model.ProcessInstance) string {
+func (e *EngineImpl) surrogateProcessName(ctx context.Context, flow *model.FlowModel, inst *model.ProcessInstance) string {
 	if flow != nil {
 		if n := strings.TrimSpace(flow.Name); n != "" {
 			return n
@@ -145,7 +145,7 @@ func (e *EngineImpl) surrogateProcessName(flow *model.FlowModel, inst *model.Pro
 		return n
 	}
 	name := ""
-	if def, err := e.repo.FindDefineByID(context.Background(), inst.DefineID); err == nil && def != nil {
+	if def, err := e.repo.FindDefineByID(ctx, inst.DefineID); err == nil && def != nil {
 		name = strings.TrimSpace(def.Name)
 	}
 	e.defineNameCache[inst.DefineID] = name

@@ -225,7 +225,7 @@ func TestIdempotentFlow(t *testing.T) {
 	inst := runFlow(t, eng, repo, def.ID, true)
 
 	// 模拟同链重复触发：结束节点再调一次拦截器（共享 inst.Variables）
-	ic.PostHandle(&model.FlowNode{Type: model.TypeEnd}, inst)
+	ic.PostHandle(context.Background(), &model.FlowNode{Type: model.TypeEnd}, inst)
 	if n := countRows(t, db); n != 1 {
 		t.Fatalf("idempotent failed, rows=%d", n)
 	}

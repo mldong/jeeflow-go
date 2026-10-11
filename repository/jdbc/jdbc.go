@@ -203,17 +203,46 @@ func (g *tsIDGen) NextID() int64 {
 }
 
 // WithTx 开启事务并把事务连接绑定到 ctx，回调内所有仓储方法走同一连接（spec §7.4）。
+//
+// 嵌套语义（audit8 R9 145-3，spec/12 §12.2 归属面）：ctx 中已有活动事务时**并入**——
+// 不双开连接、不重复 BEGIN，提交/回滚归最外层；内层回调错误原样外抛由最外层回滚连坐。
+// 反向不成立：已有事务不得拒绝开启业务动作（required 语义，spec 12 §12.2）。
+//
+// panic 兜底（spec/12 §12.2 硬义务①的 Go 对应物）：回调 panic 或未到 Commit 的任一提前
+// 返回路径都经 defer 回滚——旧形状在 panic 时既不 Commit 也不 Rollback，事务连接被
+// 永久占住（锁不释放）；重复 Rollback 是 no-op，安全。
 func (r *Repository) WithTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	if _, ok := ctx.Value(txKey{}).(*sql.Tx); ok {
+		return fn(ctx) // 已在事务中 ⇒ 并入最外层（提交/回滚归它）
+	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback() // panic / 提前返回兜底；已提交后为 no-op
+		}
+	}()
 	ctx = context.WithValue(ctx, txKey{}, tx)
 	if err := fn(ctx); err != nil {
-		_ = tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// TxFromContext 返回 ctx 中绑定的事务连接（WithTx 绑定后对同包所有仓储可见：
+// 主仓/扩展仓共用 txKey）；未在事务中 ok=false。
+// 供集成层将事务感知能力递给同连接的非仓储写腿（如 persist 的 JdbcDynamicTableWriter，
+// audit8 R9 C99 ⑥）——透出的是规范机制本身（spec 12 §12.3 Go 行登记 shape），不是新通道。
+func TxFromContext(ctx context.Context) (*sql.Tx, bool) {
+	tx, ok := ctx.Value(txKey{}).(*sql.Tx)
+	return tx, ok
 }
 
 // execer / queryer 抽象：事务连接与池连接的最小公共接口
@@ -520,18 +549,28 @@ func (r *Repository) findTasksByState(ctx context.Context, instanceID int64, sta
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var tasks []*model.ProcessTask
 	for rows.Next() {
 		t, err := scanTask(rows)
 		if err != nil {
+			rows.Close()
 			return nil, err
 		}
-		actors, _ := r.findTaskActors(ctx, t.ID)
-		t.ActorIDs = actors
 		tasks = append(tasks, t)
 	}
-	return tasks, rows.Err()
+	rowErr := rows.Err()
+	// audit8 R9 145-3：**先关结果集、再逐任务补参与者**——旧形状在 rows 未关时嵌套发
+	// FindTaskActors 查询，每条语句各走池连接时看不出来；事务内一次动作只有一条连接后，
+	// 同连接上带未完结果集再发新语句直接撞 mysql "busy buffer"（驱动判坏连接 ⇒ 整个动作红）。
+	rows.Close()
+	if rowErr != nil {
+		return nil, rowErr
+	}
+	for _, t := range tasks {
+		actors, _ := r.findTaskActors(ctx, t.ID)
+		t.ActorIDs = actors
+	}
+	return tasks, nil
 }
 
 func repeatPlaceholder(n int) string {

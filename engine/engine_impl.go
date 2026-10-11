@@ -50,9 +50,38 @@ func (e *EngineImpl) EvalExpr(expr string, vars map[string]interface{}) (interfa
 	return e.exprEval.Eval(expr, vars)
 }
 
+// InTx 在事务中执行 fn（audit8 R9 145-3，spec/12 §12.1 条 3「引擎在其命令入口内包一层
+// 事务钩子（有则用、无则裸跑）」）：
+//   - 仓储实现 WithTx（jdbc 仓）⇒ 包进事务，fn 内主仓/扩展仓所有仓储调用经 ctx 取同一连接
+//     （spec 12 §12.2 覆盖面）；嵌套调用由仓储 WithTx 的并入支归到最外层（归属面）。
+//   - 仓储未实现（内存仓等）⇒ 裸跑——§12.1 条 4 的显式降级运行态，不是契约默认值。
+//
+// 五个引擎命令入口与门面 Flow 都经此包裹（两级包裹互为嵌套；直接调引擎的集成方也拿到边界）。
+func (e *EngineImpl) InTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	if r, ok := e.repo.(interface {
+		WithTx(context.Context, func(context.Context) error) error
+	}); ok {
+		return r.WithTx(ctx, fn)
+	}
+	return fn(ctx)
+}
+
 // ─── Start ─────────────────────────────────────────────────────────────────────
 
 func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	var inst *model.ProcessInstance
+	err := e.InTx(ctx, func(ctx context.Context) error {
+		var err error
+		inst, err = e.startProcessInstanceByIDInner(ctx, defineID, operator, args)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return inst, nil
+}
+
+func (e *EngineImpl) startProcessInstanceByIDInner(ctx context.Context, defineID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
 	def, err := e.repo.FindDefineByID(ctx, defineID)
 	if err != nil || def == nil {
 		return nil, fmt.Errorf("define not found: %d", defineID)
@@ -97,6 +126,19 @@ func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int6
 // ─── Execute ───────────────────────────────────────────────────────────────────
 
 func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	var inst *model.ProcessInstance
+	err := e.InTx(ctx, func(ctx context.Context) error {
+		var err error
+		inst, err = e.executeProcessTaskInner(ctx, taskID, operator, args)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return inst, nil
+}
+
+func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
 	// issues/127 / spec 11-events §11.7 办理时抄送（tf_ccActors）：本栈此前整条腿缺失。
 	// 覆盖面按 §11.7 边界 2 收窄到**只有 executeProcessTask 这一条路径**建 cc——基准＝Java
 	// JeeflowEngineImpl 里 handleCcActors 的唯一调用点就在 executeProcessTask，
@@ -120,7 +162,7 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 		// 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
 		// createTask 触发的同节点 PostHandle 幂等一致（同一节点同一次执行仅更新一次）
 		// issues/60：声明未解析 → 显式报错（不静默跳过）
-		if err := e.firePostInterceptors(curNode, inst); err != nil {
+		if err := e.firePostInterceptors(ctx, curNode, inst); err != nil {
 			return nil, err
 		}
 		now := time.Now()
@@ -164,7 +206,7 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 					// （变量源＝实例变量 inst.Variables，对齐 Java createCountersignTasks 走 this.variables）
 					applyExpireTime(nt, expireExprOf(curNode), inst.Variables)
 					// issues/116：顺序会签推进的新任务同样在建单期并入生效委托代理人
-					e.saveNewTask(ctx, nt, e.surrogateProcessName(flow, inst))
+					e.saveNewTask(ctx, nt, e.surrogateProcessName(ctx, flow, inst))
 					// PROCESS_TASK_START：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler）
 					e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID,
 						NodeID: curNode.ID, Operator: operator, Actors: nt.ActorIDs})
@@ -260,6 +302,19 @@ func syncTaskToAggregate(inst *model.ProcessInstance, task *model.ProcessTask) {
 // ─── Reject ────────────────────────────────────────────────────────────────────
 
 func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	var inst *model.ProcessInstance
+	err := e.InTx(ctx, func(ctx context.Context) error {
+		var err error
+		inst, err = e.executeAndJumpToEndInner(ctx, taskID, operator, args)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return inst, nil
+}
+
+func (e *EngineImpl) executeAndJumpToEndInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
 	// §11.7 边界 2：跳转·回退档不挂抄送钩子（cc 钩子传 nil）——tf_ccActors 在这一档不建 cc、
 	// 不发 CC_CREATE，与 Java executeAndJumpToEnd（无 handleCcActors）同形。
 	_, inst, _, _, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
@@ -283,6 +338,19 @@ func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, oper
 // ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）─────
 
 func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
+	var inst *model.ProcessInstance
+	err := e.InTx(ctx, func(ctx context.Context) error {
+		var err error
+		inst, err = e.executeAndJumpTaskInner(ctx, taskID, operator, args, targetTaskName)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return inst, nil
+}
+
+func (e *EngineImpl) executeAndJumpTaskInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
 	// §11.7 边界 2：JUMP/ROLLBACK 两档都不建 cc（cc 钩子传 nil），与 Java executeAndJumpTask 同形
 	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
 	if err != nil {
@@ -320,6 +388,19 @@ func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, opera
 // ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）──────────────
 
 func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	var inst *model.ProcessInstance
+	err := e.InTx(ctx, func(ctx context.Context) error {
+		var err error
+		inst, err = e.executeAndJumpToFirstTaskNodeInner(ctx, taskID, operator, args)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return inst, nil
+}
+
+func (e *EngineImpl) executeAndJumpToFirstTaskNodeInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
 	// §11.7 边界 2：退发起人档不建 cc（cc 钩子传 nil），与 Java executeAndJumpToFirstTaskNode 同形
 	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
 	if err != nil {
@@ -492,7 +573,7 @@ func (e *EngineImpl) rollbackToParent(ctx context.Context, flow *model.FlowModel
 	// 变量源用**随行拷贝那份变量** nt.Variables（＝boot2 的 hisVariable），不是实例变量——
 	// 两档搞混会让"表达式是个变量名"这一档跨栈给出不同答案
 	applyExpireTime(nt, expireExprOf(findNode(flow, task.TaskName)), nt.Variables)
-	pn := e.surrogateProcessName(flow, inst)
+	pn := e.surrogateProcessName(ctx, flow, inst)
 	e.saveNewTask(ctx, nt, pn)
 	e.fireEvent(ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID,
 		NodeID: prev.ID, Operator: operator, Actors: nt.ActorIDs})
@@ -576,7 +657,7 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 	form := formKeyOf(node)
 	// issues/126 案 A：节点到期表达式一次读好复用（未配 → ""，四处写点各自保持该列 NULL）
 	expr := expireExprOf(node)
-	pn := e.surrogateProcessName(flow, inst)
+	pn := e.surrogateProcessName(ctx, flow, inst)
 	// 建单不变量 ②：判据沿用现成的 isFirstTaskNode（start 直接后继），同一次建单只算一次
 	isFirst := e.isFirstTaskNode(flow, node)
 
@@ -650,7 +731,7 @@ func (e *EngineImpl) loadAndCheck(ctx context.Context, taskID int64, operator st
 	if task.TaskState != model.TaskStateDoing {
 		return nil, nil, fmt.Errorf("task not doing: %d", task.TaskState)
 	}
-	if !e.isAllowed(task, operator) {
+	if !e.isAllowed(ctx, task, operator) {
 		return nil, nil, fmt.Errorf("operator %s not allowed", operator)
 	}
 	inst, err := e.repo.FindInstanceByID(ctx, task.ProcessInstanceID)
@@ -717,7 +798,7 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 		return e.execCustomNode(ctx, flow, node, inst, operator, vars, parentTaskID)
 	}
 	// issues/60：声明未解析 → 显式报错（不静默跳过）
-	proceed, err := e.firePreInterceptors(node, inst)
+	proceed, err := e.firePreInterceptors(ctx, node, inst)
 	if err != nil {
 		return err
 	}
@@ -726,7 +807,7 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 	}
 	defer func() {
 		// 错误理论不可达：resolve 已由上方 firePre 校验并缓存（同 inst/DefineID）
-		_ = e.firePostInterceptors(node, inst)
+		_ = e.firePostInterceptors(ctx, node, inst)
 	}()
 
 	switch node.Type {
@@ -849,7 +930,7 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 	form := formKeyOf(node)
 	// issues/126 案 A：节点到期表达式一次读好复用（未配 → ""，四处写点各自保持该列 NULL）
 	expr := expireExprOf(node)
-	pn := e.surrogateProcessName(flow, inst)
+	pn := e.surrogateProcessName(ctx, flow, inst)
 	// 建单不变量 ②（issues/121 P1）：判据沿用现成的 isFirstTaskNode（start 直接后继），一次算好复用
 	isFirst := e.isFirstTaskNode(flow, node)
 
@@ -1138,7 +1219,7 @@ func actorValueToRawStrings(v interface{}, split bool) []string {
 	}
 }
 
-func (e *EngineImpl) isAllowed(task *model.ProcessTask, operator string) bool {
+func (e *EngineImpl) isAllowed(ctx context.Context, task *model.ProcessTask, operator string) bool {
 	// v1.0.1：系统代执行（flow.auto）/超级管理员（flow.admin）放行（对齐 boot3 isAllowed）
 	if strings.EqualFold(operator, KeyAutoExecute) || strings.EqualFold(operator, KeyAdminID) {
 		return true
@@ -1147,8 +1228,8 @@ func (e *EngineImpl) isAllowed(task *model.ProcessTask, operator string) bool {
 	if task.IsAllowed(operator) {
 		return true
 	}
-	// 仓储兜底：任务参与人表
-	actors, _ := e.repo.FindTaskActors(context.Background(), task.ID)
+	// 仓储兜底：任务参与人表（与调用方同一 ctx ⇒ 事务内读同连接，audit8 R9 145-3）
+	actors, _ := e.repo.FindTaskActors(ctx, task.ID)
 	for _, a := range actors {
 		if a == operator {
 			return true

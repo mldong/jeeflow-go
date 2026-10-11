@@ -16,12 +16,15 @@ import (
 
 // ─── Interceptor ───────────────────────────────────────────────────────────────
 
-// FlowInterceptor 流程拦截器——对标 Java FlowInterceptor
+// FlowInterceptor 流程拦截器——对标 Java FlowInterceptor。
+//
+// audit8 R9 145-3（spec/12 §12.2 覆盖面）：派发随调用方 ctx 走——拦截器在事务内被调起时
+// 拿到的就是绑定了事务连接的 ctx（persist 落库腿据此并入动作事务，C99 ⑥）。
 type FlowInterceptor interface {
 	// PreHandle 节点执行前调用，返回 false 则跳过该节点
-	PreHandle(node *model.FlowNode, inst *model.ProcessInstance) (proceed bool)
+	PreHandle(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance) (proceed bool)
 	// PostHandle 节点执行后调用
-	PostHandle(node *model.FlowNode, inst *model.ProcessInstance)
+	PostHandle(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance)
 	// Order 拦截器排序，越小越先执行
 	Order() int
 }
@@ -223,7 +226,8 @@ func (e *EngineImpl) SetExtensions(ext *Extensions) {
 // interceptorCache 定义级拦截器解析缓存（issue 34，按 defineId）
 // issues/60：解析与校验分离——声明中存在未注册名时返回显式错误（不静默跳过），
 // 且错误不写缓存，保证后续执行持续报错直至注册补齐。
-func (e *EngineImpl) resolveInterceptors(inst *model.ProcessInstance) ([]FlowInterceptor, error) {
+// audit8 R9 145-3：读定义走调用方 ctx（事务内同连接），不再自造 Background。
+func (e *EngineImpl) resolveInterceptors(ctx context.Context, inst *model.ProcessInstance) ([]FlowInterceptor, error) {
 	if e.ext == nil {
 		return nil, nil
 	}
@@ -234,7 +238,7 @@ func (e *EngineImpl) resolveInterceptors(inst *model.ProcessInstance) ([]FlowInt
 		return cached, nil
 	}
 	list := e.ext.Interceptors
-	if def, err := e.repo.FindDefineByID(context.Background(), inst.DefineID); err == nil && def != nil {
+	if def, err := e.repo.FindDefineByID(ctx, inst.DefineID); err == nil && def != nil {
 		var meta struct {
 			PostInterceptors string `json:"postInterceptors"`
 		}
@@ -257,16 +261,16 @@ func (e *EngineImpl) resolveInterceptors(inst *model.ProcessInstance) ([]FlowInt
 }
 
 // firePreInterceptors 执行前置拦截器
-func (e *EngineImpl) firePreInterceptors(node *model.FlowNode, inst *model.ProcessInstance) (bool, error) {
+func (e *EngineImpl) firePreInterceptors(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance) (bool, error) {
 	if e.ext == nil {
 		return true, nil
 	}
-	list, err := e.resolveInterceptors(inst)
+	list, err := e.resolveInterceptors(ctx, inst)
 	if err != nil {
 		return false, err
 	}
 	for _, ic := range list {
-		if !ic.PreHandle(node, inst) {
+		if !ic.PreHandle(ctx, node, inst) {
 			return false, nil
 		}
 	}
@@ -274,16 +278,16 @@ func (e *EngineImpl) firePreInterceptors(node *model.FlowNode, inst *model.Proce
 }
 
 // firePostInterceptors 执行后置拦截器
-func (e *EngineImpl) firePostInterceptors(node *model.FlowNode, inst *model.ProcessInstance) error {
+func (e *EngineImpl) firePostInterceptors(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance) error {
 	if e.ext == nil {
 		return nil
 	}
-	list, err := e.resolveInterceptors(inst)
+	list, err := e.resolveInterceptors(ctx, inst)
 	if err != nil {
 		return err
 	}
 	for _, ic := range list {
-		ic.PostHandle(node, inst)
+		ic.PostHandle(ctx, node, inst)
 	}
 	return nil
 }

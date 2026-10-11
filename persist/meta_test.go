@@ -2,6 +2,7 @@
 package persist_test
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"path/filepath"
@@ -98,7 +99,7 @@ func TestMetaTableWriterReader(t *testing.T) {
 	writer := persist.NewMetaTableWriter(base, provider)
 	reader := persist.NewMetaTableReader(persist.NewJdbcTableReader(db), provider)
 
-	_, err = writer.Insert("biz_leave", map[string]interface{}{
+	_, err = writer.Insert(context.Background(), "biz_leave", map[string]interface{}{
 		"companyName":   "复杂公司",
 		"amount":        800,
 		"extra":         map[string]interface{}{"tag": "vip", "level": 3},
@@ -172,7 +173,7 @@ func TestMetaFallback(t *testing.T) {
 	provider := &mapMetaProvider{metas: map[string]*persist.TableMeta{}}
 	writer := persist.NewMetaTableWriter(base, provider)
 	reader := persist.NewMetaTableReader(persist.NewJdbcTableReader(db), provider)
-	if _, err := writer.Insert("biz_leave", map[string]interface{}{"title": "回落", "process_instance_id": int64(1)}); err != nil {
+	if _, err := writer.Insert(context.Background(), "biz_leave", map[string]interface{}{"title": "回落", "process_instance_id": int64(1)}); err != nil {
 		t.Fatalf("insert failed: %v", err)
 	}
 	result, err := reader.ReadByProcessInstance("biz_leave", int64(1))
@@ -231,7 +232,7 @@ func TestSubTableUserPropagationAndUpdate(t *testing.T) {
 	reader := persist.NewMetaTableReader(persist.NewJdbcTableReader(db), provider)
 
 	operator := int64(1567738052492341249)
-	pk, err := writer.Insert("biz_parent", map[string]interface{}{
+	pk, err := writer.Insert(context.Background(), "biz_parent", map[string]interface{}{
 		"title": "传播测试", "apply_user_id": operator,
 		"address": map[string]interface{}{"province": "广东省", "city": "深圳市"},
 		"items":   []interface{}{map[string]interface{}{"itemName": "测试项目A"}},
@@ -257,7 +258,7 @@ func TestSubTableUserPropagationAndUpdate(t *testing.T) {
 		t.Fatalf("parent create_user should be operator: %d", parentUser)
 	}
 	// Update：EXPAND 展开列 + 状态字段直通（子表不参与中途更新）
-	if _, err := writer.Update("biz_parent", map[string]interface{}{
+	if _, err := writer.Update(context.Background(), "biz_parent", map[string]interface{}{
 		"address": map[string]interface{}{"province": "北京市", "city": "海淀区"},
 		"finish":  20,
 	}, "process_instance_id", int64(999)); err != nil {

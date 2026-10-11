@@ -1,6 +1,7 @@
 package persist_test
 
 import (
+	"context"
 	"database/sql"
 	"strings"
 	"testing"
@@ -50,7 +51,7 @@ func TestInsertFull(t *testing.T) {
 		"apply_dept_id":      "D01",
 	}
 	w.FillSystemFields(data, true)
-	_, err := w.Insert("biz_leave", data)
+	_, err := w.Insert(context.Background(), "biz_leave", data)
 	if err != nil {
 		t.Fatalf("insert failed: %v", err)
 	}
@@ -70,7 +71,7 @@ func TestInsertFull(t *testing.T) {
 func TestFilterColumns(t *testing.T) {
 	db, w := setupDB(t)
 	defer db.Close()
-	kept, err := w.FilterColumns("biz_leave", []string{"title", "no_such_col", "amount"})
+	kept, err := w.FilterColumns(context.Background(), "biz_leave", []string{"title", "no_such_col", "amount"})
 	if err != nil {
 		t.Fatalf("filter failed: %v", err)
 	}
@@ -78,7 +79,7 @@ func TestFilterColumns(t *testing.T) {
 		t.Fatalf("filter result mismatch: %v", kept)
 	}
 	// Insert 内部同样过滤
-	_, err = w.Insert("biz_leave", map[string]interface{}{"title": "t", "ghost_col": "x"})
+	_, err = w.Insert(context.Background(), "biz_leave", map[string]interface{}{"title": "t", "ghost_col": "x"})
 	if err != nil {
 		t.Fatalf("insert with extra col failed: %v", err)
 	}
@@ -88,7 +89,7 @@ func TestFilterColumns(t *testing.T) {
 func TestInsertNilValue(t *testing.T) {
 	db, w := setupDB(t)
 	defer db.Close()
-	_, err := w.Insert("biz_leave", map[string]interface{}{"title": "t", "amount": nil, "apply_dept_id": nil})
+	_, err := w.Insert(context.Background(), "biz_leave", map[string]interface{}{"title": "t", "amount": nil, "apply_dept_id": nil})
 	if err != nil {
 		t.Fatalf("insert nil failed: %v", err)
 	}
@@ -98,7 +99,7 @@ func TestInsertNilValue(t *testing.T) {
 func TestInjectSafe(t *testing.T) {
 	db, w := setupDB(t)
 	defer db.Close()
-	_, err := w.Insert("biz_leave", map[string]interface{}{"title": "x'); DROP TABLE biz_leave; --"})
+	_, err := w.Insert(context.Background(), "biz_leave", map[string]interface{}{"title": "x'); DROP TABLE biz_leave; --"})
 	if err != nil {
 		t.Fatalf("insert failed: %v", err)
 	}
@@ -115,10 +116,10 @@ func TestInjectSafe(t *testing.T) {
 func TestSysPrefixRejected(t *testing.T) {
 	db, w := setupDB(t)
 	defer db.Close()
-	if _, err := w.Insert("sys_user", map[string]interface{}{"x": 1}); err == nil {
+	if _, err := w.Insert(context.Background(), "sys_user", map[string]interface{}{"x": 1}); err == nil {
 		t.Fatal("sys_ prefix should be rejected")
 	}
-	if _, err := w.FilterColumns("sys_user", []string{"x"}); err == nil {
+	if _, err := w.FilterColumns(context.Background(), "sys_user", []string{"x"}); err == nil {
 		t.Fatal("sys_ prefix should be rejected")
 	}
 }
@@ -127,7 +128,7 @@ func TestSysPrefixRejected(t *testing.T) {
 func TestIllegalTableName(t *testing.T) {
 	db, w := setupDB(t)
 	defer db.Close()
-	if _, err := w.Insert("biz_leave; DROP TABLE biz_leave", map[string]interface{}{"x": 1}); err == nil {
+	if _, err := w.Insert(context.Background(), "biz_leave; DROP TABLE biz_leave", map[string]interface{}{"x": 1}); err == nil {
 		t.Fatal("illegal table name should be rejected")
 	}
 }
@@ -136,18 +137,18 @@ func TestIllegalTableName(t *testing.T) {
 func TestExistsIdempotent(t *testing.T) {
 	db, w := setupDB(t)
 	defer db.Close()
-	_, err := w.Insert("biz_leave", map[string]interface{}{"title": "t", "process_instance_id": int64(99)})
+	_, err := w.Insert(context.Background(), "biz_leave", map[string]interface{}{"title": "t", "process_instance_id": int64(99)})
 	if err != nil {
 		t.Fatalf("insert failed: %v", err)
 	}
-	ok, err := w.Exists("biz_leave", "process_instance_id", int64(99))
+	ok, err := w.Exists(context.Background(), "biz_leave", "process_instance_id", int64(99))
 	if err != nil {
 		t.Fatalf("exists failed: %v", err)
 	}
 	if !ok {
 		t.Fatal("exists should be true")
 	}
-	ok, _ = w.Exists("biz_leave", "process_instance_id", int64(100))
+	ok, _ = w.Exists(context.Background(), "biz_leave", "process_instance_id", int64(100))
 	if ok {
 		t.Fatal("exists should be false for other key")
 	}
@@ -195,7 +196,7 @@ func TestFillSystemFields(t *testing.T) {
 func TestLooseCamelMatch(t *testing.T) {
 	db, w := setupDB(t)
 	defer db.Close()
-	_, err := w.Insert("biz_leave", map[string]interface{}{
+	_, err := w.Insert(context.Background(), "biz_leave", map[string]interface{}{
 		"startTime":         "09:00:00", // 驼峰 key（表列 start_time）
 		"processInstanceId": int64(55),  // 驼峰 key（表列 process_instance_id）
 	})
@@ -210,7 +211,7 @@ func TestLooseCamelMatch(t *testing.T) {
 	if startTime != "09:00:00" || pi != 55 {
 		t.Fatalf("camel key should land on snake column: start_time=%s pi=%d", startTime, pi)
 	}
-	kept, _ := w.FilterColumns("biz_leave", []string{"startTime", "processInstanceId", "no_such"})
+	kept, _ := w.FilterColumns(context.Background(), "biz_leave", []string{"startTime", "processInstanceId", "no_such"})
 	if len(kept) != 2 {
 		t.Fatalf("loose filter mismatch: %v", kept)
 	}
@@ -221,7 +222,7 @@ func TestStrictColumnMatch(t *testing.T) {
 	db, w := setupDB(t)
 	defer db.Close()
 	w.StrictColumnMatch = true
-	_, err := w.Insert("biz_leave", map[string]interface{}{
+	_, err := w.Insert(context.Background(), "biz_leave", map[string]interface{}{
 		"startTime": "09:00:00", // 严格模式：驼峰不匹配表列 start_time
 		"title":     "strict",
 	})
@@ -250,7 +251,7 @@ func TestPrimaryKeyGenerator(t *testing.T) {
 	}
 	w := persist.NewJdbcDynamicTableWriter(db)
 	w.PrimaryKeyGenerator = func(tableName string) interface{} { return "snow-888" }
-	if _, err := w.Insert("biz_snow", map[string]interface{}{"title": "snow"}); err != nil {
+	if _, err := w.Insert(context.Background(), "biz_snow", map[string]interface{}{"title": "snow"}); err != nil {
 		t.Fatalf("insert failed: %v", err)
 	}
 	var id, title string
@@ -261,7 +262,7 @@ func TestPrimaryKeyGenerator(t *testing.T) {
 		t.Fatalf("pk should be generated: id=%s title=%s", id, title)
 	}
 	// data 已含主键值 → 用之，不调生成器
-	if _, err := w.Insert("biz_snow", map[string]interface{}{"id": "manual-1", "title": "m"}); err != nil {
+	if _, err := w.Insert(context.Background(), "biz_snow", map[string]interface{}{"id": "manual-1", "title": "m"}); err != nil {
 		t.Fatalf("insert with manual pk failed: %v", err)
 	}
 	var n int
@@ -281,7 +282,7 @@ func TestMissingPrimaryKeyGenerator(t *testing.T) {
 		t.Fatalf("create table failed: %v", err)
 	}
 	w := persist.NewJdbcDynamicTableWriter(db) // 未配置生成器
-	_, err = w.Insert("biz_snow", map[string]interface{}{"title": "x"})
+	_, err = w.Insert(context.Background(), "biz_snow", map[string]interface{}{"title": "x"})
 	if err == nil || !strings.Contains(err.Error(), "primary key generator") {
 		t.Fatalf("should fail with clear error, got: %v", err)
 	}

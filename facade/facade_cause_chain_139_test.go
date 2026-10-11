@@ -9,6 +9,7 @@
 package facade
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -17,7 +18,7 @@ import (
 // TestIssue139DeployKeepsJsonSyntaxErrorInCause deploy：msg 固定 ＋ cause 是原始 *json.SyntaxError。
 func TestIssue139DeployKeepsJsonSyntaxErrorInCause(t *testing.T) {
 	f := &Facade{} // 解析在碰仓储之前就失败，无需装配
-	_, err := f.deploy(map[string]interface{}{"content": `{"name":"broken",`})
+	_, err := f.deploy(context.Background(), map[string]interface{}{"content": `{"name":"broken",`})
 	if err == nil {
 		t.Fatal("坏 JSON 的 deploy 应返回 error")
 	}
@@ -43,7 +44,7 @@ func TestIssue139DeployKeepsJsonSyntaxErrorInCause(t *testing.T) {
 // 出口 msg 与语法错档**完全同一条**（跨栈逐字文案），差异只体现在 cause 上。
 func TestIssue139RedeployKeepsJsonTypeErrorInCause(t *testing.T) {
 	f := &Facade{}
-	err := f.redeploy(map[string]interface{}{
+	err := f.redeploy(context.Background(), map[string]interface{}{
 		"processDefineId": int64(1), "content": `{"name":123}`,
 	})
 	if err == nil {

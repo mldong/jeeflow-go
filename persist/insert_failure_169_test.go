@@ -1,6 +1,7 @@
 package persist_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -19,7 +20,7 @@ type failInsertWriter struct {
 	lastTable   string
 }
 
-func (f *failInsertWriter) Insert(tableName string, data map[string]interface{}) (interface{}, error) {
+func (f *failInsertWriter) Insert(ctx context.Context, tableName string, data map[string]interface{}) (interface{}, error) {
 	f.insertCalls++
 	f.lastTable = tableName
 	return nil, fmt.Errorf("Column 'apply_user_id' cannot be null")
@@ -69,7 +70,7 @@ func TestIssue169ArchiveInsertFailurePanics(t *testing.T) {
 
 	func() {
 		defer func() { mustPersistPanic(t, recover(), "biz_leave") }()
-		ic.PostHandle(&model.FlowNode{ID: "end", Type: model.TypeEnd}, inst)
+		ic.PostHandle(context.Background(), &model.FlowNode{ID: "end", Type: model.TypeEnd}, inst)
 	}()
 
 	if w.insertCalls != 1 {
@@ -100,7 +101,7 @@ func TestIssue169SyncFirstInsertFailurePanics(t *testing.T) {
 
 	func() {
 		defer func() { mustPersistPanic(t, recover(), "biz_sync") }()
-		ic.PostHandle(&model.FlowNode{ID: "start", Type: model.TypeStart}, inst)
+		ic.PostHandle(context.Background(), &model.FlowNode{ID: "start", Type: model.TypeStart}, inst)
 	}()
 
 	if w.insertCalls != 1 {

@@ -498,7 +498,7 @@ func TestIssue137BizDataJSONLegStillGivesContractText(t *testing.T) {
 func TestIssue137ParseFamilyKeepsFixedTextAndCause(t *testing.T) {
 	logBuf := i137CaptureLog(t)
 	f := &Facade{}
-	_, err := f.deploy(map[string]interface{}{"content": `{"name":"broken",`})
+	_, err := f.deploy(context.Background(), map[string]interface{}{"content": `{"name":"broken",`})
 	if err == nil {
 		t.Fatal("坏 JSON 的 deploy 应返回 error")
 	}

@@ -21,17 +21,22 @@ import (
 
 // ─── DynamicTableWriter ────────────────────────────────────────────────────────
 
-// DynamicTableWriter 动态表写入组件接口——引擎无关，四语言契约一致
+// DynamicTableWriter 动态表写入组件接口——引擎无关，四语言契约一致。
+//
+// audit8 R9 C99 ⑥（spec/12 §12.2 覆盖面）：四个触库方法都带 ctx——集成方把动作作用域的 ctx
+// 交给拦截器/写腿后，活动事务经 [JdbcDynamicTableWriter.TxFromCtx] 解析并入同一条连接
+// （业务表写与 wf_* 同事务）；未注入解析器/无活动事务 ⇒ 回落 w.db 逐语句自动提交（允许
+// 运行态，spec §12.1 条 4）。FillSystemFields 纯内存，不需要 ctx。
 type DynamicTableWriter interface {
 	// FilterColumns 按目标表过滤列（表结构探测），返回表内实际存在的列
-	FilterColumns(tableName string, columns []string) ([]string, error)
+	FilterColumns(ctx context.Context, tableName string, columns []string) ([]string, error)
 	// Insert 参数化 INSERT（按 FilterColumns 结果落库），返回生成主键
-	Insert(tableName string, data map[string]interface{}) (interface{}, error)
+	Insert(ctx context.Context, tableName string, data map[string]interface{}) (interface{}, error)
 	// Update 参数化 UPDATE（按 FilterColumns 结果组装 SET 列；条件列排除，防注入），
 	// 返回受影响行数（SYNC 同步演进，issues/24；不支持时返回明确错误）
-	Update(tableName string, data map[string]interface{}, whereColumn string, whereValue interface{}) (int64, error)
+	Update(ctx context.Context, tableName string, data map[string]interface{}, whereColumn string, whereValue interface{}) (int64, error)
 	// Exists 幂等检查：指定业务键（如 process_instance_id）是否已存在
-	Exists(tableName, bizKey string, bizKeyValue interface{}) (bool, error)
+	Exists(ctx context.Context, tableName, bizKey string, bizKeyValue interface{}) (bool, error)
 	// FillSystemFields 按配置列名填充系统字段（未配置的列跳过）
 	FillSystemFields(data map[string]interface{}, isInsert bool)
 }
@@ -73,10 +78,33 @@ type JdbcDynamicTableWriter struct {
 	// 主键生成器（issues/21）：非自增主键表（雪花/应用生成）插入时生成主键值，入参表名
 	PrimaryKeyGenerator func(tableName string) interface{}
 
+	// TxFromCtx 事务解析器（audit8 R9 C99 ⑥）：从 ctx 取活动事务连接（集成方注入，
+	// 如 repository/jdbc.TxFromContext——透出的是 spec 12 §12.3 Go 行登记的同一枚机制）。
+	// ctx 中无事务 / 未注入 ⇒ 回落 w.db（逐语句自动提交，允许运行态）。
+	TxFromCtx func(ctx context.Context) (*sql.Tx, bool)
+
 	mu     sync.RWMutex
 	cache  map[string][]columnMeta
 	sqlite bool // 方言：SQLite 走 PRAGMA table_info
 	mysql  bool // 方言：MySQL 走 EXTRA/COLUMN_KEY
+}
+
+// dbConn 事务连接与池连接的最小公共接口（*sql.DB / *sql.Tx 都满足）
+type dbConn interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
+// conn 本次执行使用的连接：TxFromCtx 命中活动事务 ⇒ 事务连接（并入动作事务，spec §12.2
+// 覆盖面）；否则池连接。探测/读/写全量走它——同一动作内一个连接。
+func (w *JdbcDynamicTableWriter) conn(ctx context.Context) dbConn {
+	if w.TxFromCtx != nil {
+		if tx, ok := w.TxFromCtx(ctx); ok {
+			return tx
+		}
+	}
+	return w.db
 }
 
 // NewJdbcDynamicTableWriter 创建 JDBC 写入器（方言自动探测：
@@ -148,7 +176,7 @@ func (w *JdbcDynamicTableWriter) tableColumns(ctx context.Context, tableName str
 
 func (w *JdbcDynamicTableWriter) probeSQLite(ctx context.Context, tableName string) ([]columnMeta, error) {
 	// PRAGMA 不支持占位符——表名已过安全校验
-	rows, err := w.db.QueryContext(ctx, "PRAGMA table_info("+tableName+")")
+	rows, err := w.conn(ctx).QueryContext(ctx, "PRAGMA table_info("+tableName+")")
 	if err != nil {
 		return nil, fmt.Errorf("persist: probe columns of %s failed: %w", tableName, err)
 	}
@@ -170,7 +198,7 @@ func (w *JdbcDynamicTableWriter) probeSQLite(ctx context.Context, tableName stri
 
 func (w *JdbcDynamicTableWriter) probeMySQL(ctx context.Context, tableName string) ([]columnMeta, error) {
 	// issues/22：限定当前 schema（DATABASE()），防多库同名表列重复
-	rows, err := w.db.QueryContext(ctx,
+	rows, err := w.conn(ctx).QueryContext(ctx,
 		"SELECT column_name, extra, column_key FROM information_schema.columns "+
 			"WHERE UPPER(table_name) = UPPER(?) AND table_schema = DATABASE() "+
 			"ORDER BY ordinal_position", tableName)
@@ -196,7 +224,7 @@ func (w *JdbcDynamicTableWriter) probeMySQL(ctx context.Context, tableName strin
 func (w *JdbcDynamicTableWriter) probeStd(ctx context.Context, tableName string) ([]columnMeta, error) {
 	// PG/H2 标准 SQL：IS_IDENTITY（identity）+ column_default nextval（PG serial）+ 主键约束 JOIN
 	// issues/22：限定当前 schema（CURRENT_SCHEMA()，H2/PG 均支持），防多库同名表列重复
-	rows, err := w.db.QueryContext(ctx,
+	rows, err := w.conn(ctx).QueryContext(ctx,
 		"SELECT c.column_name, c.is_identity, c.column_default, "+
 			"CASE WHEN kcu.column_name IS NOT NULL THEN 'PRI' ELSE '' END AS column_key "+
 			"FROM information_schema.columns c "+
@@ -231,11 +259,11 @@ func (w *JdbcDynamicTableWriter) probeStd(ctx context.Context, tableName string)
 }
 
 // FilterColumns 按目标表过滤列（宽松模式驼峰↔下划线归一匹配，issues/20）
-func (w *JdbcDynamicTableWriter) FilterColumns(tableName string, columns []string) ([]string, error) {
+func (w *JdbcDynamicTableWriter) FilterColumns(ctx context.Context, tableName string, columns []string) ([]string, error) {
 	if err := checkTableName(tableName); err != nil {
 		return nil, err
 	}
-	cols, err := w.tableColumns(context.Background(), tableName)
+	cols, err := w.tableColumns(ctx, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -250,11 +278,11 @@ func (w *JdbcDynamicTableWriter) FilterColumns(tableName string, columns []strin
 
 // Insert 参数化 INSERT（列过滤 + 值过滤，防注入；写入用表列原名，issues/20；
 // 非自增主键生成，issues/21）
-func (w *JdbcDynamicTableWriter) Insert(tableName string, data map[string]interface{}) (interface{}, error) {
+func (w *JdbcDynamicTableWriter) Insert(ctx context.Context, tableName string, data map[string]interface{}) (interface{}, error) {
 	if err := checkTableName(tableName); err != nil {
 		return nil, err
 	}
-	metas, err := w.tableColumns(context.Background(), tableName)
+	metas, err := w.tableColumns(ctx, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +312,7 @@ func (w *JdbcDynamicTableWriter) Insert(tableName string, data map[string]interf
 	placeholders = placeholders[:len(placeholders)-1]
 	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", tableName,
 		strings.Join(names, ","), placeholders)
-	res, err := w.db.ExecContext(context.Background(), query, values...)
+	res, err := w.conn(ctx).ExecContext(ctx, query, values...)
 	if err != nil {
 		return nil, fmt.Errorf("persist: insert into %s failed: %w", tableName, err)
 	}
@@ -297,14 +325,14 @@ func (w *JdbcDynamicTableWriter) Insert(tableName string, data map[string]interf
 
 // Update 参数化 UPDATE（SYNC 同步演进，issues/24）：列过滤（宽松匹配）+ 条件列排除 +
 // 参数化 SET，返回受影响行数。对齐 Java JdbcDynamicTableWriter.update。
-func (w *JdbcDynamicTableWriter) Update(tableName string, data map[string]interface{}, whereColumn string, whereValue interface{}) (int64, error) {
+func (w *JdbcDynamicTableWriter) Update(ctx context.Context, tableName string, data map[string]interface{}, whereColumn string, whereValue interface{}) (int64, error) {
 	if err := checkTableName(tableName); err != nil {
 		return 0, err
 	}
 	if whereColumn == "" {
 		return 0, fmt.Errorf("persist: update %s requires where column", tableName)
 	}
-	metas, err := w.tableColumns(context.Background(), tableName)
+	metas, err := w.tableColumns(ctx, tableName)
 	if err != nil {
 		return 0, err
 	}
@@ -325,7 +353,7 @@ func (w *JdbcDynamicTableWriter) Update(tableName string, data map[string]interf
 	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s = ?", tableName,
 		strings.Join(sets, ","), whereColumn)
 	args = append(args, whereValue)
-	res, err := w.db.ExecContext(context.Background(), query, args...)
+	res, err := w.conn(ctx).ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("persist: update %s failed: %w", tableName, err)
 	}
@@ -362,16 +390,16 @@ func normalizeColumn(name string) string {
 }
 
 // Exists 幂等检查
-func (w *JdbcDynamicTableWriter) Exists(tableName, bizKey string, bizKeyValue interface{}) (bool, error) {
+func (w *JdbcDynamicTableWriter) Exists(ctx context.Context, tableName, bizKey string, bizKeyValue interface{}) (bool, error) {
 	if err := checkTableName(tableName); err != nil {
 		return false, err
 	}
-	if _, err := w.tableColumns(context.Background(), tableName); err != nil {
+	if _, err := w.tableColumns(ctx, tableName); err != nil {
 		return false, err
 	}
 	query := fmt.Sprintf("SELECT COUNT(1) FROM %s WHERE %s = ?", tableName, bizKey)
 	var n int
-	if err := w.db.QueryRowContext(context.Background(), query, bizKeyValue).Scan(&n); err != nil {
+	if err := w.conn(ctx).QueryRowContext(ctx, query, bizKeyValue).Scan(&n); err != nil {
 		return false, fmt.Errorf("persist: exists check on %s failed: %w", tableName, err)
 	}
 	return n > 0, nil

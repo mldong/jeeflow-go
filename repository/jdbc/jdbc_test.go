@@ -130,6 +130,20 @@ func newEngine(t *testing.T, repo spi.ProcessRepository) *engine.EngineImpl {
 
 // ─── 测试用 SPI 实现 ────────────────────────────────────────────────────────────
 
+// ccCountRepo 记「cc 行插入腿已执行」的计数（audit8 R9 后的写序判据）：
+// 事务内另一条连接查不到未提交行（spec 12 §12.2 接缝预期行为），"fire 早于落库"改由
+// 本条计数在 fire 时刻的读数钉住——比"另一条连接看得见"更直接（判的是调用序不是提交序）。
+type ccCountRepo struct {
+	*jdbc.Repository
+	ccInserts int
+}
+
+func (r *ccCountRepo) CreateCcInstanceIfAbsent(ctx context.Context, instanceID int64, creator string, actors ...string) ([]string, error) {
+	fresh, err := r.Repository.CreateCcInstanceIfAbsent(ctx, instanceID, creator, actors...)
+	r.ccInserts += len(fresh)
+	return fresh, err
+}
+
 type noopUserProvider struct{}
 
 func (*noopUserProvider) GetUser(userID string) (*model.UserInfo, error) {
@@ -1113,9 +1127,17 @@ func TestWithTx(t *testing.T) {
 
 // TestCcOnExecuteLegPersistsRowsAndEvents issues/127（spec 11-events §11.7）· T1 真库档：
 // 办理带 tf_ccActors ⇒ 真 MySQL 里建 wf_process_cc_instance 行 + 逐抄送人 fire CC_CREATE，
-// 并且 **fire 那一刻行已可直查**（§11.2 原则 3「只在落库之后 fire」；直查走的是另一条连接，
-// 看得见就说明行已提交，不是事务里的空火）。内存仓档见 engine_test.go 的 TestCcCreateOnExecuteLeg，
-// 这一档证 SQL 写路径与写入语义（actor_id＝被抄送人、create_user＝发起抄送的人）同样成立。
+// 且 **fire 时插入腿已执行**（§11.2 原则 3「只在落库之后 fire」，口径＝fire 时刻写入已进入
+// 本次动作事务，spec 12 §12.2「副作用面」接缝）。
+//
+// ⚠️ 判据换代（audit8 R9 145-3）：动作从"逐语句自动提交"变成"整次动作一个事务"后，§12.2 接缝
+// 明文规定"监听器用**另一条连接**反查则读不到（未提交），集成方必须按此选型"——旧形状的
+// "fire 那刻走另一条连接直查得到行"（等价于"提交后才 fire"）只对**门面级没有事务模板**的栈成立。
+// 本档据此把"不是事务里的空火"改成**写序判据**：仓储侧记 CreateCcInstanceIfAbsent 的插入执行序，
+// fire 时刻其计数必须已覆盖该抄送人（fire 早于插入 ⇒ 计数不足 ⇒ 红）；行内容与"提交后可见"
+// 由动作成功返回后的直查照旧钉住。引擎 fire 点仍在事务内（与 java/php/node 现形一致）——
+// "回滚场景通知已发出/监听器读不到未提交行"这一时序债即 audit8 既定候选 N-12（php 同形项＝㉖/R25），
+// 不在本次事务边界收口范围内。
 func TestCcOnExecuteLegPersistsRowsAndEvents(t *testing.T) {
 	db := openDB(t)
 	defer db.Close()
@@ -1126,22 +1148,18 @@ func TestCcOnExecuteLegPersistsRowsAndEvents(t *testing.T) {
 	insertDefine(t, db, "go-simple", content)
 
 	ctx := context.Background()
-	repo := jdbc.New(db)
+	repo := &ccCountRepo{Repository: jdbc.New(db)}
 	eng := newEngine(t, repo)
 	f := facade.New(eng, repo, nil)
 
 	var ccEvts []engine.ProcessEvent
-	var rowsAtFire []int
+	var writesAtFire []int
 	eng.SetExtensions(&engine.Extensions{
 		Listeners: []engine.ProcessEventListener{func(evt engine.ProcessEvent) {
 			if evt.Type != engine.EventCCCreate {
 				return
 			}
-			var n int
-			_ = db.QueryRowContext(ctx, ph(
-				"SELECT COUNT(*) FROM wf_process_cc_instance WHERE process_instance_id = ? AND actor_id = ?"),
-				evt.InstanceID, evt.CcActorID).Scan(&n)
-			rowsAtFire = append(rowsAtFire, n)
+			writesAtFire = append(writesAtFire, repo.ccInserts)
 			ccEvts = append(ccEvts, evt)
 		}},
 	})
@@ -1162,8 +1180,9 @@ func TestCcOnExecuteLegPersistsRowsAndEvents(t *testing.T) {
 		if ccEvts[i].CcActorID != want {
 			t.Errorf("CC_CREATE[%d].ccActorId = %q, want %q", i, ccEvts[i].CcActorID, want)
 		}
-		if rowsAtFire[i] == 0 {
-			t.Fatalf("CC_CREATE[%d] fire 时 %s 的 cc 行还查不到 ⇒ fire 早于落库（§11.2 原则 3）", i, want)
+		// 写序：第 i 条 fire 时，插入腿必须已执行到第 i+1 个抄送人（fire 早于落库即红）
+		if writesAtFire[i] < i+1 {
+			t.Fatalf("CC_CREATE[%d] fire 时插入腿只执行了 %d 个抄送人 ⇒ fire 早于落库（§11.2 原则 3）", i, writesAtFire[i])
 		}
 	}
 	// 库内行核对：正好 2 行，且写入语义 actor_id＝被抄送人 / create_user＝发起抄送的人（§11.7）

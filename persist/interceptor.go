@@ -64,35 +64,37 @@ func NewPersistPostInterceptor(writer DynamicTableWriter, loader DefineLoader) *
 }
 
 // PreHandle 不拦截任何节点
-func (p *PersistPostInterceptor) PreHandle(node *model.FlowNode, inst *model.ProcessInstance) (proceed bool) {
+func (p *PersistPostInterceptor) PreHandle(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance) (proceed bool) {
 	return true
 }
 
 // Order 拦截器排序（默认 0）
 func (p *PersistPostInterceptor) Order() int { return 0 }
 
-// PostHandle 节点执行后调用——按 persistMode 分派 ARCHIVE / SYNC
-func (p *PersistPostInterceptor) PostHandle(node *model.FlowNode, inst *model.ProcessInstance) {
+// PostHandle 节点执行后调用——按 persistMode 分派 ARCHIVE / SYNC。
+// audit8 R9 C99 ⑥：ctx 随引擎拦截器派发带进来（事务内＝绑定事务连接的 ctx），
+// 写腿经 writer 的 TxFromCtx 并入动作事务（spec/12 §12.2 覆盖面；未注入/无事务回落自动提交）。
+func (p *PersistPostInterceptor) PostHandle(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance) {
 	if p.Writer == nil || p.LoadDefine == nil {
 		return // 未注入：静默跳过
 	}
 	if node == nil || inst == nil {
 		return
 	}
-	tableName, persistMode, err := p.resolveDefine(inst)
+	tableName, persistMode, err := p.resolveDefine(ctx, inst)
 	if err != nil || tableName == "" {
 		return // 解析失败/未配置：静默跳过
 	}
 	if strings.EqualFold(persistMode, PersistModeSync) {
-		p.handleSync(node, inst, tableName)
+		p.handleSync(ctx, node, inst, tableName)
 		return
 	}
-	p.handleArchive(node, inst, tableName)
+	p.handleArchive(ctx, node, inst, tableName)
 }
 
 // ─── ARCHIVE（现状：结束同意归档） ─────────────────────────────────────────────
 
-func (p *PersistPostInterceptor) handleArchive(node *model.FlowNode, inst *model.ProcessInstance, tableName string) {
+func (p *PersistPostInterceptor) handleArchive(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance, tableName string) {
 	// 时机：仅结束节点 + 流程正常完成（Go Finish() 置 InstanceStateDone）+ 同意
 	if node.Type != model.TypeEnd {
 		return
@@ -109,7 +111,7 @@ func (p *PersistPostInterceptor) handleArchive(node *model.FlowNode, inst *model
 	}
 	// 幂等：以 process_instance_id 为键，先查后插。
 	// 表不存在等探测失败是配置错误，必须显性暴露（与 Java/Python 抛异常一致）
-	exists, err := p.Writer.Exists(tableName, "process_instance_id", inst.ID)
+	exists, err := p.Writer.Exists(ctx, tableName, "process_instance_id", inst.ID)
 	if err != nil {
 		panic(fmt.Errorf("persist: %w", err))
 	}
@@ -122,18 +124,18 @@ func (p *PersistPostInterceptor) handleArchive(node *model.FlowNode, inst *model
 	p.Writer.FillSystemFields(data, true)
 	// issues/169：写失败与上面的探测失败同档——配置/约束错误必须显性暴露（java py:372 node:276 同侧上抛）。
 	// 旧形状 `_, _ =` 把错误与生成主键一并丢弃，流程照常办结而业务表零行零日志。
-	if _, err := p.Writer.Insert(tableName, data); err != nil {
+	if _, err := p.Writer.Insert(ctx, tableName, data); err != nil {
 		panic(fmt.Errorf("persist: 业务表写入失败 table=%s: %w", tableName, err))
 	}
 }
 
 // ─── SYNC（1.8.0 同步演进：发起入库 → 节点推进 → 结束定稿） ────────────────────
 
-func (p *PersistPostInterceptor) handleSync(node *model.FlowNode, inst *model.ProcessInstance, tableName string) {
+func (p *PersistPostInterceptor) handleSync(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance, tableName string) {
 	if !p.markChain(node, inst) {
 		return // 同链同节点不重复（节点级，issues/19 演进）
 	}
-	exists, err := p.Writer.Exists(tableName, "process_instance_id", inst.ID)
+	exists, err := p.Writer.Exists(ctx, tableName, "process_instance_id", inst.ID)
 	if err != nil {
 		panic(fmt.Errorf("persist: %w", err))
 	}
@@ -153,20 +155,20 @@ func (p *PersistPostInterceptor) handleSync(node *model.FlowNode, inst *model.Pr
 	if isTask {
 		stateCode = stateDoing
 	}
-	p.putStateField(tableName, data, node.ID, stateCode)
+	p.putStateField(ctx, tableName, data, node.ID, stateCode)
 
 	p.fillContext(data, inst)
 	if !exists {
 		p.Writer.FillSystemFields(data, true)
 		// issues/169：首建腿写失败必须显性——下面那条 Update 错已经 panic，两档不能一个炸一个咽
 		// （旧形状 `_, _ =` ⇒ 发起即失败时后续推进全打在不存在的那行上，整单业务数据静默丢失）。
-		if _, err := p.Writer.Insert(tableName, data); err != nil {
+		if _, err := p.Writer.Insert(ctx, tableName, data); err != nil {
 			panic(fmt.Errorf("persist: 业务表写入失败 table=%s: %w", tableName, err))
 		}
 		return
 	}
 	p.Writer.FillSystemFields(data, false) // 只填 update 组
-	if _, err := p.Writer.Update(tableName, data, "process_instance_id", inst.ID); err != nil {
+	if _, err := p.Writer.Update(ctx, tableName, data, "process_instance_id", inst.ID); err != nil {
 		panic(fmt.Errorf("persist: %w", err))
 	}
 }
@@ -174,8 +176,8 @@ func (p *PersistPostInterceptor) handleSync(node *model.FlowNode, inst *model.Pr
 // ─── 公共 ──────────────────────────────────────────────────────────────────────
 
 // resolveDefine 从流程定义 content 顶层解析 relTableName / persistMode（缺省回落流程 name）
-func (p *PersistPostInterceptor) resolveDefine(inst *model.ProcessInstance) (string, string, error) {
-	define, err := p.LoadDefine(context.Background(), inst.DefineID)
+func (p *PersistPostInterceptor) resolveDefine(ctx context.Context, inst *model.ProcessInstance) (string, string, error) {
+	define, err := p.LoadDefine(ctx, inst.DefineID)
 	if err != nil || define == nil {
 		return "", "", err
 	}
@@ -270,11 +272,11 @@ func (p *PersistPostInterceptor) isEditable(fieldPerm map[string]interface{}, fi
 }
 
 // putStateField 状态字段写入：优先 {节点ID}_{状态码} 列，无则 {节点ID} 列（列探测过滤）
-func (p *PersistPostInterceptor) putStateField(tableName string, data map[string]interface{}, nodeID string, stateCode int) {
+func (p *PersistPostInterceptor) putStateField(ctx context.Context, tableName string, data map[string]interface{}, nodeID string, stateCode int) {
 	if nodeID == "" {
 		return
 	}
-	kept, err := p.Writer.FilterColumns(tableName,
+	kept, err := p.Writer.FilterColumns(ctx, tableName,
 		[]string{nodeID + "_" + strconv.Itoa(stateCode), nodeID})
 	if err != nil || len(kept) == 0 {
 		return
