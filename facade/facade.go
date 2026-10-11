@@ -305,14 +305,22 @@ func (f *Facade) redeploy(args map[string]interface{}) error {
 		// issues/139：对外 msg 为固定文案，原始异常只留在错误对象链（Unwrap），不进 msg
 		return fixedMsgError(msgReadFlowDefineJSONFailed, err)
 	}
-	return f.repo.UpdateDefine(context.Background(), &model.ProcessDefine{
+	// audit8 R5/spec 06：redeploy 是原地替换内容——先读再写保留原 state/version（对齐 rust 参考实现）
+	def := &model.ProcessDefine{
 		ID:          defineID,
 		Name:        flow.Name,
 		DisplayName: flow.DisplayName,
 		Type:        flow.Type,
 		Content:     content,
 		UpdateUser:  toStr(args["operator"], "system"),
-	})
+	}
+	if old, oerr := f.repo.FindDefineByID(context.Background(), defineID); oerr == nil && old != nil {
+		def.State = old.State
+		def.Version = old.Version
+		def.CreateTime = old.CreateTime
+		def.CreateUser = old.CreateUser
+	}
+	return f.repo.UpdateDefine(context.Background(), def)
 }
 
 func (f *Facade) removeDefine(args map[string]interface{}) error {
@@ -867,7 +875,11 @@ func (f *Facade) designRedeploy(args map[string]interface{}) (interface{}, error
 			Type:        flow.Type,
 			Content:     content,
 			// issues/59：保留原 version（替换语义，不递增）；缺失时 JDBC 兜底会误写 1
-			Version:    last.Version,
+			Version: last.Version,
+			// audit8 R5/spec 06：替换语义同保 state/create 元数据（停用定义 redeploy 后不得被复活）
+			State:      last.State,
+			CreateTime: last.CreateTime,
+			CreateUser: last.CreateUser,
 			UpdateUser: toStr(args["operator"], "system"),
 		}); err != nil {
 			return nil, err

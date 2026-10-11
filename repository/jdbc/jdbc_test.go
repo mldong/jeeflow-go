@@ -399,6 +399,16 @@ func TestDefineCrud(t *testing.T) {
 		t.Fatalf("state not updated: %d", got.State)
 	}
 
+	// audit8 R5：停用态经 UpdateDefine 整对象回写后仍为 0（修复前仓储把 state==0 兜底成 1 复活停用定义）
+	loaded2, _ := repo.FindDefineByID(ctx, def.ID)
+	loaded2.DisplayName = "CRUD 流程 v3"
+	if err := repo.UpdateDefine(ctx, loaded2); err != nil {
+		t.Fatalf("update define (disabled): %v", err)
+	}
+	if got, _ := repo.FindDefineByID(ctx, def.ID); got.State != 0 {
+		t.Fatalf("UpdateDefine 后停用态应保持 0, got %d", got.State)
+	}
+
 	// remove
 	if err := repo.RemoveDefine(ctx, def.ID); err != nil {
 		t.Fatalf("remove define: %v", err)

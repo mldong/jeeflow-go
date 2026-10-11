@@ -133,6 +133,56 @@ func TestFacadeDeployVersion(t *testing.T) {
 	}
 }
 
+// audit8 R5/spec 06：processDefine/redeploy 原地替换内容——version/state 不变
+func TestDefineRedeployPreservesVersionState(t *testing.T) {
+	f, repo, _ := setupFacade()
+	content := string(flowContent(t, "01-simple.json"))
+
+	// 部署（首次 version=0，启用 state=1）
+	r := f.Flow("processDefine/deploy", map[string]interface{}{"content": content})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("deploy failed: %v", r)
+	}
+	defineID := mustI64(r["data"].(map[string]interface{})["processDefineId"])
+
+	// 方向一：启用态 + version=0 原地替换 → 两者原样保持
+	// （修复前：memory 腿整对象覆盖把 state 清零，JDBC 腿把 version==0 兜底误写 1）
+	r = f.Flow("processDefine/redeploy", map[string]interface{}{
+		"processDefineId": defineID, "content": content, "operator": "lisi",
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("redeploy failed: %v", r)
+	}
+	def, _ := repo.FindDefineByID(context.Background(), defineID)
+	if def.Version != 0 {
+		t.Fatalf("redeploy 后 version 应保持 0, got %d", def.Version)
+	}
+	if def.State != 1 {
+		t.Fatalf("redeploy 后 state 应保持启用 1, got %d", def.State)
+	}
+	if def.UpdateUser != "lisi" {
+		t.Fatalf("redeploy 后 updateUser 应为 lisi, got %s", def.UpdateUser)
+	}
+
+	// 方向二：停用后再 redeploy → 仍停用（JDBC 腿修复前把 state==0 兜底复活成 1）
+	if r := f.Flow("processDefine/upAndDown", map[string]interface{}{"id": defineID, "state": 0}); r["code"].(int) != 0 {
+		t.Fatalf("upAndDown failed: %v", r)
+	}
+	r = f.Flow("processDefine/redeploy", map[string]interface{}{
+		"processDefineId": defineID, "content": content, "operator": "lisi",
+	})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("redeploy(2) failed: %v", r)
+	}
+	def2, _ := repo.FindDefineByID(context.Background(), defineID)
+	if def2.State != 0 {
+		t.Fatalf("停用态 redeploy 后 state 应保持 0, got %d", def2.State)
+	}
+	if def2.Version != 0 {
+		t.Fatalf("停用态 redeploy 后 version 应保持 0, got %d", def2.Version)
+	}
+}
+
 func TestFacadeInstanceTaskAndWithdraw(t *testing.T) {
 	f, repo, _ := setupFacade()
 	content := flowContent(t, "01-simple.json")
@@ -1552,6 +1602,26 @@ func TestDesignDeployRedeployIsDeployed(t *testing.T) {
 	defV2, _ := repo.FindDefineByID(nil, defineID2)
 	if defV2.Version != 5 {
 		t.Fatalf("redeploy 后 version 应保持 5, got %d", defV2.Version)
+	}
+	// audit8 R5：启用态 redeploy 后 state 不得被打回 0（修复前 facade 未携带 State，memory 腿整对象覆盖清零）
+	if defV2.State != 1 {
+		t.Fatalf("redeploy 后 state 应保持启用 1, got %d", defV2.State)
+	}
+
+	// audit8 R5：同替换语义，停用态 redeploy 后也不得被复活（JDBC 腿兜底会把 0 写成 1，由 L2 格覆盖）
+	if r := f.Flow("processDefine/upAndDown", map[string]interface{}{"id": defineID2, "state": 0}); r["code"].(int) != 0 {
+		t.Fatalf("upAndDown: %v", r)
+	}
+	r = f.Flow("processDesign/redeploy", map[string]interface{}{"id": designID, "operator": "zhangsan"})
+	if code, _ := r["code"].(int); code != 0 {
+		t.Fatalf("redeploy(3): %v", r)
+	}
+	defV3, _ := repo.FindDefineByID(nil, defineID2)
+	if defV3.State != 0 {
+		t.Fatalf("designRedeploy 后 state 应保持停用 0, got %d", defV3.State)
+	}
+	if defV3.Version != 5 {
+		t.Fatalf("designRedeploy 后 version 仍应保持 5, got %d", defV3.Version)
 	}
 }
 

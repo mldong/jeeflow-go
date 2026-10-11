@@ -330,12 +330,8 @@ func (r *Repository) SaveDefine(ctx context.Context, def *model.ProcessDefine) e
 }
 
 func (r *Repository) UpdateDefine(ctx context.Context, def *model.ProcessDefine) error {
-	if def.State == 0 {
-		def.State = 1
-	}
-	if def.Version == 0 {
-		def.Version = 1
-	}
+	// audit8 R5：写透调用方值（不再把 state/version 的 0 兜底成 1）——0 是合法取值
+	// （停用态 / 首个版本），redeploy 由门面先读再写回填；兜底会复活停用定义
 	c := r.conn(ctx)
 	_, err := c.ExecContext(ctx,
 		"UPDATE wf_process_define SET name=?, display_name=?, type=?, state=?, content=?, version=?, update_time=?, update_user=? WHERE id=?",
