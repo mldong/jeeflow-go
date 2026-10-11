@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"reflect"
 	"sort"
@@ -1112,7 +1113,15 @@ func (f *Facade) highLight(args map[string]interface{}) (interface{}, error) {
 	def, _ := f.repo.FindDefineByID(context.Background(), inst.DefineID)
 	if def != nil {
 		var flow model.FlowModel
-		if json.Unmarshal(def.Content, &flow) == nil {
+		// issues/162 的 go 腿（owner 10-11 拍口径＝保留降级面＋落一条可诊断日志，形状照 python
+		// `_log.warning`／php `error_log`）：定义 content 坏形状不该让整条 highLight 报错
+		// （对外仍 code=0、只是边集/节点补全/nodeProgress 留空），但旧形状 `if Unmarshal(...)==nil`
+		// 把降级判得一声不响——这条通道当年藏住过 156／160 两个真分叉，**不许新增第二条静默腿**。
+		// ⚠ 本栈另两腿（buildNodeProgress／collectPath）签名不返错误，可观测的只有这一处解码失败。
+		if err := json.Unmarshal(def.Content, &flow); err != nil {
+			log.Printf("[jeeflow] WARN highLight 模型补全腿解码失败，边集/节点补全/nodeProgress 已降级（实例与任务行不受影响）: instanceId=%d, defineId=%d, err=%v",
+				inst.ID, inst.DefineID, err)
+		} else {
 			nodeProgress = f.buildNodeProgress(&flow, his)
 			f.collectPath(&flow, "start", active, &history, &edges, map[string]bool{}, inst.Variables, his)
 		}

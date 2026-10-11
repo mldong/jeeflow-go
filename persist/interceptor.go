@@ -120,7 +120,11 @@ func (p *PersistPostInterceptor) handleArchive(node *model.FlowNode, inst *model
 	data := p.extractFields(inst, nil, false, true) // 只 f_ 全量
 	p.fillContext(data, inst)
 	p.Writer.FillSystemFields(data, true)
-	_, _ = p.Writer.Insert(tableName, data)
+	// issues/169：写失败与上面的探测失败同档——配置/约束错误必须显性暴露（java py:372 node:276 同侧上抛）。
+	// 旧形状 `_, _ =` 把错误与生成主键一并丢弃，流程照常办结而业务表零行零日志。
+	if _, err := p.Writer.Insert(tableName, data); err != nil {
+		panic(fmt.Errorf("persist: 业务表写入失败 table=%s: %w", tableName, err))
+	}
 }
 
 // ─── SYNC（1.8.0 同步演进：发起入库 → 节点推进 → 结束定稿） ────────────────────
@@ -154,7 +158,11 @@ func (p *PersistPostInterceptor) handleSync(node *model.FlowNode, inst *model.Pr
 	p.fillContext(data, inst)
 	if !exists {
 		p.Writer.FillSystemFields(data, true)
-		_, _ = p.Writer.Insert(tableName, data)
+		// issues/169：首建腿写失败必须显性——下面那条 Update 错已经 panic，两档不能一个炸一个咽
+		// （旧形状 `_, _ =` ⇒ 发起即失败时后续推进全打在不存在的那行上，整单业务数据静默丢失）。
+		if _, err := p.Writer.Insert(tableName, data); err != nil {
+			panic(fmt.Errorf("persist: 业务表写入失败 table=%s: %w", tableName, err))
+		}
 		return
 	}
 	p.Writer.FillSystemFields(data, false) // 只填 update 组
