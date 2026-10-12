@@ -608,6 +608,13 @@ func TestWithdrawAuthzPersistsUpdateUser(t *testing.T) {
 	const taskSQL = "SELECT task_state, update_user FROM wf_process_task WHERE id = ?"
 	const instSQL = "SELECT state, update_user FROM wf_process_instance WHERE id = ?"
 
+	// 前置（R10 · issues/176）：apply 腿由 flow.auto 代执行（spec 04:60-62）⇒ 已完成行
+	// = 20 + update_user flow.auto；下面"撤回不得改写已完成行"的断言与撤回前读数逐字比对
+	applyStateBefore, applyUserBefore := queryRowState(t, db, applySQL, instID)
+	if applyStateBefore != int(model.TaskStateDone) || applyUserBefore != "flow.auto" {
+		t.Fatalf("前置：apply 行应为 20 + flow.auto（代执行语义），实得 %d + %q", applyStateBefore, applyUserBefore)
+	}
+
 	// 负向①：operator 缺失 / 空串 → 99999999 + msg，库里原状不动
 	for _, args := range []map[string]interface{}{
 		{"id": instID},
@@ -646,9 +653,10 @@ func TestWithdrawAuthzPersistsUpdateUser(t *testing.T) {
 	if s, u := queryRowState(t, db, taskSQL, taskID); s != int(model.TaskStateWithdraw) || u != "leader" {
 		t.Fatalf("task1 落库 = state %d update_user %q, want 30（不是 99）+ leader", s, u)
 	}
-	// 已完成(20) 的 apply 行：状态与 update_user 都不得被撤回改写
-	if s, u := queryRowState(t, db, applySQL, instID); s != int(model.TaskStateDone) || u != "zhangsan" {
-		t.Fatalf("已完成任务被改写 = state %d update_user %q, want 20 + zhangsan", s, u)
+	// 已完成(20) 的 apply 行：状态与 update_user 都不得被撤回改写（撤回前=撤回后）
+	if s, u := queryRowState(t, db, applySQL, instID); s != applyStateBefore || u != applyUserBefore {
+		t.Fatalf("已完成任务被改写 = state %d update_user %q, want %d + %q（撤回前=撤回后）",
+			s, u, applyStateBefore, applyUserBefore)
 	}
 }
 

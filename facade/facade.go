@@ -275,7 +275,9 @@ func (f *Facade) startAndExecute(ctx context.Context, args map[string]interface{
 		if v, ok := flowArgs[engine.KeyProcessStartNextNodeOperator]; ok && fmt.Sprintf("%v", v) != "" {
 			flowArgs[engine.KeyNextNodeOperator] = v
 		}
-		if _, err := f.engine.ExecuteProcessTask(ctx, task.ID, operator, flowArgs); err != nil {
+		// issues/176：spec 04:60-62——apply 节点由 flow.auto 代执行（operator 列=flow.auto，
+		// 不进发起人已办）；u_* 由发起腿留下、引擎对 flow.auto 跳过注入（对齐 boot2 :317）
+		if _, err := f.engine.ExecuteProcessTask(ctx, task.ID, engine.KeyAutoExecute, flowArgs); err != nil {
 			return nil, err
 		}
 	}

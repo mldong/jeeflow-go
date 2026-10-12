@@ -3489,7 +3489,6 @@ func issue129Seed(t *testing.T, f *facade.Facade, repo *memory.Repository) {
 		r := f.Flow("processInstance/startAndExecute", map[string]interface{}{"processDefineId": defID, "operator": who})
 		mustOk(t, r)
 		instID := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
-		// startAndExecute 已自动办结 apply 任务（办理人 = who）⇒ who 的"我已办"必有 1 行
 		taskID := doingTaskID(t, repo, instID, "task1")
 		if taskID == 0 {
 			t.Fatalf("夹具前置：%s 的单应剩 task1 进行中，实际没有", who)
@@ -3503,9 +3502,29 @@ func issue129Seed(t *testing.T, f *facade.Facade, repo *memory.Repository) {
 			"processInstanceId": instID, "actorIds": []interface{}{who}, "operator": who,
 		}))
 	}
+	// R10（issues/176）：startAndExecute 的 apply 行 operator=flow.auto ⇒ 不再天然产出"发起人已办"。
+	// 补一组"真人办结单"（发起 → 真人执行 task1）给两档各造真已办行；这些单 task1 已办结，
+	// 不占待办出口（cc 也不建），只给"我的已办"（t.operator）与实例档各加一行。
+	doneOnce := func(who string) {
+		r := f.Flow("processInstance/startAndExecute", map[string]interface{}{"processDefineId": defID, "operator": who})
+		mustOk(t, r)
+		instID := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
+		taskID := doingTaskID(t, repo, instID, "task1")
+		if taskID == 0 {
+			t.Fatalf("夹具前置：%s 的已办单应剩 task1 进行中，实际没有", who)
+		}
+		mustOk(t, f.Flow("processTask/addCandidate", map[string]interface{}{
+			"processTaskId": taskID, "actorIds": []interface{}{who},
+		}))
+		mustOk(t, f.Flow("processTask/execute", map[string]interface{}{
+			"processTaskId": taskID, "operator": who, "submitType": 1,
+		}))
+	}
 	start("user1")
 	start("user1")
 	start("userB")
+	doneOnce("user1")
+	doneOnce("userB")
 }
 
 // rowIDSet 行 id 集合（内存仓遍历 map，顺序不定 ⇒ 比集合不比切片）
@@ -3586,6 +3605,43 @@ func TestIssue129BlankOperatorEqualsMissingAndUser1(t *testing.T) {
 		if len(nobody) != 0 {
 			t.Fatalf("[%s] 不存在的用户应 0 行，实际 %d 行", action, len(nobody))
 		}
+	}
+}
+
+// TestIssue176StartAndExecuteAutoLegOperatorIsFlowAuto R10（issues/176）：门面 startAndExecute
+// 的自动办理腿以 flow.auto 执行 apply（spec 04:60-62；boot2 ProcessInstanceServiceImpl:317 同形）：
+//  ① apply 留痕行在 flow.auto 档可查（行在，不是没建行）；
+//  ② 发起人档 doneList 不再含 apply 行（doneList 过滤 t.operator ⇒ 该行 operator 列=flow.auto）；
+//  ③ AUTO 腿跳过用户注入，u_* 仍是发起人（u_userId=zhangsan）。
+func TestIssue176StartAndExecuteAutoLegOperatorIsFlowAuto(t *testing.T) {
+	f, repo, _ := setupFacade()
+	mustOk(t, f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))}))
+	r := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": mustDefineID(t, repo, "simple"), "operator": "zhangsan",
+	})
+	mustOk(t, r)
+
+	// ① 留痕在 flow.auto 档
+	autoDone := z142Rows(t, f.Flow("processTask/doneList", map[string]interface{}{
+		"operator": engine.KeyAutoExecute, "pageSize": 100}), "doneList(flow.auto)")
+	if len(autoDone) != 1 {
+		t.Fatalf("flow.auto 档应查到 apply 留痕 1 行，实得 %d", len(autoDone))
+	}
+	if name := autoDone[0].(map[string]interface{})["taskName"]; name != "apply" {
+		t.Fatalf("留痕行应是 apply，实得 %v", name)
+	}
+	// ② 发起人档不再含 apply 行
+	if rows := z142Rows(t, f.Flow("processTask/doneList", map[string]interface{}{
+		"operator": "zhangsan", "pageSize": 100}), "doneList(zhangsan)"); len(rows) != 0 {
+		t.Fatalf("发起人已办不得含 apply 行（R10），实得 %d 条", len(rows))
+	}
+	// ③ u_* 仍是发起人（AUTO 腿跳过注入）
+	instID := mustI64(r["data"].(map[string]interface{})["processInstanceId"])
+	detail := f.Flow("processInstance/detail", map[string]interface{}{"id": instID})
+	mustOk(t, detail)
+	ext, _ := detail["data"].(map[string]interface{})["ext"].(map[string]interface{})
+	if v, _ := ext[engine.KeyUserID].(string); v != "zhangsan" {
+		t.Fatalf("AUTO 腿应跳过注入：ext.u_userId = %v, want zhangsan", ext[engine.KeyUserID])
 	}
 }
 
