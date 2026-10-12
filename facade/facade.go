@@ -36,14 +36,19 @@ import (
 // 返回 (rows, total, err)；query 透传 pageNum/pageSize/搜索条件。
 type UserSearch func(query map[string]interface{}) ([]map[string]interface{}, int, error)
 
+// UserSearchByID 用户按主键查询钩子（issues/178 R12，可选）——candidatePage 模型候选映射
+// 第一级（spec/06 §2.4 优先级：findById → getUser → 兜底）；未注入或未命中时回落 getUser。
+type UserSearchByID func(userID string) (map[string]interface{}, error)
+
 // Facade 统一门面
 type Facade struct {
-	engine     *engine.EngineImpl
-	repo       spi.ProcessRepository
-	extRepo    spi.ProcessExtRepository // 可空：未接入时设计/委托 action 报错
-	userSearch UserSearch               // 可空：candidatePage 用户搜索依赖
-	orgProv    spi.OrgUserProvider      // 可空：candidatePage candidateGroups 角色取人（v1.6.0）
-	metaReader interface {
+	engine         *engine.EngineImpl
+	repo           spi.ProcessRepository
+	extRepo        spi.ProcessExtRepository // 可空：未接入时设计/委托 action 报错
+	userSearch     UserSearch               // 可空：candidatePage 用户搜索依赖
+	userSearchByID UserSearchByID           // 可空：candidatePage 候选映射第一级（issues/178 R12）
+	orgProv        spi.OrgUserProvider      // 可空：candidatePage candidateGroups 角色取人（v1.6.0）
+	metaReader     interface {
 		ReadByProcessInstance(tableName string, processInstanceID interface{}) (interface{}, error)
 	}
 }
@@ -59,6 +64,12 @@ func (f *Facade) SetMetaReader(reader interface {
 // SetUserSearch 注入用户搜索钩子
 func (f *Facade) SetUserSearch(fn UserSearch) *Facade {
 	f.userSearch = fn
+	return f
+}
+
+// SetUserSearchByID 注入候选映射第一级钩子（issues/178 R12；可选，未注入回落 getUser）
+func (f *Facade) SetUserSearchByID(fn UserSearchByID) *Facade {
+	f.userSearchByID = fn
 	return f
 }
 
@@ -1601,11 +1612,30 @@ func (f *Facade) candidatePage(ctx context.Context, args map[string]interface{})
 		}
 	}
 	if len(candidates) > 0 {
-		// 候选命中 → 用户信息映射（UserProvider 兜底）
-		// issues/80：行键对齐前端 UserSelect（valueField='id'）——补 id 键，保留 userId 兼容旧消费方
+		// 候选命中 → 用户信息映射（issues/178 R12 优先级链，形状照 java JeeflowFacade.java:945-1012）：
+		// 第一级 userSearchByID（findById）→ 第二级 engine.UserProvider().GetUser → 兜底；
+		// 修前恒兜底 {id:c,userId:c,realName:c}（provider 真名被丢，C99 ⑩ 派 3）。
+		var up spi.UserProvider
+		if f.engine != nil {
+			up = f.engine.UserProvider()
+		}
 		rows := []map[string]interface{}{}
 		for _, c := range candidates {
-			rows = append(rows, map[string]interface{}{"id": c, "userId": c, "realName": c})
+			var src map[string]interface{}
+			if f.userSearchByID != nil {
+				if m, err := f.userSearchByID(c); err == nil && m != nil {
+					src = m
+				}
+			}
+			if src == nil && up != nil {
+				if u, err := up.GetUser(c); err == nil && u != nil {
+					src = map[string]interface{}{"userId": u.UserID, "realName": u.RealName}
+					if u.DeptName != "" {
+						src["deptName"] = u.DeptName
+					}
+				}
+			}
+			rows = append(rows, candidateRow(c, src))
 		}
 		return pageData(1, 10, len(rows), rows), nil
 	}
@@ -1618,6 +1648,38 @@ func (f *Facade) candidatePage(ctx context.Context, args map[string]interface{})
 		return nil, err
 	}
 	return pageData(toIntDef(args["pageNum"], 1), toIntDef(args["pageSize"], 10), total, rows), nil
+}
+
+// candidateRow candidatePage 模型候选行键归一（issues/178 R12；形状照 java :992-1012）：
+// id=src.id→src.userId→actorID（一律字符串化）；realName=src.realName→id；
+// userId/userName/deptName 仅在 src 给出时透传。src 为 nil＝两级都未命中 ⇒ 兜底 {actor, actor}。
+func candidateRow(actorID string, src map[string]interface{}) map[string]interface{} {
+	if src == nil {
+		src = map[string]interface{}{"userId": actorID, "realName": actorID}
+	}
+	row := map[string]interface{}{}
+	id := actorID
+	if v, ok := src["id"]; ok && v != nil {
+		id = fmt.Sprintf("%v", v)
+	} else if v, ok := src["userId"]; ok && v != nil {
+		id = fmt.Sprintf("%v", v)
+	}
+	row["id"] = id
+	if v, ok := src["realName"]; ok && v != nil {
+		row["realName"] = v
+	} else {
+		row["realName"] = id
+	}
+	if v, ok := src["userId"]; ok && v != nil {
+		row["userId"] = v
+	}
+	if v, ok := src["userName"]; ok && v != nil {
+		row["userName"] = v
+	}
+	if v, ok := src["deptName"]; ok && v != nil {
+		row["deptName"] = v
+	}
+	return row
 }
 
 // nextTaskCandidates 找当前任务节点的后继任务节点，收集 candidateUsers / candidateGroups（逗号分割）。
