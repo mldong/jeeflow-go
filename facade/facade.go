@@ -1625,7 +1625,20 @@ func (f *Facade) candidatePage(ctx context.Context, args map[string]interface{})
 func (f *Facade) nextTaskCandidates(flow *model.FlowModel, taskName string) []string {
 	var result []string
 	collect := func(node *model.FlowNode) {
-		if v, ok := node.Properties["candidateUsers"].(string); ok && v != "" {
+		// issues/177 R11：candidateUsers/candidateGroups 顶层优先、`field` 子对象兜底
+		// （旧设计器写入位置；形状对齐 engine 的 163 会签条件附带读形）
+		propStr := func(key string) string {
+			if v, ok := node.Properties[key].(string); ok && v != "" {
+				return v
+			}
+			if fld, ok := node.Properties["field"].(map[string]interface{}); ok {
+				if v, ok2 := fld[key].(string); ok2 {
+					return v
+				}
+			}
+			return ""
+		}
+		if v := propStr("candidateUsers"); v != "" {
 			for _, s := range strings.Split(v, ",") {
 				s = strings.TrimSpace(s)
 				if s != "" && !containsStr(result, s) {
@@ -1634,7 +1647,7 @@ func (f *Facade) nextTaskCandidates(flow *model.FlowModel, taskName string) []st
 			}
 		}
 		if f.orgProv != nil {
-			if v, ok := node.Properties["candidateGroups"].(string); ok && v != "" {
+			if v := propStr("candidateGroups"); v != "" {
 				for _, roleCode := range strings.Split(v, ",") {
 					roleCode = strings.TrimSpace(roleCode)
 					if roleCode == "" {
