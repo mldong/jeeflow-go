@@ -149,6 +149,44 @@ type tier145FlakyRepo struct {
 	ccCalls    int
 	failFinish bool // 实例终结写（state 离开 DOING 的 UpdateInstance）注入失败
 	finishHits int
+	// issues/175 注入位：任务 INSERT 与门面参与者追加（修前两处的 error 都被调用点丢弃）
+	failSaveTaskN     int
+	saveTaskCalls     int
+	failSaveInstanceN int
+	saveInstanceCalls int
+	failAddActorN     int
+	addActorCalls     int
+}
+
+// SaveTask 注入（issues/175 判据靶）：第 N 次任务 INSERT 失败。
+// 修前 saveNewTask 的 11 个调用点全部丢弃该 error ⇒ 动作照报 code=0、实例行留存；
+// 本轮修后错误必须冒到引擎入口/门面出口，故这两枚计数位只服务 175 那一格。
+func (r *tier145FlakyRepo) SaveTask(ctx context.Context, task *model.ProcessTask) error {
+	r.saveTaskCalls++
+	if r.failSaveTaskN > 0 && r.saveTaskCalls == r.failSaveTaskN {
+		return fmt.Errorf("injected: SaveTask failed (issues/175)")
+	}
+	return r.Repository.SaveTask(ctx, task)
+}
+
+// SaveInstance 注入（issues/175 e 腿靶）：第 N 次实例 INSERT 失败。
+// 修前该写点是裸调用（错误丢弃），案文 §2 的实证形状＝实例行没落库而动作报成功。
+func (r *tier145FlakyRepo) SaveInstance(ctx context.Context, inst *model.ProcessInstance) error {
+	r.saveInstanceCalls++
+	if r.failSaveInstanceN > 0 && r.saveInstanceCalls == r.failSaveInstanceN {
+		return fmt.Errorf("injected: SaveInstance failed (issues/175)")
+	}
+	return r.Repository.SaveInstance(ctx, inst)
+}
+
+// AddTaskActor 注入（issues/175 门面腿靶）：第 N 次参与者追加失败。
+// 修前门面 startAndExecute 是 `_ = f.repo.AddTaskActor(...)`，失败对外不可见。
+func (r *tier145FlakyRepo) AddTaskActor(ctx context.Context, taskID int64, actors []string) error {
+	r.addActorCalls++
+	if r.failAddActorN > 0 && r.addActorCalls == r.failAddActorN {
+		return fmt.Errorf("injected: AddTaskActor failed (issues/175)")
+	}
+	return r.Repository.AddTaskActor(ctx, taskID, actors)
 }
 
 func (r *tier145FlakyRepo) CreateCcInstanceIfAbsent(ctx context.Context, instanceID int64, creator string, actorIDs ...string) ([]string, error) {
@@ -562,4 +600,125 @@ func TestTxTier145ListenerSeesActionDataViaEventCtx(t *testing.T) {
 				"自造 Background 走池连接会读不到（spec/12 §12.2 接缝另一档，L2-11 缺件形态）", i)
 		}
 	}
+}
+
+// ─── issues/175 写腿吞错判据（audit8 R74）──────────────────────────────────────
+
+// TestIssue175WriteLegErrorsPropagate 引擎/门面写腿调用点丢弃 error 的判据壳，四枚子测试
+// 各自独立红绿（单条 Fatalf 不遮住其余腿，修前/修后逐腿对得上）：
+//
+//	a 发起腿任务 INSERT 注入 ⇒ 引擎入口必须报错＋四表零残留；
+//	b 办理腿下游建单注入 ⇒ 动作必须报错＋实例与当前任务回到 DOING＋无新任务行
+//	  （R9-go tier 判据当年被迫避让的那个注入点自此可用）；
+//	c 门面 startAndExecute 参与者追加注入 ⇒ 出口 code≠0＋四表零残留（修前是 `_ =`）；
+//	d 正向对照＝无注入 ⇒ 两条腿照常落库（证明 a~c 的红来自注入而非夹具）；
+//	e 发起腿实例行 INSERT 注入 ⇒ 引擎入口必须报错＋四表零残留（案文 §2 的实证形状正面入判据）。
+func TestIssue175WriteLegErrorsPropagate(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+
+	// a 发起腿：apply 任务行的 INSERT 是本动作第一条写
+	t.Run("a_发起腿任务写失败必须报错且四表零残留", func(t *testing.T) {
+		tier145Cleanup(t, db)
+		defer tier145Cleanup(t, db)
+		insertDefine(t, db, "go-simple", loadFlow(t, "01-simple.json"))
+		ctx := context.Background()
+
+		repo := &tier145FlakyRepo{Repository: jdbc.New(db), failSaveTaskN: 1}
+		eng := newEngine(t, repo)
+		if _, err := eng.StartProcessInstanceByID(ctx, defineID, "zhangsan", nil); err == nil {
+			t.Fatalf("175-a 发起腿任务写失败必须报错（修前形状＝error 被 saveNewTask 调用点丢弃，动作报成功）")
+		}
+		tier145AssertNoActionResidue(t, db, "175-a 发起腿任务写失败")
+	})
+
+	// b 办理腿：apply 办结后下游 task1 建单失败（前置发起走干净仓，已提交）
+	t.Run("b_办理腿下游建单写失败必须报错且动作内写整体回滚", func(t *testing.T) {
+		tier145Cleanup(t, db)
+		defer tier145Cleanup(t, db)
+		insertDefine(t, db, "go-simple", loadFlow(t, "01-simple.json"))
+		ctx := context.Background()
+
+		repo0 := jdbc.New(db)
+		inst, err := newEngine(t, repo0).StartProcessInstanceByID(ctx, defineID, "zhangsan", nil)
+		if err != nil {
+			t.Fatalf("175-b 前置发起应成功: %v", err)
+		}
+		doing, err := repo0.FindDoingTasks(ctx, inst.ID, nil)
+		if err != nil || len(doing) == 0 {
+			t.Fatalf("175-b 前置应有 apply 待办: %v", err)
+		}
+
+		repo := &tier145FlakyRepo{Repository: jdbc.New(db), failSaveTaskN: 1}
+		if _, err := newEngine(t, repo).ExecuteProcessTask(ctx, doing[0].ID, "zhangsan",
+			map[string]interface{}{"submitType": 0}); err == nil {
+			t.Fatalf("175-b 办理腿下游建单写失败必须报错（修前形状同 a）")
+		}
+		if got := tier145Scalar(t, db, "SELECT task_state FROM wf_process_task WHERE id = ?", doing[0].ID); got != int(model.TaskStateDoing) {
+			t.Fatalf("175-b：动作失败后当前任务行必须回到 DOING(%d)，实得 %d —— 动作内写未整体回滚",
+				model.TaskStateDoing, got)
+		}
+		if got := tier145Scalar(t, db, "SELECT state FROM wf_process_instance WHERE id = ?", inst.ID); got != int(model.InstanceStateDoing) {
+			t.Fatalf("175-b：动作失败后实例行必须仍是 DOING(%d)，实得 %d", model.InstanceStateDoing, got)
+		}
+		if n := tier145Count(t, db, "SELECT COUNT(*) FROM wf_process_task WHERE process_instance_id = ? AND task_name = ?", inst.ID, "task1"); n != 0 {
+			t.Fatalf("175-b：建单失败的下游任务行必须零残留，实得 %d", n)
+		}
+	})
+
+	// c 门面腿：startAndExecute 自动办理之前的参与者追加写失败
+	t.Run("c_门面参与者写失败出口不得报成功", func(t *testing.T) {
+		tier145Cleanup(t, db)
+		defer tier145Cleanup(t, db)
+		insertDefine(t, db, "go-simple", loadFlow(t, "01-simple.json"))
+
+		repo := &tier145FlakyRepo{Repository: jdbc.New(db), failAddActorN: 1}
+		f := facade.New(newEngine(t, repo), repo, nil)
+		r := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+			"processDefineId": defineID, "operator": "zhangsan",
+		})
+		if r["code"].(int) == 0 {
+			t.Fatalf("175-c 门面参与者写失败不得报成功（修前形状＝`_ = f.repo.AddTaskActor`）: %v", r)
+		}
+		tier145AssertNoActionResidue(t, db, "175-c 门面参与者写失败")
+	})
+
+	// e 发起腿实例行：SaveInstance 是本次动作的第 0 条写，它失败后不得继续建单还报成功
+	t.Run("e_发起腿实例行写失败必须报错且四表零残留", func(t *testing.T) {
+		tier145Cleanup(t, db)
+		defer tier145Cleanup(t, db)
+		insertDefine(t, db, "go-simple", loadFlow(t, "01-simple.json"))
+		ctx := context.Background()
+
+		repo := &tier145FlakyRepo{Repository: jdbc.New(db), failSaveInstanceN: 1}
+		if _, err := newEngine(t, repo).StartProcessInstanceByID(ctx, defineID, "zhangsan", nil); err == nil {
+			t.Fatalf("175-e 发起腿实例行写失败必须报错（修前形状＝`e.repo.SaveInstance(ctx, inst)` 裸调用）")
+		}
+		tier145AssertNoActionResidue(t, db, "175-e 发起腿实例行写失败")
+	})
+
+	// d 正向对照：同一夹具不注入 ⇒ 实例/任务/参与者三行齐
+	t.Run("d_正向对照无注入应照常落库", func(t *testing.T) {
+		tier145Cleanup(t, db)
+		defer tier145Cleanup(t, db)
+		insertDefine(t, db, "go-simple", loadFlow(t, "01-simple.json"))
+
+		repo := jdbc.New(db)
+		f := facade.New(newEngine(t, repo), repo, nil)
+		r := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+			"processDefineId": defineID, "operator": "zhangsan",
+		})
+		if r["code"].(int) != 0 {
+			t.Fatalf("175-d 正向对照必须成功: %v", r)
+		}
+		if n := tier145Count(t, db, "SELECT COUNT(*) FROM wf_process_instance WHERE process_define_id = ?", defineID); n != 1 {
+			t.Fatalf("175-d 正向对照：实例行应为 1，实得 %d", n)
+		}
+		if n := tier145Count(t, db, "SELECT COUNT(*) FROM wf_process_task WHERE process_instance_id IN (SELECT id FROM wf_process_instance WHERE process_define_id = ?) AND task_name = ?", defineID, "task1"); n != 1 {
+			t.Fatalf("175-d 正向对照：apply 办结后应有 task1 待办 1 条，实得 %d", n)
+		}
+		if n := tier145Count(t, db, "SELECT COUNT(*) FROM wf_process_task_actor WHERE process_task_id IN (SELECT id FROM wf_process_task WHERE process_instance_id IN (SELECT id FROM wf_process_instance WHERE process_define_id = ?))", defineID); n == 0 {
+			t.Fatalf("175-d 正向对照：参与者行必须落库（门面腿正向可用），实得 %d", n)
+		}
+	})
 }

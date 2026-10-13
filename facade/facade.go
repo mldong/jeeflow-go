@@ -280,7 +280,9 @@ func (f *Facade) startAndExecute(ctx context.Context, args map[string]interface{
 		return nil, err
 	}
 	for _, task := range doing {
-		_ = f.repo.AddTaskActor(ctx, task.ID, []string{operator})
+		if err := f.repo.AddTaskActor(ctx, task.ID, []string{operator}); err != nil {
+			return nil, err
+		}
 		flowArgs["submitType"] = 0 // APPLY
 		// 对齐 boot3：f_nextNodeOperator（发起时预指派人）→ tf_nextNodeOperator（引擎执行参数）
 		if v, ok := flowArgs[engine.KeyProcessStartNextNodeOperator]; ok && fmt.Sprintf("%v", v) != "" {
