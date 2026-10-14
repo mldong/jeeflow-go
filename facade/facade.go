@@ -1173,13 +1173,14 @@ func (f *Facade) highLight(ctx context.Context, args map[string]interface{}) (in
 		// `_log.warning`／php `error_log`）：定义 content 坏形状不该让整条 highLight 报错
 		// （对外仍 code=0、只是边集/节点补全/nodeProgress 留空），但旧形状 `if Unmarshal(...)==nil`
 		// 把降级判得一声不响——这条通道当年藏住过 156／160 两个真分叉，**不许新增第二条静默腿**。
-		// ⚠ 本栈另两腿（buildNodeProgress／collectPath）签名不返错误，可观测的只有这一处解码失败。
+		// ⚠ 本栈另两腿里 buildNodeProgress 签名不返错误、仍不可观测；collectPath 的决策求值失败腿
+		// 自 issues/201 起自带一条 WARN（宽度维持折 false），两条腿各有判据。
 		if err := json.Unmarshal(def.Content, &flow); err != nil {
 			log.Printf("[jeeflow] WARN highLight 模型补全腿解码失败，边集/节点补全/nodeProgress 已降级（实例与任务行不受影响）: instanceId=%d, defineId=%d, err=%v",
 				inst.ID, inst.DefineID, err)
 		} else {
 			nodeProgress = f.buildNodeProgress(&flow, his)
-			f.collectPath(&flow, "start", active, &history, &edges, map[string]bool{}, inst.Variables, his)
+			f.collectPath(&flow, "start", active, &history, &edges, map[string]bool{}, inst.Variables, his, inst.ID, inst.DefineID)
 		}
 	}
 	return map[string]interface{}{
@@ -1301,7 +1302,8 @@ func (f *Facade) buildNodeProgress(flow *model.FlowModel, tasks []*model.Process
 // ⇒ 目标节点当前活跃的那条边既不下钻也不收录，流程图上"进当前待办的那一跳"永远是灰的。
 func (f *Facade) collectPath(flow *model.FlowModel, nodeID string, active []string,
 	history *[]string, edges *[]string, visited map[string]bool,
-	vars map[string]interface{}, historyTasks []*model.ProcessTask) {
+	vars map[string]interface{}, historyTasks []*model.ProcessTask,
+	instanceID int64, defineID int64) {
 	if visited[nodeID] {
 		return
 	}
@@ -1314,7 +1316,7 @@ func (f *Facade) collectPath(flow *model.FlowModel, nodeID string, active []stri
 		// 决策节点：输出边表达式求值过滤——false 的分支未实际执行，不收集
 		if src != nil && src.Type == "snaker:decision" {
 			if expr, ok := e.Properties["expr"].(string); ok && expr != "" {
-				if ok2, _ := f.evalDecisionExpr(flow, src, expr, vars, historyTasks); !ok2 {
+				if ok2, _ := f.evalDecisionExpr(flow, src, expr, vars, historyTasks, instanceID, defineID); !ok2 {
 					continue
 				}
 			}
@@ -1332,13 +1334,16 @@ func (f *Facade) collectPath(flow *model.FlowModel, nodeID string, active []stri
 		if containsStr(active, target.ID) {
 			continue // 遇活跃节点停止深入（边名已在上面收录）
 		}
-		f.collectPath(flow, target.ID, active, history, edges, visited, vars, historyTasks)
+		f.collectPath(flow, target.ID, active, history, edges, visited, vars, historyTasks, instanceID, defineID)
 	}
 }
 
 // evalDecisionExpr 决策输出边表达式求值（args = 实例变量 + 决策节点前置任务变量，与引擎同源）
+//
+// instanceID/defineID 只作日志归因用（issues/201）——求值失败那条腿不许再一声不吭。
 func (f *Facade) evalDecisionExpr(flow *model.FlowModel, decision *model.FlowNode, expr string,
-	vars map[string]interface{}, historyTasks []*model.ProcessTask) (bool, error) {
+	vars map[string]interface{}, historyTasks []*model.ProcessTask,
+	instanceID int64, defineID int64) (bool, error) {
 	args := map[string]interface{}{}
 	for k, v := range vars {
 		args[k] = v
@@ -1359,6 +1364,12 @@ func (f *Facade) evalDecisionExpr(flow *model.FlowModel, decision *model.FlowNod
 	}
 	result, err := f.engine.EvalExpr(expr, args)
 	if err != nil {
+		// issues/201（audit8 R79 拍 C＝只统一「必须落可诊断日志」，遍历宽度不钉）：
+		// 求值失败与求值为假是两件事——旧形状 `return false, nil` 把 error 就地丢弃，
+		// 表达式坏／SPI 抛错在对外读数上与「这条分支没走」完全同形，静默通道藏过 156／160
+		// 两例的那条腿。本栈宽度维持折 false（该边不收、其余边继续遍历），只补可归因的一句。
+		log.Printf("[jeeflow] WARN highLight 决策边表达式求值失败，该边按 false 处理（分支不收、其余边继续遍历）: instanceId=%d, defineId=%d, nodeId=%s, expr=%q, err=%v",
+			instanceID, defineID, decision.ID, expr, err)
 		return false, nil
 	}
 	b, _ := result.(bool)
