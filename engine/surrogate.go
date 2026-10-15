@@ -114,7 +114,13 @@ func (e *EngineImpl) applySurrogateToTask(ctx context.Context, nt *model.Process
 // 不存在"打在空 id 上静默无效"的时序坑。
 func (e *EngineImpl) saveNewTask(ctx context.Context, nt *model.ProcessTask, processName string) error {
 	e.applySurrogateToTask(ctx, nt, processName)
-	return e.repo.SaveTask(ctx, nt)
+	if err := e.repo.SaveTask(ctx, nt); err != nil {
+		return err
+	}
+	// audit8 R92（spec04 §完成任务）：唯一建单口＝执行族产出列表的唯一追加口
+	// （基准＝java exec.getProcessTaskList()，由建单处每次追加）。见 engine/new_tasks.go。
+	appendNewTask(ctx, nt)
+	return nil
 }
 
 // surrogateProcessName 委托查询用的流程名（规范 06 §4.5 条款 1.1）：**先 trim 再判空**

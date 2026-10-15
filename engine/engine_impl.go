@@ -127,17 +127,19 @@ func (e *EngineImpl) startProcessInstanceByIDInner(ctx context.Context, defineID
 
 // ─── Execute ───────────────────────────────────────────────────────────────────
 
-func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	var inst *model.ProcessInstance
-	err := e.InTx(ctx, func(ctx context.Context) error {
+func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}) ([]*model.ProcessTask, error) {
+	// spec04 §完成任务 ⇒ 返回本次动作产出的任务行（基准＝java exec.getProcessTaskList()）。
+	// 收集器挂在进事务前的 ctx 上，InTx 派生的 ctx 一路带到唯一建单口 saveNewTask（见 new_tasks.go）。
+	cctx, sink := withNewTasksSink(ctx)
+	err := e.InTx(cctx, func(ctx context.Context) error {
 		var err error
-		inst, err = e.executeProcessTaskInner(ctx, taskID, operator, args)
+		_, err = e.executeProcessTaskInner(ctx, taskID, operator, args)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	return inst, nil
+	return newTasksOf(sink), nil
 }
 
 func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
@@ -307,17 +309,17 @@ func syncTaskToAggregate(inst *model.ProcessInstance, task *model.ProcessTask) {
 
 // ─── Reject ────────────────────────────────────────────────────────────────────
 
-func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	var inst *model.ProcessInstance
-	err := e.InTx(ctx, func(ctx context.Context) error {
+func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, operator string, args map[string]interface{}) ([]*model.ProcessTask, error) {
+	cctx, sink := withNewTasksSink(ctx)
+	err := e.InTx(cctx, func(ctx context.Context) error {
 		var err error
-		inst, err = e.executeAndJumpToEndInner(ctx, taskID, operator, args)
+		_, err = e.executeAndJumpToEndInner(ctx, taskID, operator, args)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	return inst, nil
+	return newTasksOf(sink), nil
 }
 
 func (e *EngineImpl) executeAndJumpToEndInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
@@ -343,17 +345,17 @@ func (e *EngineImpl) executeAndJumpToEndInner(ctx context.Context, taskID int64,
 
 // ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）─────
 
-func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
-	var inst *model.ProcessInstance
-	err := e.InTx(ctx, func(ctx context.Context) error {
+func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) ([]*model.ProcessTask, error) {
+	cctx, sink := withNewTasksSink(ctx)
+	err := e.InTx(cctx, func(ctx context.Context) error {
 		var err error
-		inst, err = e.executeAndJumpTaskInner(ctx, taskID, operator, args, targetTaskName)
+		_, err = e.executeAndJumpTaskInner(ctx, taskID, operator, args, targetTaskName)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	return inst, nil
+	return newTasksOf(sink), nil
 }
 
 func (e *EngineImpl) executeAndJumpTaskInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
@@ -393,17 +395,17 @@ func (e *EngineImpl) executeAndJumpTaskInner(ctx context.Context, taskID int64, 
 
 // ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）──────────────
 
-func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	var inst *model.ProcessInstance
-	err := e.InTx(ctx, func(ctx context.Context) error {
+func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) ([]*model.ProcessTask, error) {
+	cctx, sink := withNewTasksSink(ctx)
+	err := e.InTx(cctx, func(ctx context.Context) error {
 		var err error
-		inst, err = e.executeAndJumpToFirstTaskNodeInner(ctx, taskID, operator, args)
+		_, err = e.executeAndJumpToFirstTaskNodeInner(ctx, taskID, operator, args)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	return inst, nil
+	return newTasksOf(sink), nil
 }
 
 func (e *EngineImpl) executeAndJumpToFirstTaskNodeInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {

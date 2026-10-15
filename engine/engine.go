@@ -9,10 +9,12 @@ import (
 
 type Engine interface {
 	StartProcessInstanceByID(ctx context.Context, defineID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
-	ExecuteProcessTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
-	ExecuteAndJumpToEnd(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
-	ExecuteAndJumpTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error)
-	ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error)
+	// spec04 §完成任务（:37/:77/:98/:111）执行族四法 → ProcessTask[]（本次动作产出的任务行，
+	// 基准＝java exec.getProcessTaskList()）；start 族保留返回实例（spec04 :9/:24）。见 new_tasks.go。
+	ExecuteProcessTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}) ([]*model.ProcessTask, error)
+	ExecuteAndJumpToEnd(ctx context.Context, taskID int64, operator string, args map[string]interface{}) ([]*model.ProcessTask, error)
+	ExecuteAndJumpTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) ([]*model.ProcessTask, error)
+	ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) ([]*model.ProcessTask, error)
 }
 
 const (

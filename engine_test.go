@@ -128,7 +128,11 @@ func Test01SimpleFlow(t *testing.T) {
 	}
 	repo.AddTaskActor(context.Background(), doing[0].ID, []string{"applicant"})
 	doing[0].ActorIDs = append(doing[0].ActorIDs, "applicant")
-	inst, _ = eng.ExecuteProcessTask(context.Background(), doing[0].ID, "applicant", nil)
+	{
+		nt, _ := eng.ExecuteProcessTask(context.Background(), doing[0].ID, "applicant", nil)
+		_ = nt
+	}
+	inst, _ = repo.FindInstanceByID(context.Background(), doing[0].ProcessInstanceID)
 	if inst.State != model.InstanceStateDone {
 		t.Fatalf("expected done, got %d", inst.State)
 	}
@@ -161,7 +165,11 @@ func Test02MultiTask(t *testing.T) {
 	// t3→end
 	repo.AddTaskActor(context.Background(), doing[0].ID, []string{"userC"})
 	doing[0].ActorIDs = append(doing[0].ActorIDs, "userC")
-	inst, _ = eng.ExecuteProcessTask(context.Background(), doing[0].ID, "userC", nil)
+	{
+		nt, _ := eng.ExecuteProcessTask(context.Background(), doing[0].ID, "userC", nil)
+		_ = nt
+	}
+	inst, _ = repo.FindInstanceByID(context.Background(), doing[0].ProcessInstanceID)
 	if inst.State != model.InstanceStateDone {
 		t.Fatalf("expected done, got %d", inst.State)
 	}
@@ -185,7 +193,11 @@ func Test02B_InitiatorURealNameStable(t *testing.T) {
 	repo.AddTaskActor(context.Background(), doing[0].ID, []string{"bob"})
 	doing[0].ActorIDs = append(doing[0].ActorIDs, "bob")
 	doneTaskID := doing[0].ID
-	inst, _ = eng.ExecuteProcessTask(context.Background(), doneTaskID, "bob", nil)
+	{
+		nt, _ := eng.ExecuteProcessTask(context.Background(), doneTaskID, "bob", nil)
+		_ = nt
+	}
+	inst, _ = repo.FindInstanceByID(context.Background(), inst.ID)
 
 	// 核心断言：实例 u_realName 恒为发起人 alice，不被操作人 bob 覆盖
 	if got := inst.Variables[engine.KeyRealName]; got != "用户alice" {
@@ -213,7 +225,11 @@ func Test02B_InitiatorURealNameStable(t *testing.T) {
 	}
 	repo.AddTaskActor(context.Background(), doing[0].ID, []string{"userB"})
 	doing[0].ActorIDs = append(doing[0].ActorIDs, "userB")
-	inst, _ = eng.ExecuteProcessTask(context.Background(), doing[0].ID, "userB", nil)
+	{
+		nt, _ := eng.ExecuteProcessTask(context.Background(), doing[0].ID, "userB", nil)
+		_ = nt
+	}
+	inst, _ = repo.FindInstanceByID(context.Background(), doing[0].ProcessInstanceID)
 	if got := inst.Variables[engine.KeyRealName]; got != "用户alice" {
 		t.Fatalf("issues/97: 深层节点后实例 u_realName 应仍为 alice，实际 %v", got)
 	}
@@ -258,7 +274,11 @@ func Test04ForkJoin(t *testing.T) {
 	}
 	repo.AddTaskActor(context.Background(), tB.ID, []string{"userB"})
 	tB.ActorIDs = append(tB.ActorIDs, "userB")
-	inst, _ = eng.ExecuteProcessTask(context.Background(), tB.ID, "userB", nil)
+	{
+		nt, _ := eng.ExecuteProcessTask(context.Background(), tB.ID, "userB", nil)
+		_ = nt
+	}
+	inst, _ = repo.FindInstanceByID(context.Background(), tB.ProcessInstanceID)
 	if inst.State != model.InstanceStateDone {
 		t.Fatalf("expected done, got %d", inst.State)
 	}
@@ -304,7 +324,11 @@ func Test06CountersignSequential(t *testing.T) {
 	task = doing[0]
 	repo.AddTaskActor(context.Background(), task.ID, []string{"userB"})
 	task.ActorIDs = append(task.ActorIDs, "userB")
-	inst, _ = eng.ExecuteProcessTask(context.Background(), task.ID, "userB", nil)
+	{
+		nt, _ := eng.ExecuteProcessTask(context.Background(), task.ID, "userB", nil)
+		_ = nt
+	}
+	inst, _ = repo.FindInstanceByID(context.Background(), task.ProcessInstanceID)
 	if inst.State != model.InstanceStateDone {
 		t.Fatalf("expected done, got %d", inst.State)
 	}
@@ -345,7 +369,11 @@ func Test08Reject(t *testing.T) {
 	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
 	repo.AddTaskActor(context.Background(), doing[0].ID, []string{"applicant"})
 	doing[0].ActorIDs = append(doing[0].ActorIDs, "applicant")
-	inst, _ = eng.ExecuteAndJumpToEnd(context.Background(), doing[0].ID, "applicant", nil)
+	{
+		nt, _ := eng.ExecuteAndJumpToEnd(context.Background(), doing[0].ID, "applicant", nil)
+		_ = nt
+	}
+	inst, _ = repo.FindInstanceByID(context.Background(), doing[0].ProcessInstanceID)
 	if inst.State != model.InstanceStateReject {
 		t.Fatalf("expected reject, got %d", inst.State)
 	}
@@ -567,7 +595,15 @@ func Test12SystemExecuteFlowAuto(t *testing.T) {
 	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
 
 	// ① flow.auto 非参与者身份放行（startAndExecute 契约）
-	inst, err := eng.ExecuteProcessTask(context.Background(), doing[0].ID, engine.KeyAutoExecute, nil)
+	nt, err := eng.ExecuteProcessTask(context.Background(), doing[0].ID, engine.KeyAutoExecute, nil)
+	if err != nil {
+		t.Fatalf("执行族调用失败: %v", err)
+	}
+	_ = nt
+	inst, err = repo.FindInstanceByID(context.Background(), doing[0].ProcessInstanceID)
+	if err != nil {
+		t.Fatalf("动作后回查实例失败: %v", err)
+	}
 	if err != nil {
 		t.Fatalf("flow.auto should pass: %v", err)
 	}
@@ -583,7 +619,15 @@ func Test12SystemExecuteFlowAuto(t *testing.T) {
 	}
 
 	// ③ flow.admin 放行
-	inst, err = eng.ExecuteProcessTask(context.Background(), doing[0].ID, engine.KeyAdminID, nil)
+	nt, err = eng.ExecuteProcessTask(context.Background(), doing[0].ID, engine.KeyAdminID, nil)
+	if err != nil {
+		t.Fatalf("执行族调用失败: %v", err)
+	}
+	_ = nt
+	inst, err = repo.FindInstanceByID(context.Background(), doing[0].ProcessInstanceID)
+	if err != nil {
+		t.Fatalf("动作后回查实例失败: %v", err)
+	}
 	if err != nil {
 		t.Fatalf("flow.admin should pass: %v", err)
 	}
@@ -993,12 +1037,12 @@ func Test154CreateWritesLineageCustomNode(t *testing.T) {
 	if !cust.IsFinished() {
 		t.Fatalf("cust1 留痕行该是 DONE(20)，实得 TaskState=%d", cust.TaskState)
 	}
-	wantParent(t, cust, 0)      // 发起路径无当前任务 ⇒ parent 落 0
+	wantParent(t, cust, 0)       // 发起路径无当前任务 ⇒ parent 落 0
 	wantFirstFlag(t, cust, true) // cust1 是 start 直接后继
 
 	// 令牌自己走过 custom 落到 task1：task1 才是这条流上唯一那条待办
 	task1 := doingByName(t, repo, inst.ID, "task1")
-	wantParent(t, task1, 0)      // 与 java 同形：这一支的当前任务仍是"发起时那条"，无 ⇒ 0
+	wantParent(t, task1, 0) // 与 java 同形：这一支的当前任务仍是"发起时那条"，无 ⇒ 0
 	wantFirstFlag(t, task1, false)
 	if doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil); len(doing) != 1 {
 		t.Fatalf("记录类节点不得产生第二条待办，实得 %v", doing154Names(doing))
@@ -1369,7 +1413,7 @@ func TestCcLegCoverageNarrowedToExecuteProcessTask(t *testing.T) {
 			t.Fatalf("加参与者: %v", err)
 		}
 		t1 = firstDoing(t, repo, ctx, inst.ID, "task1") // 回读带参与者的行
-		evts = nil                                     // 只观察这一次动作
+		evts = nil                                      // 只观察这一次动作
 		args := map[string]interface{}{engine.KeyCcActors: ccActor}
 		action(t, eng, t1.ID, args)
 		var cc []engine.ProcessEvent

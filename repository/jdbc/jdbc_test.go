@@ -206,7 +206,15 @@ func TestFlowSimpleEndToEnd(t *testing.T) {
 
 	// ② 完成 apply（startAndExecute 语义）→ task1（leader）
 	applyTask := doing[0]
-	inst, err = eng.ExecuteProcessTask(ctx, applyTask.ID, "zhangsan", nil)
+	nt, err := eng.ExecuteProcessTask(ctx, applyTask.ID, "zhangsan", nil)
+	if err != nil {
+		t.Fatalf("执行族调用失败: %v", err)
+	}
+	_ = nt
+	inst, err = repo.FindInstanceByID(ctx, applyTask.ProcessInstanceID)
+	if err != nil {
+		t.Fatalf("动作后回查实例失败: %v", err)
+	}
 	if err != nil {
 		t.Fatalf("complete apply: %v", err)
 	}
@@ -226,7 +234,15 @@ func TestFlowSimpleEndToEnd(t *testing.T) {
 	}
 
 	// ③ 完成 task1 → end → 实例完成
-	inst, err = eng.ExecuteProcessTask(ctx, doing[0].ID, "leader", map[string]interface{}{"comment": "ok"})
+	nt, err = eng.ExecuteProcessTask(ctx, doing[0].ID, "leader", map[string]interface{}{"comment": "ok"})
+	if err != nil {
+		t.Fatalf("执行族调用失败: %v", err)
+	}
+	_ = nt
+	inst, err = repo.FindInstanceByID(ctx, doing[0].ProcessInstanceID)
+	if err != nil {
+		t.Fatalf("动作后回查实例失败: %v", err)
+	}
 	if err != nil {
 		t.Fatalf("complete task1: %v", err)
 	}
