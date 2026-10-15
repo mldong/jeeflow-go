@@ -1299,8 +1299,10 @@ func (e *EngineImpl) addUserInfo(operator string, vars map[string]interface{}) {
 }
 
 func (e *EngineImpl) addAutoGenTitle(displayName string, vars map[string]interface{}) {
+	// issues/232 R64 拍 A：标题钉秒 yyyy-MM-dd HH:mm:ss——标题专用格式化点，
+	// 不得并到 expire_time 腿的共用解析/格式化
 	realName, _ := vars[KeyRealName].(string)
-	title := fmt.Sprintf("%s的%s-%s", realName, displayName, time.Now().Format("2006-01-02 15:04"))
+	title := fmt.Sprintf("%s的%s-%s", realName, displayName, time.Now().Format("2006-01-02 15:04:05"))
 	vars[KeyAutoGenTitle] = title
 }
 
