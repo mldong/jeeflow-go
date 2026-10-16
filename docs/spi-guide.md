@@ -6,7 +6,7 @@ jeeflow 通过 SPI 接口解耦引擎与存储、用户等外部依赖。实现�
 
 ### ProcessRepository
 
-> 接口方法均以 `context.Context` 为第一参数（spec §7.4 事务约定）：事务上下文内仓储调用走绑定连接，否则走连接池。
+> 接口方法均以 `context.Context` 为第一参数（规范 05「事务约定」节 事务约定）：事务上下文内仓储调用走绑定连接，否则走连接池。
 
 ```go
 type ProcessRepository interface {
@@ -59,7 +59,7 @@ repo := jdbc.New(db)                // 关系表主键用内置时间戳 ID 生�
 
 仓储方法自动映射 `wf_*` 5 张表（spec §2）。`content` 为流程定义 JSON，`variable` 为变量 JSON。
 
-**事务（spec §7.4）**：`WithTx` 开启事务并把连接绑定到 ctx，回调内所有仓储调用走同一连接；异常自动回滚：
+**事务（规范 05「事务约定」节）**：`WithTx` 开启事务并把连接绑定到 ctx，回调内所有仓储调用走同一连接；异常自动回滚：
 
 ```go
 err := repo.WithTx(ctx, func(ctx context.Context) error {
@@ -70,7 +70,7 @@ err := repo.WithTx(ctx, func(ctx context.Context) error {
 })
 ```
 
-> 约定：**业务层是事务 owner**——先 `WithTx` 再调引擎方法，引擎核心不感知事务。
+> 约定：**业务层是事务 owner**——先 `WithTx` 再调引擎方法，引擎对事务是「可选参与」而非「不感知」（权威＝规范 05 事务约定第 1 条／规范 12 §12.1 原则 3）。
 
 ## 可选 SPI
 

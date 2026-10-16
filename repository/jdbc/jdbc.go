@@ -1,6 +1,6 @@
 // Package jdbc 提供 ProcessRepository 的 JDBC 参考实现。
 //
-// 对齐 spec §7.4 事务约定：仓储方法接收 ctx，WithTx 把事务连接绑定到 ctx，
+// 对齐 规范 05「事务约定」节 事务约定：仓储方法接收 ctx，WithTx 把事务连接绑定到 ctx，
 // 同事务内所有仓储调用走同一连接；无事务上下文时回退为独立连接。
 // 引擎核心零依赖，本包依赖 database/sql（stdlib）+ 驱动（调用方引入）。
 // 占位符统一 `?`，New 时按驱动自动转换（mysql → `?` 原生；pgx → `$n`），
@@ -203,7 +203,7 @@ func (g *tsIDGen) NextID() int64 {
 	return now*1000 + int64(g.seq)
 }
 
-// WithTx 开启事务并把事务连接绑定到 ctx，回调内所有仓储方法走同一连接（spec §7.4）。
+// WithTx 开启事务并把事务连接绑定到 ctx，回调内所有仓储方法走同一连接（规范 05「事务约定」节）。
 //
 // 嵌套语义（audit8 R9 145-3，spec/12 §12.2 归属面）：ctx 中已有活动事务时**并入**——
 // 不双开连接、不重复 BEGIN，提交/回滚归最外层；内层回调错误原样外抛由最外层回滚连坐。
@@ -510,7 +510,7 @@ func (r *Repository) UpdateInstance(ctx context.Context, inst *model.ProcessInst
 	if err != nil {
 		return err
 	}
-	// v1.0.1：级联持久化聚合根内任务状态变更（同连接，spec §7.4）
+	// v1.0.1：级联持久化聚合根内任务状态变更（同连接，规范 05「事务约定」节）
 	for _, task := range inst.Tasks {
 		if task.ID != 0 {
 			if err := r.updateTaskWithConn(ctx, c, task); err != nil {

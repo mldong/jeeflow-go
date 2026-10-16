@@ -1073,7 +1073,7 @@ func containsI64(list []int64, v int64) bool {
 	return false
 }
 
-// ─── 事务（spec §7.4）：绑定连接 + 回滚 ───────────────────────────────────────
+// ─── 事务（规范 05「事务约定」节）：绑定连接 + 回滚 ───────────────────────────────────────
 
 func TestWithTx(t *testing.T) {
 	db := openDB(t)
