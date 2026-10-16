@@ -19,7 +19,8 @@ type EngineImpl struct {
 	exprEval         spi.ExpressionEvaluator
 	ext              *Extensions
 	registry         *HandlerRegistry
-	interceptorCache map[int64][]FlowInterceptor
+	interceptorCache map[string][]FlowInterceptor
+	rootDeclCache    map[int64]rootDecls
 	// 委托代理自动生效（issues/116）：surrogateRepo 未注入＝静默跳过；
 	// surrogateOff 为"关闭位"（零值＝开启，见 SurrogateAutoApply 注释）
 	surrogateRepo   spi.ProcessExtRepository
@@ -820,6 +821,13 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 		return e.execCustomNode(ctx, flow, node, inst, operator, vars, parentTaskID)
 	}
 	// issues/60：声明未解析 → 显式报错（不静默跳过）
+	// audit8 R91 随修：pre／post 两档在拆档后是**各取各的串**，只校验 pre 会漏掉 post——
+	// R91 之前两档读同一枚根级 postInterceptors，"pre 校验过＝post 也校验过"成立；拆档后不成立，
+	// 下方 defer 的 `_ =` 会把 post 档未注册名静默吞掉（既有 TestDeclaredInterceptorMissingRegistry
+	// 正是这样照出来的红）。⇒ 执行前把两档都解析一遍，post 的解析结果顺手进缓存。
+	if _, err := e.resolveInterceptors(ctx, node, inst, "post"); err != nil {
+		return err
+	}
 	proceed, err := e.firePreInterceptors(ctx, node, inst)
 	if err != nil {
 		return err
@@ -828,7 +836,7 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 		return nil
 	}
 	defer func() {
-		// 错误理论不可达：resolve 已由上方 firePre 校验并缓存（同 inst/DefineID）
+		// post 档已在上方解析并校验（同 node/档位 ⇒ 命中缓存），此处只派发
 		_ = e.firePostInterceptors(ctx, node, inst)
 	}()
 

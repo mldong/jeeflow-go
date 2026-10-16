@@ -223,46 +223,99 @@ type Extensions struct {
 
 func (e *EngineImpl) SetExtensions(ext *Extensions) {
 	e.ext = ext
-	e.interceptorCache = map[int64][]FlowInterceptor{}
+	e.interceptorCache = map[string][]FlowInterceptor{}
+	e.rootDeclCache = map[int64]rootDecls{}
 	e.defineNameCache = map[int64]string{}
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
-// interceptorCache 定义级拦截器解析缓存（issue 34，按 defineId）
-// issues/60：解析与校验分离——声明中存在未注册名时返回显式错误（不静默跳过），
+// rootDecls 流程根一档的 pre/post 声明（每一定义只回查一行，见 resolveInterceptors 的读放大纪律）
+type rootDecls struct{ Pre, Post string }
+
+// rootDeclsFor 读取并缓存流程根的 pre/postInterceptors 声明。
+// 读取/解析失败按 issues/60 现状语义视作"根级未声明"，同样缓存（不打断执行链）。
+func (e *EngineImpl) rootDeclsFor(ctx context.Context, defineID int64) rootDecls {
+	if d, ok := e.rootDeclCache[defineID]; ok {
+		return d
+	}
+	d := rootDecls{}
+	if def, err := e.repo.FindDefineByID(ctx, defineID); err == nil && def != nil {
+		var meta struct {
+			PreInterceptors  string `json:"preInterceptors"`
+			PostInterceptors string `json:"postInterceptors"`
+		}
+		if json.Unmarshal(def.Content, &meta) == nil {
+			d.Pre = strings.TrimSpace(meta.PreInterceptors)
+			d.Post = strings.TrimSpace(meta.PostInterceptors)
+		}
+	}
+	e.rootDeclCache[defineID] = d
+	return d
+}
+
+// resolveInterceptors 定义级／节点级拦截器解析（issue 34 ＋ audit8 R91，
+// 对齐 java NodeModel.java:49-59：节点串空才取流程根同名键）。
+// 档位＝"pre"/"post" 两档各自取串：节点 properties 声明优先，串空才回落流程根同名键，
+// **两档不叠加**（spec02 §3「节点级拦截器的优先序、回落与键形」）；两档都没声明才回落引擎级列表
+// （向后兼容现状）。解析键＝注册名（键形按丙＝注册表里沿用 java 全类名串，本栈不另发明短名）。
+// 缓存键含 defineId＋节点＋档位（issues/234 §4.2：按 defineId 单键会把两个节点的声明串档）。
+// issues/60：解析与校验分离——声明中存在未注册名时返回显式错误（不静默跳过，带档位与节点 id），
 // 且错误不写缓存，保证后续执行持续报错直至注册补齐。
 // audit8 R9 145-3：读定义走调用方 ctx（事务内同连接），不再自造 Background。
-func (e *EngineImpl) resolveInterceptors(ctx context.Context, inst *model.ProcessInstance) ([]FlowInterceptor, error) {
+// 读放大纪律：节点未声明时回查的是 rootDeclsFor（每定义一行），不是逐节点读定义行。
+func (e *EngineImpl) resolveInterceptors(ctx context.Context, node *model.FlowNode,
+	inst *model.ProcessInstance, phase string) ([]FlowInterceptor, error) {
 	if e.ext == nil {
 		return nil, nil
 	}
 	if inst == nil || inst.DefineID == 0 {
 		return e.ext.Interceptors, nil
 	}
-	if cached, ok := e.interceptorCache[inst.DefineID]; ok {
+	prop, rootField := "postInterceptors", "post"
+	if phase == "pre" {
+		prop, rootField = "preInterceptors", "pre"
+	}
+	nodeID := ""
+	if node != nil {
+		nodeID = node.ID
+	}
+	key := fmt.Sprintf("%d|%s|%s", inst.DefineID, nodeID, phase)
+	if cached, ok := e.interceptorCache[key]; ok {
 		return cached, nil
 	}
-	list := e.ext.Interceptors
-	if def, err := e.repo.FindDefineByID(ctx, inst.DefineID); err == nil && def != nil {
-		var meta struct {
-			PostInterceptors string `json:"postInterceptors"`
-		}
-		if json.Unmarshal(def.Content, &meta) == nil && strings.TrimSpace(meta.PostInterceptors) != "" {
-			list = nil
-			for _, name := range strings.Split(meta.PostInterceptors, ",") {
-				name = strings.TrimSpace(name)
-				if name != "" {
-					if ic, ok := e.ext.InterceptorRegistry[name]; !ok {
-						return nil, fmt.Errorf("postInterceptors 声明的拦截器未注册: %s", name)
-					} else {
-						list = append(list, ic)
-					}
-				}
-			}
+	declared := ""
+	if node != nil {
+		if v, ok := node.Properties[prop].(string); ok {
+			declared = strings.TrimSpace(v)
 		}
 	}
-	e.interceptorCache[inst.DefineID] = list
+	list := e.ext.Interceptors
+	if declared == "" {
+		d := e.rootDeclsFor(ctx, inst.DefineID)
+		if rootField == "pre" {
+			declared = d.Pre
+		} else {
+			declared = d.Post
+		}
+		if declared == "" {
+			e.interceptorCache[key] = list
+			return list, nil
+		}
+	}
+	list = nil
+	for _, name := range strings.Split(declared, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		ic, ok := e.ext.InterceptorRegistry[name]
+		if !ok {
+			return nil, fmt.Errorf("%s 声明的拦截器未注册: %s（nodeId=%s）", prop, name, nodeID)
+		}
+		list = append(list, ic)
+	}
+	e.interceptorCache[key] = list
 	return list, nil
 }
 
@@ -271,7 +324,7 @@ func (e *EngineImpl) firePreInterceptors(ctx context.Context, node *model.FlowNo
 	if e.ext == nil {
 		return true, nil
 	}
-	list, err := e.resolveInterceptors(ctx, inst)
+	list, err := e.resolveInterceptors(ctx, node, inst, "pre")
 	if err != nil {
 		return false, err
 	}
@@ -288,7 +341,7 @@ func (e *EngineImpl) firePostInterceptors(ctx context.Context, node *model.FlowN
 	if e.ext == nil {
 		return nil
 	}
-	list, err := e.resolveInterceptors(ctx, inst)
+	list, err := e.resolveInterceptors(ctx, node, inst, "post")
 	if err != nil {
 		return err
 	}
