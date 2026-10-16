@@ -354,8 +354,20 @@ func (e *EngineImpl) firePostInterceptors(ctx context.Context, node *model.FlowN
 // fireEvent 发布事件。
 // 兜底语义（issues/104 P2 统一口径）：单监听器 panic 只记录不传播——
 // 不得影响引擎主流程，也不得中断后续监听器（对齐 PHP per-listener catch）。
+//
+// audit8 R77 读法一（issues/234 §4.3／spec12 §12.3.1）：派发**发起点不动**——仍在事务内、仍随事件带
+// 动作 ctx（145-3 钉的就是"同连接反查读得到动作内未提交的行"，TestTxTier145ListenerSeesActionDataViaEventCtx
+// 是这条的既有判据，本轮一度把整批派发挪到提交后才照出它红）。本栈补的是**可选**通道 RunAfterCommit：
+// 监听器自己声明"这一腿提交后再跑"（java 参考实现即此形状：事务内 fire＋监听器自取 afterCommit）。
+// ⇒ 没接通道的监听器行为逐字不变；接了的才挪到 COMMIT 之后（回滚整批丢弃）。
 func (e *EngineImpl) fireEvent(ctx context.Context, evt ProcessEvent) {
-	if e.ext == nil { return }
+	if e.ext == nil {
+		return
+	}
+	e.dispatchListeners(ctx, evt)
+}
+
+func (e *EngineImpl) dispatchListeners(ctx context.Context, evt ProcessEvent) {
 	for _, l := range e.ext.Listeners {
 		func() {
 			defer func() {
@@ -367,6 +379,24 @@ func (e *EngineImpl) fireEvent(ctx context.Context, evt ProcessEvent) {
 			l(ctx, evt)
 		}()
 	}
+}
+
+// AfterCommitCarrier 事务载体的可选能力（audit8 R77）：把回调登记到"本次事务提交之后"执行，
+// 回滚则整批丢弃；返回 false＝当前 ctx 不在活动事务中（或本栈没有这条通道），调用方须自行立即执行。
+// jdbc 仓实现它；内存仓与宿主自开事务的集成层都走"自行立即执行"那一支（行为不变）。
+type AfterCommitCarrier interface {
+	AfterCommit(ctx context.Context, fn func(ctx context.Context)) bool
+}
+
+// RunAfterCommit 提交后腿通道（audit8 R77 读法一，php R25 的 Go 对应物）：监听器/集成层用它把
+// "看到的世界必须是已提交"那一腿（反查、外发通知、二次写）挪到 COMMIT 之后，回滚则整批丢弃。
+// 没有活动事务或载体没这条通道 ⇒ 立即执行（门面级没外包事务模板的栈，"落库后"与"提交后"等价）。
+// 引擎自身的 fire 不经此处——派发形状由 145-3 钉住，不随本轮改变。
+func (e *EngineImpl) RunAfterCommit(ctx context.Context, fn func(ctx context.Context)) {
+	if c, ok := e.repo.(AfterCommitCarrier); ok && c.AfterCommit(ctx, fn) {
+		return
+	}
+	fn(ctx)
 }
 
 // FireEvent 公开事件发布入口（facade 层事件源调用，issues/102 CC_CREATE）：

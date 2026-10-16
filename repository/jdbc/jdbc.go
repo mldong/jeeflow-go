@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mldong/jeeflow-go/model"
@@ -56,7 +57,7 @@ func (n *nullStrScan) Scan(v interface{}) error {
 
 // nullStrToPtr 可空字符串列 → *string（NULL → nil，不投成 ""）。
 // 出口形状对齐 jeeflow-java（rs.getString 对 NULL 返回 Java null → JSON null）；
-// 遵 spec 06 §2.4「可空列合法出口为 null/缺键，'' 违规」。用于分页行 DTO 的可空列。
+// 遵 spec 06 §2.4「可空列合法出口为 null/缺键，” 违规」。用于分页行 DTO 的可空列。
 func nullStrToPtr(ns sql.NullString) *string {
 	if !ns.Valid {
 		return nil
@@ -213,19 +214,21 @@ func (g *tsIDGen) NextID() int64 {
 // 永久占住（锁不释放）；重复 Rollback 是 no-op，安全。
 func (r *Repository) WithTx(ctx context.Context, fn func(ctx context.Context) error) error {
 	if _, ok := ctx.Value(txKey{}).(*sql.Tx); ok {
-		return fn(ctx) // 已在事务中 ⇒ 并入最外层（提交/回滚归它）
+		return fn(ctx) // 已在事务中 ⇒ 并入最外层（提交/回滚归它，afterCommit 登记表也归它）
 	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	st := &txState{tx: tx}
 	committed := false
 	defer func() {
 		if !committed {
 			_ = tx.Rollback() // panic / 提前返回兜底；已提交后为 no-op
+			st.discard()      // audit8 R77：回滚 ⇒ 提交后腿整批丢弃（监听器不得看到未提交的世界）
 		}
 	}()
-	ctx = context.WithValue(ctx, txKey{}, tx)
+	ctx = context.WithValue(context.WithValue(ctx, txKey{}, tx), stateKey{}, st)
 	if err := fn(ctx); err != nil {
 		return err
 	}
@@ -233,7 +236,71 @@ func (r *Repository) WithTx(ctx context.Context, fn func(ctx context.Context) er
 		return err
 	}
 	committed = true
+	st.fire(noTx{ctx}) // 提交后腿走无事务 ctx ⇒ 与 java「事务线程提交后反查」同形，不再占着已提交的连接
 	return nil
+}
+
+// ─── 提交后腿（audit8 R77 读法一，issues/234 §4.3／spec12 §12.3.1）───────────────
+//
+// 契约下限＝"监听器看到的世界＝已提交"由**监听器侧**承担：引擎在事务内发起派发，但把派发
+// 交给这条通道登记 ⇒ 提交后执行、回滚丢弃；不在事务中（或宿主模板没接门面）⇒ 立即执行，
+// 行为与上一版逐字一致。php 侧 R25（issues/191）已按同一形状收口，本栈是其 Go 对应物。
+
+// stateKey 挂最外层事务的提交后腿登记表（txKey 只放连接本身，保持既有取值语义不变）
+type stateKey struct{}
+
+type txState struct {
+	mu   sync.Mutex
+	tx   *sql.Tx
+	cbs  []func(context.Context)
+	done bool
+}
+
+func (s *txState) add(fn func(context.Context)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.done {
+		return
+	}
+	s.cbs = append(s.cbs, fn)
+}
+
+func (s *txState) fire(ctx context.Context) {
+	s.mu.Lock()
+	cbs := s.cbs
+	s.cbs, s.done = nil, true
+	s.mu.Unlock()
+	for _, cb := range cbs {
+		cb(ctx)
+	}
+}
+
+func (s *txState) discard() {
+	s.mu.Lock()
+	s.cbs, s.done = nil, true
+	s.mu.Unlock()
+}
+
+// noTx 屏蔽 txKey 的 ctx 包装：提交后连接已释放，回调里的仓储调用必须走池连接而非旧事务连接
+type noTx struct{ context.Context }
+
+func (c noTx) Value(k any) any {
+	if _, ok := k.(txKey); ok {
+		return nil
+	}
+	return c.Context.Value(k)
+}
+
+// AfterCommit 登记"提交后执行"的回调。
+// 返回值＝是否真登记进活动事务；false（不在事务中）⇒ 调用方**自己立即执行**（兼容旧行为）。
+// 嵌套 WithTx 由最外层持有登记表（内层 ctx 已带 stateKey），提交/回滚都归最外层。
+func (r *Repository) AfterCommit(ctx context.Context, fn func(ctx context.Context)) bool {
+	st, ok := ctx.Value(stateKey{}).(*txState)
+	if !ok {
+		return false
+	}
+	st.add(fn)
+	return true
 }
 
 // TxFromContext 返回 ctx 中绑定的事务连接（WithTx 绑定后对同包所有仓储可见：
