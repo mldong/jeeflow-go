@@ -1343,12 +1343,18 @@ func findNodeByType(flow *model.FlowModel, typ string) *model.FlowNode {
 	return nil
 }
 
+func unknownEdgeWarning(from, to string) string {
+	return fmt.Sprintf("[jeeflow] WARNING 转移出边的目标节点不在模型里（该节点类型未建档，解析期已跳过），本次流转停在这条边: from=%s, to=%s", from, to)
+}
+
 func followEdges(flow *model.FlowModel, sourceID string) []*model.FlowNode {
 	var result []*model.FlowNode
 	for _, edge := range flow.Edges {
 		if edge.SourceNodeID == sourceID {
 			if n := findNode(flow, edge.TargetNodeID); n != nil {
 				result = append(result, n)
+			} else {
+				log.Print(unknownEdgeWarning(sourceID, edge.TargetNodeID))
 			}
 		}
 	}
