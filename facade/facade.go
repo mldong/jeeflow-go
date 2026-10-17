@@ -373,6 +373,16 @@ func (f *Facade) removeDefine(ctx context.Context, args map[string]interface{}) 
 	if err != nil {
 		return err
 	}
+	// audit8 R110：先对整批做存在性校验再删，避免"前面的删了、后面的被拒"的半删。
+	for _, id := range ids {
+		has, err := f.repo.HasInstancesByDefineID(ctx, id)
+		if err != nil {
+			return err
+		}
+		if has {
+			return errors.New(msgExistUnFinishInstance)
+		}
+	}
 	for _, id := range ids {
 		if err := f.repo.RemoveDefine(ctx, id); err != nil {
 			return err
@@ -2344,6 +2354,9 @@ func errorResult(msg string) map[string]interface{} {
 // `throw new RuntimeException("读取流程定义 JSON 失败", e)` —— 门面出口
 // JeeflowFacade.java:177 `error(e.getMessage())` 取到的就是这句固定文案，cause 不进 msg。
 const msgReadFlowDefineJSONFailed = "读取流程定义 JSON 失败"
+
+// msgExistUnFinishInstance 删定义的实例守卫文案（内部码 20010005，逐字沿用 boot2）。
+const msgExistUnFinishInstance = "存在正在未完成的流程实例，不允许删除！"
 
 // facadeFixedError 对外 msg 与内部 cause **分离**的错误（issues/139）。
 //

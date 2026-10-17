@@ -659,6 +659,29 @@ func mustDefineState(t *testing.T, f *facade.Facade, id int64, label string) int
 	return int(mustI64(r["data"].(map[string]interface{})["state"]))
 }
 
+// TestR110DefineRemoveAnyInstanceGuard：任何实例存在即拒；整批先校验，不半删。
+func TestR110DefineRemoveAnyInstanceGuard(t *testing.T) {
+	f, _, _ := setupFacade()
+	def := mustDeployDefine(t, f, "01-simple.json", "simple", "R110定义")
+	mustOk(t, f.Flow("processInstance/startAndExecute",
+		map[string]interface{}{"processDefineId": def, "operator": "zhangsan"}))
+
+	r := f.Flow("processDefine/remove", map[string]interface{}{"id": def})
+	if r["code"].(int) != 99999999 || r["msg"].(string) != "存在正在未完成的流程实例，不允许删除！" {
+		t.Fatalf("单 id 应被拒，got %v", r)
+	}
+	mustRowAlive(t, f, "processDefine/detail", def, "R110定义")
+
+	clean := mustDeployDefine(t, f, "01-simple.json", "simple", "R110Clean")
+	r = f.Flow("processDefine/remove", map[string]interface{}{"ids": []interface{}{clean, def}})
+	if r["code"].(int) != 99999999 || r["msg"].(string) != "存在正在未完成的流程实例，不允许删除！" {
+		t.Fatalf("批量应被拒，got %v", r)
+	}
+	mustRowAlive(t, f, "processDefine/detail", clean, "clean 不得半删")
+	mustRowAlive(t, f, "processDefine/detail", def, "dirty 不得被删")
+	mustOk(t, f.Flow("processDefine/remove", map[string]interface{}{"id": clean}))
+}
+
 // TestFacadeIdsMatrixDefineRemove processDefine/remove 的四态矩阵（前端定义列表勾选删除走 {ids}）
 func TestFacadeIdsMatrixDefineRemove(t *testing.T) {
 	f, _, _ := setupFacade()

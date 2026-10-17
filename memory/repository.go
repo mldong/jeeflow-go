@@ -124,6 +124,17 @@ func (r *Repository) RemoveDefine(ctx context.Context, defineID int64) error {
 	return nil
 }
 
+func (r *Repository) HasInstancesByDefineID(ctx context.Context, defineID int64) (bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, inst := range r.instances {
+		if inst.DefineID == defineID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (r *Repository) FindInstanceByID(ctx context.Context, id int64) (*model.ProcessInstance, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

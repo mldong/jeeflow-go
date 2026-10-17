@@ -450,6 +450,16 @@ func (r *Repository) RemoveDefine(ctx context.Context, defineID int64) error {
 	return err
 }
 
+func (r *Repository) HasInstancesByDefineID(ctx context.Context, defineID int64) (bool, error) {
+	c := r.conn(ctx)
+	var count int
+	if err := c.QueryRowContext(ctx,
+		"SELECT COUNT(1) FROM wf_process_instance WHERE process_define_id=?", defineID).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // ─── ProcessInstance ───────────────────────────────────────────────────────────
 
 const instanceCols = "id, parent_id, process_define_id, state, parent_node_name, business_no, operator, expire_time, variable, create_time, create_user, update_time, update_user"

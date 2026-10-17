@@ -17,6 +17,7 @@ type ProcessRepository interface {
 	UpdateDefine(ctx context.Context, def *model.ProcessDefine) error
 	UpdateDefineState(ctx context.Context, defineID int64, state int) error
 	RemoveDefine(ctx context.Context, defineID int64) error
+	HasInstancesByDefineID(ctx context.Context, defineID int64) (bool, error)
 
 	FindInstanceByID(ctx context.Context, id int64) (*model.ProcessInstance, error)
 	SaveInstance(ctx context.Context, inst *model.ProcessInstance) error
