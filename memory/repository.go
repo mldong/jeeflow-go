@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -966,6 +967,16 @@ func (r *Repository) taskRow(t *model.ProcessTask) *model.TaskRow {
 	}
 	if inst, ok := r.instances[t.ProcessInstanceID]; ok {
 		row.InstanceCreateTime = inst.CreateTime
+		// 与 repository/jdbc 的 `pi.variable AS instance_variable` 投影对齐（spec 06 §4.5 条款 6
+		// 「同栈两仓同答案」）：issues/82-3 那条「任务变量只剩控制键 ⇒ ext 回退实例变量」的
+		// 回退目标就是这一列。此前内存仓漏映射 ⇒ 门面级用例只能断言 ext 非 nil，照不出回退
+		// 有没有真发生（本轮 `_branchCtx` 写进每条任务变量后七栈齐漏，只有 php 的 PDO 仓有
+		// 内容级断言才报红）。
+		if len(inst.Variables) > 0 {
+			if b, err := json.Marshal(inst.Variables); err == nil {
+				row.InstanceVariable = string(b)
+			}
+		}
 		if def, ok := r.defines[inst.DefineID]; ok {
 			row.ProcessDefineName = sp(def.Name)
 			row.ProcessDefineDisplayName = sp(def.DisplayName)

@@ -2771,8 +2771,20 @@ func taskRowToMap(r *model.TaskRow) map[string]interface{} {
 	ext := r.Variables
 	// issues/121 P1：引擎建单必写的控制键不算「任务变量非空」，否则新建任务的 ext
 	// 永远不再回退实例变量（issues/82-3 既有契约）。
-	if len(ext) == 0 || (len(ext) == 1 && ext[model.IsFirstTaskNodeKey] != nil) {
-		ext = instanceExt
+	// 「退回修改、重提直返」又添了两枚引擎内部键（spec 04 保留键 engine.VarBranchCtx／
+	// VarReapplyCtx，建单时无条件写入、空分支也写 []）：同样不算用户变量——否则每条任务行
+	// 从此都不再回退，且内部键直接从公开出口透出。但 VarReapplyCtx 是前端「重新提交后
+	// 返回：X」的唯一取数口（jeeflow-ui helpers.ts 读 ext._reapplyContext）⇒ 回退后原样合回。
+	// 合回必须落在**副本**上：instanceExt 是同一响应里的另一个出口，不能被任务侧的键污染。
+	if hasOnlyControlKeys(ext) {
+		reapply, marked := ext[engine.VarReapplyCtx]
+		ext = make(map[string]interface{}, len(instanceExt)+1)
+		for k, v := range instanceExt {
+			ext[k] = v
+		}
+		if marked {
+			ext[engine.VarReapplyCtx] = reapply
+		}
 	}
 	return map[string]interface{}{
 		"id": r.ID, "processInstanceId": r.ProcessInstanceID, "taskName": r.TaskName,
@@ -2786,6 +2798,19 @@ func taskRowToMap(r *model.TaskRow) map[string]interface{} {
 		"ext":                ext, "instanceExt": instanceExt, "version": r.DefineVersion,
 		"taskFormData": formDataOf(r.Variables, "tf_"), // issues/15
 	}
+}
+
+// hasOnlyControlKeys 任务变量是否只剩引擎建单必写的控制键（issues/121 P1 的判据体）：
+// 行级首节点标记 ＋ spec 04 的两枚直返保留键。空表／nil 也算（原 len(ext)==0 那一档）。
+func hasOnlyControlKeys(ext map[string]interface{}) bool {
+	for k := range ext {
+		switch k {
+		case model.IsFirstTaskNodeKey, engine.VarBranchCtx, engine.VarReapplyCtx:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ccRowToMap 抄送行：ext（实例变量对象）+ displayName/version（定义）

@@ -1463,6 +1463,13 @@ func mergeExecIntoInstance(base, exec map[string]interface{}) map[string]interfa
 		if k == model.IsFirstTaskNodeKey {
 			continue
 		}
+		// 「退回修改、重提直返」的两枚保留键（spec 04）同属**行级**引擎内部状态：`_branchCtx`
+		// 是分支归属栈、`_reapplyContext` 只出现在申请待办上，实例层没有对应语义。若不挡，
+		// 任务办结时它们会随 exec 变量池写进实例变量并落库 ⇒ 每个出口（任务行 instanceExt／
+		// 实例行 ext）都透出内部键，且 issues/82-3 的回退目标本身被污染。
+		if k == VarBranchCtx || k == VarReapplyCtx {
+			continue
+		}
 		out[k] = v
 	}
 	return out

@@ -2388,6 +2388,97 @@ func TestPageEnvelopeAndInstanceExt(t *testing.T) {
 	}
 }
 
+// issues/82-3 / 121 P1 的**内容级**判据——上面 TestPageEnvelopeAndInstanceExt 只查容器键在不在，
+// 回退有没有真发生它照不出（本轮 `_branchCtx` 写进每条任务变量后，七栈都是这么漏过去的；
+// 只有 php 的 PDO 仓有内容级断言才报红）。两腿：
+// ① 任务变量只剩引擎控制键 ⇒ 任务行 ext 回退实例变量、内部键不透出；
+// ② 直返申请待办 ⇒ ext = 实例变量 + `_reapplyContext`（前端「重新提交后返回：X」的取数口），
+//   且合回不得污染同一响应里的 instanceExt。
+func TestTaskRowExtFallsBackWithReapplyReservedKeys(t *testing.T) {
+	f, repo, _ := setupFacade()
+	if r := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "01-simple.json"))}); r["code"].(int) != 0 {
+		t.Fatalf("deploy: %v", r)
+	}
+	if r := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": mustDefineID(t, repo, "simple"), "operator": "zhangsan",
+	}); r["code"].(int) != 0 {
+		t.Fatalf("start: %v", r)
+	}
+	r := f.Flow("processTask/todoList", map[string]interface{}{"operator": "leader"})
+	mustOk(t, r)
+	rows, _ := r["data"].(map[string]interface{})["rows"].([]interface{})
+	if len(rows) == 0 {
+		t.Fatalf("todoList 应有行")
+	}
+	row, _ := rows[0].(map[string]interface{})
+	ext, _ := row["ext"].(map[string]interface{})
+	instExt, _ := row["instanceExt"].(map[string]interface{})
+	if len(instExt) == 0 {
+		t.Fatalf("前置：instanceExt 必须非空，否则下面的回退断言恒真空 → %v", row)
+	}
+	if _, ok := ext[engine.VarBranchCtx]; ok {
+		t.Fatalf("内部键 %s 不得从任务行 ext 透出（spec 04 保留键）: ext=%v instExt=%v",
+			engine.VarBranchCtx, ext, instExt)
+	}
+	if _, ok := ext[model.IsFirstTaskNodeKey]; ok {
+		t.Fatalf("行级首节点标记同属控制键，回退后不应留在 ext 上: %v", ext)
+	}
+	if !reflect.DeepEqual(ext, instExt) {
+		t.Fatalf("任务变量只剩控制键 ⇒ ext 应回退实例变量（82-3 / 121 P1）:\n ext=%v\n instExt=%v", ext, instExt)
+	}
+
+	// ② 直返申请待办
+	if r := f.Flow("processDefine/deploy", map[string]interface{}{"content": string(flowContent(t, "14-return-to-source.json"))}); r["code"].(int) != 0 {
+		t.Fatalf("deploy rts: %v", r)
+	}
+	if r := f.Flow("processInstance/startAndExecute", map[string]interface{}{
+		"processDefineId": mustDefineID(t, repo, "return-to-source"), "operator": "applicant",
+	}); r["code"].(int) != 0 {
+		t.Fatalf("start rts: %v", r)
+	}
+	ids := todoIDsOf(t, f, "userA")
+	if len(ids) == 0 {
+		t.Fatalf("前置：userA 应有 taskA 待办")
+	}
+	if r := f.Flow("processTask/execute", map[string]interface{}{
+		"processTaskId": ids[0], "operator": "userA", "submitType": 6,
+	}); r["code"].(int) != 0 {
+		t.Fatalf("退回发起人: %v", r)
+	}
+	r = f.Flow("processTask/todoList", map[string]interface{}{"operator": "applicant", "pageSize": 100})
+	mustOk(t, r)
+	rows, _ = r["data"].(map[string]interface{})["rows"].([]interface{})
+	var appRow map[string]interface{}
+	for _, m := range rows {
+		c, _ := m.(map[string]interface{})
+		if e, _ := c["ext"].(map[string]interface{}); e != nil {
+			if _, ok := e[engine.VarReapplyCtx]; ok {
+				appRow = c
+			}
+		}
+	}
+	if appRow == nil {
+		t.Fatalf("直返申请待办的 ext 应带 %s（前端提示的取数口）；实得行=%v", engine.VarReapplyCtx, rows)
+	}
+	appExt, _ := appRow["ext"].(map[string]interface{})
+	appInstExt, _ := appRow["instanceExt"].(map[string]interface{})
+	for k := range appInstExt {
+		if _, ok := appExt[k]; !ok {
+			t.Fatalf("回退仍要发生：实例变量键 %s 应在 ext 上 → ext=%v instExt=%v", k, appExt, appInstExt)
+		}
+	}
+	if _, ok := appExt[engine.VarBranchCtx]; ok {
+		t.Fatalf("内部键 %s 不得从 ext 透出: %v", engine.VarBranchCtx, appExt)
+	}
+	ctx, _ := appExt[engine.VarReapplyCtx].(map[string]interface{})
+	if ctx == nil || ctx["sourceNode"] != "taskA" {
+		t.Fatalf("来源节点应可读（前端提示就取这一格）: %v", appExt[engine.VarReapplyCtx])
+	}
+	if _, ok := appInstExt[engine.VarReapplyCtx]; ok {
+		t.Fatalf("合回不得污染同一响应里的 instanceExt 出口: %v", appInstExt)
+	}
+}
+
 // issues/82-5：task detail 任务级 ext.isFirstTaskNode（前端 detail.vue 双兜底）
 func TestTaskDetailExtIsFirstTaskNode(t *testing.T) {
 	// 场景 1：startAndExecute 自动完成 apply → 剩 task1（DOING，非首节点）→ false
