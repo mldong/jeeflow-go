@@ -1,0 +1,36 @@
+{
+  "name": "return-to-source-nested",
+  "displayName": "退回直返-嵌套并行",
+  "type": "snaker",
+  "nodes": [
+    {"id": "start", "type": "snaker:start", "properties": {"width": 100, "height": 50}, "text": {"value": "开始"}},
+    {"id": "apply", "type": "snaker:task", "properties": {"width": 100, "height": 50, "form": "apply-form", "assignee": "applicant", "taskType": 0, "performType": 0}, "text": {"value": "发起申请"}},
+    {"id": "fork1", "type": "snaker:fork", "properties": {"width": 100, "height": 50}, "text": {"value": "外层分支"}},
+    {"id": "taskA", "type": "snaker:task", "properties": {"width": 100, "height": 50, "form": "form-a", "assignee": "userA", "taskType": 0, "performType": 0}, "text": {"value": "外层财务"}},
+    {"id": "taskB", "type": "snaker:task", "properties": {"width": 100, "height": 50, "form": "form-b", "assignee": "userB", "taskType": 0, "performType": 0}, "text": {"value": "外层人事"}},
+    {"id": "fork2", "type": "snaker:fork", "properties": {"width": 100, "height": 50}, "text": {"value": "内层分支"}},
+    {"id": "taskX", "type": "snaker:task", "properties": {"width": 100, "height": 50, "form": "form-x", "assignee": "userX", "taskType": 0, "performType": 0, "reapplyMode": "RETURN_TO_SOURCE"}, "text": {"value": "内层财务"}},
+    {"id": "taskY", "type": "snaker:task", "properties": {"width": 100, "height": 50, "form": "form-y", "assignee": "userY", "taskType": 0, "performType": 0}, "text": {"value": "内层人事"}},
+    {"id": "join2", "type": "snaker:join", "properties": {"width": 100, "height": 50}, "text": {"value": "内层合并"}},
+    {"id": "taskA2", "type": "snaker:task", "properties": {"width": 100, "height": 50, "form": "form-a2", "assignee": "userA", "taskType": 0, "performType": 0}, "text": {"value": "内层复核"}},
+    {"id": "join1", "type": "snaker:join", "properties": {"width": 100, "height": 50}, "text": {"value": "外层合并"}},
+    {"id": "taskC", "type": "snaker:task", "properties": {"width": 100, "height": 50, "form": "form-c", "assignee": "userC", "taskType": 0, "performType": 0}, "text": {"value": "负责人审批"}},
+    {"id": "end", "type": "snaker:end", "properties": {"width": 100, "height": 50}, "text": {"value": "结束"}}
+  ],
+  "edges": [
+    {"id": "e0", "sourceNodeId": "start", "targetNodeId": "apply", "properties": {}},
+    {"id": "e1", "sourceNodeId": "apply", "targetNodeId": "fork1", "properties": {}},
+    {"id": "e2", "sourceNodeId": "fork1", "targetNodeId": "taskA", "properties": {}},
+    {"id": "e3", "sourceNodeId": "fork1", "targetNodeId": "taskB", "properties": {}},
+    {"id": "e4", "sourceNodeId": "taskA", "targetNodeId": "fork2", "properties": {}},
+    {"id": "e5", "sourceNodeId": "fork2", "targetNodeId": "taskX", "properties": {}},
+    {"id": "e6", "sourceNodeId": "fork2", "targetNodeId": "taskY", "properties": {}},
+    {"id": "e7", "sourceNodeId": "taskX", "targetNodeId": "join2", "properties": {}},
+    {"id": "e8", "sourceNodeId": "taskY", "targetNodeId": "join2", "properties": {}},
+    {"id": "e9", "sourceNodeId": "join2", "targetNodeId": "taskA2", "properties": {}},
+    {"id": "e10", "sourceNodeId": "taskA2", "targetNodeId": "join1", "properties": {}},
+    {"id": "e11", "sourceNodeId": "taskB", "targetNodeId": "join1", "properties": {}},
+    {"id": "e12", "sourceNodeId": "join1", "targetNodeId": "taskC", "properties": {}},
+    {"id": "e13", "sourceNodeId": "taskC", "targetNodeId": "end", "properties": {}}
+  ]
+}

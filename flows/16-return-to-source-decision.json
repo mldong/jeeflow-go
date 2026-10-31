@@ -1,0 +1,217 @@
+{
+  "name": "return-to-source-decision",
+  "displayName": "条件分支退回直返",
+  "type": "approval",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "snaker:start",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50
+      },
+      "text": {
+        "value": "开始"
+      }
+    },
+    {
+      "id": "apply",
+      "type": "snaker:task",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "apply-form",
+        "assignee": "applicant",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "发起申请"
+      }
+    },
+    {
+      "id": "decision1",
+      "type": "snaker:decision",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "expr": "amount > 1000"
+      },
+      "text": {
+        "value": "金额大于1000"
+      }
+    },
+    {
+      "id": "taskHigh",
+      "type": "snaker:task",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "form-h",
+        "assignee": "userH",
+        "taskType": 0,
+        "performType": 0,
+        "reapplyMode": "RETURN_TO_SOURCE"
+      },
+      "text": {
+        "value": "高额审批"
+      }
+    },
+    {
+      "id": "taskLow",
+      "type": "snaker:task",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "form-l",
+        "assignee": "userL",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "普通审批"
+      }
+    },
+    {
+      "id": "decision2",
+      "type": "snaker:decision",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "expr": "level > 1"
+      },
+      "text": {
+        "value": "二级条件"
+      }
+    },
+    {
+      "id": "taskX",
+      "type": "snaker:task",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "form-x",
+        "assignee": "userX",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "二级X"
+      }
+    },
+    {
+      "id": "taskY",
+      "type": "snaker:task",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "form-y",
+        "assignee": "userY",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "二级Y"
+      }
+    },
+    {
+      "id": "end",
+      "type": "snaker:end",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50
+      },
+      "text": {
+        "value": "结束"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e0",
+      "sourceNodeId": "start",
+      "targetNodeId": "apply",
+      "properties": {}
+    },
+    {
+      "id": "e1",
+      "sourceNodeId": "apply",
+      "targetNodeId": "decision1",
+      "properties": {}
+    },
+    {
+      "id": "e2",
+      "sourceNodeId": "decision1",
+      "targetNodeId": "taskHigh",
+      "properties": {
+        "expr": "amount > 1000"
+      }
+    },
+    {
+      "id": "e3",
+      "sourceNodeId": "decision1",
+      "targetNodeId": "taskLow",
+      "properties": {
+        "expr": "amount <= 1000"
+      }
+    },
+    {
+      "id": "e4",
+      "sourceNodeId": "taskHigh",
+      "targetNodeId": "decision2",
+      "properties": {}
+    },
+    {
+      "id": "e5",
+      "sourceNodeId": "decision2",
+      "targetNodeId": "taskX",
+      "properties": {
+        "expr": "level > 1"
+      }
+    },
+    {
+      "id": "e6",
+      "sourceNodeId": "decision2",
+      "targetNodeId": "taskY",
+      "properties": {
+        "expr": "level <= 1"
+      }
+    },
+    {
+      "id": "e7",
+      "sourceNodeId": "taskLow",
+      "targetNodeId": "end",
+      "properties": {}
+    },
+    {
+      "id": "e8",
+      "sourceNodeId": "taskX",
+      "targetNodeId": "end",
+      "properties": {}
+    },
+    {
+      "id": "e9",
+      "sourceNodeId": "taskY",
+      "targetNodeId": "end",
+      "properties": {}
+    }
+  ]
+}

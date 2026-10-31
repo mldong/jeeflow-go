@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"sync"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -26,6 +27,8 @@ type EngineImpl struct {
 	surrogateRepo   spi.ProcessExtRepository
 	surrogateOff    bool
 	defineNameCache map[int64]string
+	// 同实例串行化（汇合一次性放行、同一任务重复办理、退回与另一支汇合交错）
+	instLocks sync.Map
 }
 
 func New(repo spi.ProcessRepository, userProv spi.UserProvider, idGen spi.IDGenerator, exprEval spi.ExpressionEvaluator, opts ...Option) *EngineImpl {
@@ -129,6 +132,8 @@ func (e *EngineImpl) startProcessInstanceByIDInner(ctx context.Context, defineID
 // ─── Execute ───────────────────────────────────────────────────────────────────
 
 func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}) ([]*model.ProcessTask, error) {
+	unlock := e.lockInstanceByTask(taskID)
+	defer unlock()
 	// spec04 §完成任务 ⇒ 返回本次动作产出的任务行（基准＝java exec.getProcessTaskList()）。
 	// 收集器挂在进事务前的 ctx 上，InTx 派生的 ctx 一路带到唯一建单口 saveNewTask（见 new_tasks.go）。
 	cctx, sink := withNewTasksSink(ctx)
@@ -144,6 +149,11 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 }
 
 func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	args = stripReserved(args)
+	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil &&
+		pre.TaskState == model.TaskStateDoing && reapplyOf(pre.Variables) != nil {
+		return e.executeReapply(ctx, pre, operator, args)
+	}
 	// issues/127 / spec 11-events §11.7 办理时抄送（tf_ccActors）：本栈此前整条腿缺失。
 	// 覆盖面按 §11.7 边界 2 收窄到**只有 executeProcessTask 这一条路径**建 cc——基准＝Java
 	// JeeflowEngineImpl 里 handleCcActors 的唯一调用点就在 executeProcessTask，
@@ -324,6 +334,9 @@ func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, oper
 }
 
 func (e *EngineImpl) executeAndJumpToEndInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil && pre.TaskState == model.TaskStateDoing && reapplyOf(pre.Variables) != nil {
+		return nil, fmt.Errorf("带重提直返标记的申请待办不允许拒绝，只接受重新提交(submitType=5)")
+	}
 	// §11.7 边界 2：跳转·回退档不挂抄送钩子（cc 钩子传 nil）——tf_ccActors 在这一档不建 cc、
 	// 不发 CC_CREATE，与 Java executeAndJumpToEnd（无 handleCcActors）同形。
 	_, inst, _, _, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
@@ -360,6 +373,10 @@ func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, opera
 }
 
 func (e *EngineImpl) executeAndJumpTaskInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
+	// 带直返上下文的进行中申请待办只接受重新提交(5)：命名跳转/退回上一步都在改状态前拒绝
+	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil && pre.TaskState == model.TaskStateDoing && reapplyOf(pre.Variables) != nil {
+		return nil, fmt.Errorf("带重提直返标记的申请待办不允许跳转，只接受重新提交(submitType=5)")
+	}
 	// §11.7 边界 2：JUMP/ROLLBACK 两档都不建 cc（cc 钩子传 nil），与 Java executeAndJumpTask 同形
 	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
 	if err != nil {
@@ -397,6 +414,8 @@ func (e *EngineImpl) executeAndJumpTaskInner(ctx context.Context, taskID int64, 
 // ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）──────────────
 
 func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) ([]*model.ProcessTask, error) {
+	unlock := e.lockInstanceByTask(taskID)
+	defer unlock()
 	cctx, sink := withNewTasksSink(ctx)
 	err := e.InTx(cctx, func(ctx context.Context) error {
 		var err error
@@ -410,13 +429,54 @@ func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID i
 }
 
 func (e *EngineImpl) executeAndJumpToFirstTaskNodeInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
-	// §11.7 边界 2：退发起人档不建 cc（cc 钩子传 nil），与 Java executeAndJumpToFirstTaskNode 同形
+	args = stripReserved(args)
+	// 校验放在任何状态变更之前：带直返上下文的申请待办不得再次退回
+	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil && pre.TaskState == model.TaskStateDoing && reapplyOf(pre.Variables) != nil {
+		return nil, fmt.Errorf("带重提直返标记的申请待办不允许再次退回，只接受重新提交(submitType=5)")
+	}
+	// 依据来源节点配置判准入（RETURN_TO_SOURCE 直返）
+	var sourceNode *model.FlowNode
+	direct := false
+	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil && pre.TaskState == model.TaskStateDoing {
+		if preFlow, ferr := e.loadFlowForTask(ctx, pre); ferr == nil {
+			sourceNode = findNode(preFlow, pre.TaskName)
+		}
+	}
+	if sourceNode != nil {
+		mode, merr := parseReapplyMode(sourceNode)
+		if merr != nil {
+			return nil, merr
+		}
+		direct = mode == reapplyReturnToSource
+	}
 	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
 	if err != nil {
 		return nil, err
 	}
-	// 找到第一个任务节点，强制参与者为发起人，重新执行
-	if start := findNodeByType(flow, model.TypeStart); start != nil {
+	if direct {
+		if sourceNode.Type != model.TypeTask {
+			return nil, fmt.Errorf("节点[%s]不是普通审批任务，不支持重提直返", sourceNode.ID)
+		}
+		if IsCountersign(sourceNode.Properties["performType"]) {
+			return nil, fmt.Errorf("会签节点[%s]不支持退回修改直返", sourceNode.ID)
+		}
+		if e.isFirstTaskNode(flow, sourceNode) {
+			return nil, fmt.Errorf("申请节点[%s]不能配置重提直返", sourceNode.ID)
+		}
+		applyNode := firstTaskNode(flow)
+		if applyNode == nil {
+			return nil, fmt.Errorf("流程定义缺少申请节点，无法退回发起人")
+		}
+		if applyNode.Properties == nil {
+			applyNode.Properties = map[string]interface{}{}
+		}
+		applyNode.Properties["assignee"] = inst.Operator
+		if _, err := e.createTaskAtNode(ctx, flow, applyNode, inst, inst.Operator, vars, task.ID,
+			nil, newReapplyContext(task.ID, sourceNode.ID, scopesOf(task.Variables))); err != nil {
+			return nil, err
+		}
+	} else if start := findNodeByType(flow, model.TypeStart); start != nil {
+		// 找到第一个任务节点，强制参与者为发起人，重新执行
 		for _, node := range followEdges(flow, start.ID) {
 			if node.Type == model.TypeTask || node.Type == model.TypeCustom {
 				if node.Properties == nil {
@@ -685,6 +745,7 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 		}
 		nt := inst.CreateTaskWithActors(e.nextID(), node.ID, node.Text.Value, nil, operator, form, now, parentTaskID, isFirst, pt)
 		applyExpireTime(nt, expr, inst.Variables)
+		e.attachBranchCtx(flow, inst, nt, node.ID, parentTaskID)
 		if err := e.saveNewTask(ctx, nt, pn); err != nil {
 			return err
 		}
@@ -699,6 +760,7 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
 				// issues/126 案 A 写点：并行会签**全员**逐条按节点表达式算到期时间
 				applyExpireTime(nt, expr, inst.Variables)
+				e.attachBranchCtx(flow, inst, nt, node.ID, parentTaskID)
 				if err := e.saveNewTask(ctx, nt, pn); err != nil {
 					return err
 				}
@@ -714,6 +776,7 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 			})
 			// issues/126 案 A 写点：串行会签**首位成员**按节点表达式算到期时间
 			applyExpireTime(nt, expr, inst.Variables)
+			e.attachBranchCtx(flow, inst, nt, node.ID, parentTaskID)
 			if err := e.saveNewTask(ctx, nt, pn); err != nil {
 				return err
 			}
@@ -723,6 +786,7 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
 				// issues/126 案 A 写点：未知 countersignType 兜底分支也按逐人建单，同样要算
 				applyExpireTime(nt, expr, inst.Variables)
+				e.attachBranchCtx(flow, inst, nt, node.ID, parentTaskID)
 				if err := e.saveNewTask(ctx, nt, pn); err != nil {
 					return err
 				}
@@ -737,6 +801,7 @@ func (e *EngineImpl) createTaskWithActors(ctx context.Context, flow *model.FlowM
 	}
 	// issues/126 案 A 写点：普通建单（显式参与者入口）按节点表达式算到期时间
 	applyExpireTime(nt, expr, inst.Variables)
+	e.attachBranchCtx(flow, inst, nt, node.ID, parentTaskID)
 	if err := e.saveNewTask(ctx, nt, pn); err != nil {
 		return err
 	}
@@ -852,8 +917,7 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 		}
 		return nil
 	case model.TypeJoin:
-		doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
-		if len(doing) == 0 {
+		if e.mergeReady(ctx, flow, inst, node.ID, parentTaskID) {
 			for _, n := range followEdges(flow, node.ID) {
 				// issues/60：错误传播（拦截器解析等）
 				if err := e.executeNode(ctx, flow, inst, n, operator, vars, parentTaskID); err != nil {
@@ -987,6 +1051,7 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 		}
 		nt := inst.CreateTaskWithActors(e.nextID(), node.ID, node.Text.Value, nil, operator, form, now, parentTaskID, isFirst, pt)
 		applyExpireTime(nt, expr, inst.Variables)
+		e.attachBranchCtx(flow, inst, nt, node.ID, parentTaskID)
 		if err := e.saveNewTask(ctx, nt, pn); err != nil {
 			return err
 		}
@@ -1004,6 +1069,7 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
 				// issues/126 案 A 写点：并行会签**全员**逐条按节点表达式算到期时间
 				applyExpireTime(nt, expr, inst.Variables)
+				e.attachBranchCtx(flow, inst, nt, node.ID, parentTaskID)
 				if err := e.saveNewTask(ctx, nt, pn); err != nil {
 					return err
 				}
@@ -1021,6 +1087,7 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 			})
 			// issues/126 案 A 写点：串行会签**首位成员**按节点表达式算到期时间
 			applyExpireTime(nt, expr, inst.Variables)
+			e.attachBranchCtx(flow, inst, nt, node.ID, parentTaskID)
 			if err := e.saveNewTask(ctx, nt, pn); err != nil {
 				return err
 			}
@@ -1030,6 +1097,7 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 				nt := inst.CreateTask(e.nextID(), node.ID, node.Text.Value, actor, operator, form, now, parentTaskID, isFirst, 1)
 				// issues/126 案 A 写点：未知 countersignType 兜底分支也按逐人建单，同样要算
 				applyExpireTime(nt, expr, inst.Variables)
+				e.attachBranchCtx(flow, inst, nt, node.ID, parentTaskID)
 				if err := e.saveNewTask(ctx, nt, pn); err != nil {
 					return err
 				}
@@ -1047,6 +1115,7 @@ func (e *EngineImpl) createTask(ctx context.Context, flow *model.FlowModel, node
 	// 节点没配 ⇒ 这一列保持 NULL（不写 now()、不写 ''、不写 0）
 	applyExpireTime(nt, expr, inst.Variables)
 	// issues/116：委托代理在**参与者落库前**并入（见 engine/surrogate.go），随任务一起落库
+	e.attachBranchCtx(flow, inst, nt, node.ID, parentTaskID)
 	if err := e.saveNewTask(ctx, nt, pn); err != nil {
 		return err
 	}

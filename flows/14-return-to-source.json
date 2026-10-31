@@ -1,0 +1,111 @@
+{
+  "name": "return-to-source",
+  "displayName": "退回重提直返",
+  "type": "approval",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "snaker:start",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50
+      },
+      "text": {
+        "value": "开始"
+      }
+    },
+    {
+      "id": "apply",
+      "type": "snaker:task",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "apply-form",
+        "assignee": "applicant",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "发起申请"
+      }
+    },
+    {
+      "id": "taskA",
+      "type": "snaker:task",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "form-a",
+        "assignee": "userA",
+        "taskType": 0,
+        "performType": 0,
+        "reapplyMode": "RETURN_TO_SOURCE"
+      },
+      "text": {
+        "value": "财务审批"
+      }
+    },
+    {
+      "id": "taskB",
+      "type": "snaker:task",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "form-b",
+        "assignee": "userB",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "负责人审批"
+      }
+    },
+    {
+      "id": "end",
+      "type": "snaker:end",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50
+      },
+      "text": {
+        "value": "结束"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e0",
+      "sourceNodeId": "start",
+      "targetNodeId": "apply",
+      "properties": {}
+    },
+    {
+      "id": "e1",
+      "sourceNodeId": "apply",
+      "targetNodeId": "taskA",
+      "properties": {}
+    },
+    {
+      "id": "e2",
+      "sourceNodeId": "taskA",
+      "targetNodeId": "taskB",
+      "properties": {}
+    },
+    {
+      "id": "e3",
+      "sourceNodeId": "taskB",
+      "targetNodeId": "end",
+      "properties": {}
+    }
+  ]
+}
