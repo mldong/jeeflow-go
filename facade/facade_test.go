@@ -2470,6 +2470,14 @@ func TestTaskRowExtFallsBackWithReapplyReservedKeys(t *testing.T) {
 	if _, ok := appExt[engine.VarBranchCtx]; ok {
 		t.Fatalf("内部键 %s 不得从 ext 透出: %v", engine.VarBranchCtx, appExt)
 	}
+	// issues/240：isFirstTaskNode 是行级标记（写回处 issues/121 P1 已挡），退回后的申请行
+	// ext 与办结后的实例变量都不得再见到它——本栈的普查钉子，变异摘挡必红。
+	if _, ok := appExt[model.IsFirstTaskNodeKey]; ok {
+		t.Fatalf("退回后申请行 ext 不得带 isFirstTaskNode（issues/240）: %v", appExt)
+	}
+	if _, ok := appInstExt[model.IsFirstTaskNodeKey]; ok {
+		t.Fatalf("办结后 isFirstTaskNode 不得进实例变量（issues/240 普查）: %v", appInstExt)
+	}
 	ctx, _ := appExt[engine.VarReapplyCtx].(map[string]interface{})
 	if ctx == nil || ctx["sourceNode"] != "taskA" {
 		t.Fatalf("来源节点应可读（前端提示就取这一格）: %v", appExt[engine.VarReapplyCtx])
