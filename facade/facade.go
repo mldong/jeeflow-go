@@ -1319,17 +1319,20 @@ func (f *Facade) collectPath(flow *model.FlowModel, nodeID string, active []stri
 	}
 	visited[nodeID] = true
 	src := findNodeIn(flow, nodeID)
-	for _, e := range flow.Edges {
+	isDecision := src != nil && src.Type == "snaker:decision"
+	var chosen map[int]bool
+	if isDecision {
+		// issues/241：任务行佐证优先于按当前变量求值（直返单重提后实例变量已改，
+		// 按当前值重放会把没走过的分支算进历史）
+		chosen = f.selectDecisionEdges(flow, src, active, vars, historyTasks, instanceID, defineID)
+	}
+	for i := range flow.Edges {
+		e := &flow.Edges[i]
 		if e.SourceNodeID != nodeID {
 			continue
 		}
-		// 决策节点：输出边表达式求值过滤——false 的分支未实际执行，不收集
-		if src != nil && src.Type == "snaker:decision" {
-			if expr, ok := e.Properties["expr"].(string); ok && expr != "" {
-				if ok2, _ := f.evalDecisionExpr(flow, src, expr, vars, historyTasks, instanceID, defineID); !ok2 {
-					continue
-				}
-			}
+		if isDecision && !chosen[i] {
+			continue
 		}
 		if e.ID != "" && !containsStr(*edges, e.ID) {
 			*edges = append(*edges, e.ID)
@@ -1346,6 +1349,81 @@ func (f *Facade) collectPath(flow *model.FlowModel, nodeID string, active []stri
 		}
 		f.collectPath(flow, target.ID, active, history, edges, visited, vars, historyTasks, instanceID, defineID)
 	}
+}
+
+// selectDecisionEdges 决策节点选边（issues/241）：先按表达式求值（issues/06/153 旧口径），
+// **当表达式给出的非空结果与任务行佐证相矛盾时，以任务行为准**；求值失败/零命中时保持既有
+// 降级面（issues/164/201 的口径不被本规则改写）。返回值是 flow.Edges 的索引集合。
+func (f *Facade) selectDecisionEdges(flow *model.FlowModel, decision *model.FlowNode,
+	active []string, vars map[string]interface{}, historyTasks []*model.ProcessTask,
+	instanceID int64, defineID int64) map[int]bool {
+	selected := map[int]bool{}
+	for i := range flow.Edges {
+		e := &flow.Edges[i]
+		if e.SourceNodeID != decision.ID {
+			continue
+		}
+		expr, ok := e.Properties["expr"].(string)
+		if !ok || expr == "" {
+			selected[i] = true
+			continue
+		}
+		if ok2, _ := f.evalDecisionExpr(flow, decision, expr, vars, historyTasks, instanceID, defineID); ok2 {
+			selected[i] = true
+		}
+	}
+	if len(selected) == 0 {
+		return selected
+	}
+	for i := range selected {
+		target := findNodeIn(flow, flow.Edges[i].TargetNodeID)
+		if target == nil || target.ID == "" {
+			continue
+		}
+		if containsStr(active, target.ID) || hasTaskRow(historyTasks, target.ID) {
+			return selected // 表达式与执行事实一致，维持原口径
+		}
+	}
+	var activeHits, evidHits []int
+	for i := range flow.Edges {
+		e := &flow.Edges[i]
+		if e.SourceNodeID != decision.ID {
+			continue
+		}
+		target := findNodeIn(flow, e.TargetNodeID)
+		if target == nil || target.ID == "" {
+			continue
+		}
+		if containsStr(active, target.ID) {
+			activeHits = append(activeHits, i)
+		}
+		if hasTaskRow(historyTasks, target.ID) {
+			evidHits = append(evidHits, i)
+		}
+	}
+	chosen := map[int]bool{}
+	if len(activeHits) > 0 {
+		for _, i := range activeHits {
+			chosen[i] = true
+		}
+		return chosen
+	}
+	if len(evidHits) > 0 {
+		for _, i := range evidHits {
+			chosen[i] = true
+		}
+		return chosen
+	}
+	return selected
+}
+
+func hasTaskRow(tasks []*model.ProcessTask, nodeName string) bool {
+	for _, t := range tasks {
+		if t.TaskName == nodeName {
+			return true
+		}
+	}
+	return false
 }
 
 // evalDecisionExpr 决策输出边表达式求值（args = 实例变量 + 决策节点前置任务变量，与引擎同源）

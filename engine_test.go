@@ -73,12 +73,22 @@ func (e *testExprEval) Eval(expr string, vars map[string]interface{}) (interface
 		}
 		return false, nil
 	}
+	// 共享夹具用裸名 amount，issues/241 夹具用表单字段 f_amount
 	if v, ok := vars["amount"]; ok {
 		amt := toFloat(v)
 		if expr == "amount > 1000" {
 			return amt > 1000, nil
 		}
 		if expr == "amount <= 1000" {
+			return amt <= 1000, nil
+		}
+	}
+	if v, ok := vars["f_amount"]; ok {
+		amt := toFloat(v)
+		if expr == "f_amount > 1000" {
+			return amt > 1000, nil
+		}
+		if expr == "f_amount <= 1000" {
 			return amt <= 1000, nil
 		}
 	}
