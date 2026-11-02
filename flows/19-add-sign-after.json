@@ -1,0 +1,116 @@
+{
+  "name": "add-sign-after",
+  "displayName": "后加签（可重复）",
+  "type": "approval",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "snaker:start",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50
+      },
+      "text": {
+        "value": "开始"
+      }
+    },
+    {
+      "id": "apply",
+      "type": "snaker:task",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "apply-form",
+        "assignee": "applicant",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "发起申请"
+      }
+    },
+    {
+      "id": "review",
+      "type": "snaker:task",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "form-review",
+        "assignee": "userA",
+        "taskType": 0,
+        "performType": 0,
+        "allowAddSign": true,
+        "addSignMaxRounds": 0
+      },
+      "text": {
+        "value": "审批（可后加签）"
+      }
+    },
+    {
+      "id": "final",
+      "type": "snaker:task",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "form-final",
+        "assignee": "userF",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": {
+        "value": "终审"
+      }
+    },
+    {
+      "id": "end",
+      "type": "snaker:end",
+      "x": 0,
+      "y": 0,
+      "properties": {
+        "width": 100,
+        "height": 50
+      },
+      "text": {
+        "value": "结束"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "type": "snaker:transition",
+      "sourceNodeId": "start",
+      "targetNodeId": "apply",
+      "properties": {}
+    },
+    {
+      "id": "e2",
+      "type": "snaker:transition",
+      "sourceNodeId": "apply",
+      "targetNodeId": "review",
+      "properties": {}
+    },
+    {
+      "id": "e3",
+      "type": "snaker:transition",
+      "sourceNodeId": "review",
+      "targetNodeId": "final",
+      "properties": {}
+    },
+    {
+      "id": "e4",
+      "type": "snaker:transition",
+      "sourceNodeId": "final",
+      "targetNodeId": "end",
+      "properties": {}
+    }
+  ]
+}
