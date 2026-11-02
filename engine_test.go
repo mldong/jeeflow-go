@@ -1059,11 +1059,6 @@ func Test154CreateWritesLineageCustomNode(t *testing.T) {
 	}
 }
 
-// Test154RollbackLineageNegatives issues/121 P2 两格负向：
-// ① 无血缘（parent 为 0，以及 P1 之前老行的 NULL 形状）⇒ 20010007，不得静默不建单；
-// ② 血缘前驱跨不过 fork（boot2 canRejected 遇 fork/join/start 是跳过该入边、不再深入）
-//
-//	⇒ 20010008。夹具 04-fork-join：分支行的 parent 是 fork 之前的 apply。
 func doing154Names(ts []*model.ProcessTask) []string {
 	var out []string
 	for _, t := range ts {
@@ -1072,6 +1067,17 @@ func doing154Names(ts []*model.ProcessTask) []string {
 	return out
 }
 
+// Test154RollbackLineageNegatives issues/121 P2 两格负向：
+// ① 无血缘（parent 为 0，以及 P1 之前老行的 NULL 形状）⇒ 20010007，不得静默不建单；
+// ② 血缘前驱跨不过 fork（boot2 canRejected 遇 fork/join/start 是跳过该入边、不再深入）
+//
+//	⇒ 20010008。夹具 04-fork-join：分支行的 parent 是 fork 之前的 apply。
+//
+// 三档**同时钉零写入**（issues/243 甲案，2026-11-03；基准 java JeeflowFullTest test167／test168）：
+// 血缘守卫由 executeAndJumpTaskInner 排在 prepareExecuteTask（内含 CompleteTask + UpdateTask）
+// **之前**，报错那一次调用结束后当前行仍是 DOING、待办还在原办理人手里、实例状态不变、
+// 实例下任务行总数不变（没有凭空多出的复活行）。修前这几档是红的——本栈内存仓储和 java 一样
+// 没有回滚，守卫后置时用户看到的是"点了退回、报错了、待办也没了"。
 func Test154RollbackLineageNegatives(t *testing.T) {
 	ctx := context.Background()
 
@@ -1086,15 +1092,21 @@ func Test154RollbackLineageNegatives(t *testing.T) {
 	if apply.ParentTaskID == nil || *apply.ParentTaskID != 0 {
 		t.Fatalf("前置条件：发起那条 parent 应为 0，实得 %v", apply.ParentTaskID)
 	}
+	rowsBefore := taskRowCount(t, repo, ctx, inst.ID)
+	instStateBefore := instanceState(t, repo, ctx, inst.ID)
 	errRollback(ctx, t, eng, apply.ID, "applicant", "上一步任务ID为空，无法驳回至上一步处理")
+	wantRollbackZeroWrite(t, repo, ctx, apply, inst.ID, rowsBefore, instStateBefore)
 
-	// 老行形状：parent 为 NULL
+	// 老行形状：parent 为 NULL。复用上面那一条即可——上一段报错**没动它**（零写入），
+	// 这里只把它的 parent 改成 NULL（java 那笔删掉的就是"另起一条实例规避脏状态"那段：
+	// 修前那次失败已把 apply 置为办结，复用它会撞到"任务不在进行中"，只能另起一条）。
 	nullParent := apply
 	nullParent.ParentTaskID = nil
 	if err := repo.UpdateTask(ctx, &nullParent); err != nil {
 		t.Fatalf("置 NULL 被打断: %v", err)
 	}
 	errRollback(ctx, t, eng, apply.ID, "applicant", "上一步任务ID为空，无法驳回至上一步处理")
+	wantRollbackZeroWrite(t, repo, ctx, apply, inst.ID, rowsBefore, instStateBefore)
 
 	// ② 守卫：fork 分支行退到 fork 之前的节点
 	eng2, repo2 := setup()
@@ -1119,7 +1131,61 @@ func Test154RollbackLineageNegatives(t *testing.T) {
 	if len(branch.ActorIDs) == 0 {
 		t.Fatalf("前置条件：分支行应有参与者，否则测不到守卫（会被权限校验先挡下）")
 	}
+	branchRowsBefore := taskRowCount(t, repo2, ctx, inst2.ID)
+	branchStateBefore := instanceState(t, repo2, ctx, inst2.ID)
 	errRollback(ctx, t, eng2, branch.ID, branch.ActorIDs[0], "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务")
+	// 20010008 那一档同样零写入：并行待办仍在办理人手里，且没有凭空多出的行
+	wantRollbackZeroWrite(t, repo2, ctx, branch, inst2.ID, branchRowsBefore, branchStateBefore)
+}
+
+// taskRowCount 实例下**全部**任务行数（含 DOING／办结／废弃，＝java 的 getTasks().size()）
+func taskRowCount(t *testing.T, repo *memory.Repository, ctx context.Context, instID int64) int {
+	t.Helper()
+	rows, err := repo.FindHistoryTasks(ctx, instID)
+	if err != nil {
+		t.Fatalf("读实例 %d 的任务行: %v", instID, err)
+	}
+	return len(rows)
+}
+
+// instanceState 读回实例状态（持久值，不用聚合根内存对象）
+func instanceState(t *testing.T, repo *memory.Repository, ctx context.Context, instID int64) model.InstanceState {
+	t.Helper()
+	inst, err := repo.FindInstanceByID(ctx, instID)
+	if err != nil || inst == nil {
+		t.Fatalf("读实例 %d: err=%v inst=%v", instID, err, inst)
+	}
+	return inst.State
+}
+
+// wantRollbackZeroWrite 报错即零写入的位序判据（issues/243 甲案）：报错那次调用结束后
+// ①当前行仍是 DOING、还是报错前那一条（同一 id，不是新建的复活行）、
+// ②待办还在原办理人手里（参与者集合不变）、
+// ③实例下任务行总数不变、④实例状态不变。
+// before 传报错前从仓储读回的那一行快照（firstDoing／doingByName 给的都是副本，不会被引擎改）。
+func wantRollbackZeroWrite(t *testing.T, repo *memory.Repository, ctx context.Context,
+	before model.ProcessTask, instID int64, rowsBefore int, stateBefore model.InstanceState) {
+	t.Helper()
+	row := rowOf(t, repo, before.ID)
+	if !row.IsDoing() {
+		t.Errorf("报错零写入：当前行 %d 必须仍是 DOING（血缘守卫排在办结之前），实得 TaskState=%d", row.ID, row.TaskState)
+	}
+	if len(row.ActorIDs) != len(before.ActorIDs) {
+		t.Errorf("待办必须还在原办理人手里：报错前 %v，实得 %v", before.ActorIDs, row.ActorIDs)
+	} else {
+		for i, a := range before.ActorIDs {
+			if row.ActorIDs[i] != a {
+				t.Errorf("待办办理人不得变化：报错前 %v，实得 %v", before.ActorIDs, row.ActorIDs)
+				break
+			}
+		}
+	}
+	if n := taskRowCount(t, repo, ctx, instID); n != rowsBefore {
+		t.Errorf("报错不建单：实例 %d 下任务行总数应仍为 %d，实得 %d", instID, rowsBefore, n)
+	}
+	if s := instanceState(t, repo, ctx, instID); s != stateBefore {
+		t.Errorf("实例状态不受这次失败影响：期望 %d，实得 %d", stateBefore, s)
+	}
 }
 
 // firstDoing 取该实例某节点的进行中任务（不存在即 fail，避免"节点名写错→空集合→假绿"）

@@ -449,7 +449,8 @@ func (f *Facade) withdraw(ctx context.Context, args map[string]interface{}) erro
 	// 撤回只允许作用于**进行中(10)**实例，非 10 一律拒——改前对已办结(20)/已终止(40) 的实例
 	// 调撤回会把它静默改写成 30（已撤回），已办列表/按状态聚合的统计凭空改历史且零报错。
 	// 内部码 20010009：本栈 error 无码位 ⇒ 沿用 20010007/20010008
-	// （engine_impl.go rollbackToParent 的 `const noLineage`/`const guardFail`）的形状定义固定
+	// （engine_impl.go 的 `rollbackNoLineageMsg`/`rollbackGuardFailMsg`，issues/243 甲案后由
+	// `checkRejectable` 与复活腿 `rollbackToParent` 共用）的形状定义固定
 	// 中文文案，出口由门面统一成 code=99999999 + msg 逐字，**码值不进 msg**（issues/121 口径）。
 	const notDoing = "流程实例非进行中，无法撤回"
 	if inst.State != model.InstanceStateDoing {

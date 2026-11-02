@@ -566,30 +566,62 @@ func TestAddSignReturnToApplicantAbandonsSiblings(t *testing.T) {
 // 模型里没有自环边 ⇒ 既有 canRejected 守卫不过 ⇒ 报"无法驳回至上一步处理"那一档（与会签同档），
 // 要退用退回发起人(6)或跳转(4)。本格钉住"禁"这一档不是靠巧合，而是守卫真的拦住了。
 //
-// ⚠️ 本格**只断言报错档，不断言零写入**——这一档的守卫位在 prepareExecuteTask 之后
-// （engine_impl.go executeAndJumpTaskInner：先完成当前任务、再解析血缘），所以报错时那条
-// 加签待办已被办结、本节点没有新行。这是**本栈既有的形状、不是加签带进来的**：串行会签推进位
-// 的行血缘 parent 也在同节点，今天对它按 submitType=3 就是同一结果（java 同序，
-// ProcessInstance.rollback 的守卫也在 completeTask 之后）。要把"报错且零写入"抬到这一档，
-// 得把血缘校验前置到状态变更之前——那是回退腿自己的 issue，不塞进本轮移植（已按当轮回报记给 owner）。
+// **报错那一次零写入**（issues/243 甲案，2026-11-03 落地；基准 java AddSignAfterTest test17）：
+// 血缘守卫 `checkRejectable` 由 `executeAndJumpTaskInner` 排在 `prepareExecuteTask`
+// （内部 `CompleteTask` + `UpdateTask` 会把当前行办结）**之前**，所以本栈内存仓储（同样没有回滚）
+// 里报错后当前行仍是 DOING、待办还在原办理人手里。修前的形状是"点了退回、报错了、待办也没了"
+// （本格旧注释与旧断言钉的正是那一款）；真库（JDBC）外层有事务，两种位序都整笔回滚，
+// 观察不到差别——这一档只有内存仓储照得出来，故本格同时钉文案与零写入。
+//
+// 串行会签推进位的行血缘 parent 也在同节点，对它按 submitType=3 是同一结果、同一零写入。
 func TestAddSignRollbackOnChainIsForbidden(t *testing.T) {
 	eng, repo, iid := asStartToReview(t, asOn)
+	ctx := context.Background()
 	a := asDoing(t, repo, iid, "review")
-	if _, err := eng.ExecuteProcessTask(context.Background(), a.ID, "userA", asAgreeOps("userB")); err != nil {
+	if _, err := eng.ExecuteProcessTask(ctx, a.ID, "userA", asAgreeOps("userB")); err != nil {
 		t.Fatalf("A→B: %v", err)
 	}
 	b := asDoing(t, repo, iid, "review")
-	_, err := eng.ExecuteAndJumpTask(context.Background(), b.ID, asFirstActor(b), asPlain(int(model.SubmitTypeRollback)), "")
+	rowsBefore := asRowCount(t, repo, iid, "review") // a（已办结）＋b（待办）两行
+	instBefore, err := repo.FindInstanceByID(ctx, iid)
+	if err != nil || instBefore == nil {
+		t.Fatalf("读实例 %d: err=%v inst=%v", iid, err, instBefore)
+	}
+	_, err = eng.ExecuteAndJumpTask(ctx, b.ID, asFirstActor(b), asPlain(int(model.SubmitTypeRollback)), "")
 	if err == nil {
 		t.Fatal("加签链上退回上一步必须被守卫拦下（同节点血缘、模型无自环边）")
 	}
 	if !strings.Contains(err.Error(), "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务") {
 		t.Errorf("应落到既有 20010008 那一档文案，实得 %q", err.Error())
 	}
-	// 守卫不过 ⇒ 绝不给本节点点亮新行（同节点续办不走"退回"这条路）
-	if asDoing(t, repo, iid, "review") != nil {
-		t.Error("被拒的退回不得在本节点再建一条待办")
+	// ── 零写入四档（修前这几档红）──────────────────────────────────────────────
+	// ①当前行仍是待办，且 review 上**唯一**那条 DOING 就是报错前那一条 b（不是新建的复活行）
+	if n := asDoingCount(repo, iid, "review"); n != 1 {
+		t.Errorf("报错零写入：review 应只剩报错前那一条待办，实得 %d 条", n)
 	}
+	still := asDoing(t, repo, iid, "review")
+	if still == nil {
+		t.Fatal("报错零写入：当前行必须仍是 DOING（守卫排在办结之前），实得 review 上没有任何待办")
+	}
+	if still.ID != b.ID {
+		t.Errorf("待办必须还是报错那一条 %d，实得 %d（复活行不许在本节点出现）", b.ID, still.ID)
+	}
+	if got, want := asFirstActor(still), asFirstActor(b); got != want {
+		t.Errorf("待办还在原办理人手里：期望 %q，实得 %q", want, got)
+	}
+	// ②实例状态不受这次失败影响
+	instAfter, err := repo.FindInstanceByID(ctx, iid)
+	if err != nil || instAfter == nil {
+		t.Fatalf("读实例 %d: err=%v inst=%v", iid, err, instAfter)
+	}
+	if instAfter.State != instBefore.State {
+		t.Errorf("实例状态不得因这次失败而变：期望 %d，实得 %d", instBefore.State, instAfter.State)
+	}
+	// ③行数不变：守卫不过 ⇒ 不建复活行（这一档两种位序下都成立，钉住防"报错却建单"）
+	if n := asRowCount(t, repo, iid, "review"); n != rowsBefore {
+		t.Errorf("报错不建单：review 行数应仍为 %d，实得 %d", rowsBefore, n)
+	}
+	// ④令牌不得流出本节点
 	if asDoing(t, repo, iid, "final") != nil {
 		t.Error("被拒的退回不得流出本节点")
 	}

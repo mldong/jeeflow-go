@@ -406,9 +406,18 @@ func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, opera
 }
 
 func (e *EngineImpl) executeAndJumpTaskInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
+	snapshot, _ := e.repo.FindTaskByID(ctx, taskID)
 	// 带直返上下文的进行中申请待办只接受重新提交(5)：命名跳转/退回上一步都在改状态前拒绝
-	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil && pre.TaskState == model.TaskStateDoing && reapplyOf(pre.Variables) != nil {
+	if snapshot != nil && snapshot.TaskState == model.TaskStateDoing && reapplyOf(snapshot.Variables) != nil {
 		return nil, fmt.Errorf("带重提直返标记的申请待办不允许跳转，只接受重新提交(submitType=5)")
+	}
+	if targetTaskName == "" {
+		// issues/243 甲案：血缘守卫排在 prepareExecuteTask 之前——prepareExecuteTask 内部
+		// CompleteTask + UpdateTask 会把当前行办结，本栈内存仓储同样没有回滚，守卫后置 ⇒
+		// 报错那一次调用结束后当前待办凭空消失且没有复活行（真库靠外层事务整笔回滚，照不出来）。
+		if err := e.checkRollbackPossible(ctx, snapshot); err != nil {
+			return nil, err
+		}
 	}
 	// §11.7 边界 2：JUMP/ROLLBACK 两档都不建 cc（cc 钩子传 nil），与 Java executeAndJumpTask 同形
 	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
@@ -634,31 +643,80 @@ func isRejectSubmitType(v interface{}) bool {
 	return false
 }
 
-// rollbackToParent 退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的
-// TaskParentID，复活那条历史行；不按模型入边拓扑推（拓扑版在分支/回环流会回到本实例
-// 没走过的节点）。对外 msg 用固定中文文案、不含引擎内部码（本栈 error 无码位，出口统一 99999999）。
-func (e *EngineImpl) rollbackToParent(ctx context.Context, flow *model.FlowModel,
-	inst *model.ProcessInstance, task *model.ProcessTask, operator string) error {
-	const noLineage = "上一步任务ID为空，无法驳回至上一步处理"
-	const guardFail = "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务"
+// 退回上一步两道守卫的固定文案（规范 04 · 退回上一步）。逐字不许改、不许新增第二种文案：
+// 对外 msg 用固定中文文案、不含引擎内部码（本栈 error 无码位，出口统一 99999999），
+// 对应 java 的 20010007／20010008 两档。
+const (
+	rollbackNoLineageMsg = "上一步任务ID为空，无法驳回至上一步处理"
+	rollbackGuardFailMsg = "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务"
+)
 
+// checkRollbackPossible 退回上一步（targetTaskName 空 ⇒ 血缘腿）的**写前置**守卫（issues/243 甲案）。
+//
+// 只做一件事：把 checkRejectable 的两道判据（无血缘／canRejected 不过）提到任何状态变更之前。
+// 它自己**只读**（task → instance → define → 解析模型 ⇒ checkRejectable）。
+// **不**在这里报"任务不存在／不在进行中""无权办理"，也不在这里发明第二种文案——那几档留给
+// prepareExecuteTask 的 loadAndCheck 用既有固定错报（它们本来就排在 CompleteTask 之前，天然零写入）；
+// 任务取不到／不在 DOING、取不到实例或定义（loadFlowForTask 报错）一律放行，
+// 由 prepareExecuteTask 走它的原形状。
+func (e *EngineImpl) checkRollbackPossible(ctx context.Context, current *model.ProcessTask) error {
+	if current == nil || current.TaskState != model.TaskStateDoing {
+		return nil
+	}
+	flow, err := e.loadFlowForTask(ctx, current)
+	if err != nil || flow == nil {
+		// 取不到实例／定义／模型（或模型没过解析期硬校验）⇒ 放行：
+		// prepareExecuteTask 会用它自己的既有错在同一位序（办结之前）报出来，文案与档号都不变。
+		return nil
+	}
+	_, _, err = e.checkRejectable(ctx, flow, current)
+	return err
+}
+
+// checkRejectable 退回上一步的两道守卫（规范 04 · 退回上一步）：**只读判据，不碰任何状态**——
+// 不写任务行、不写实例、不 fire 事件、不建历史行。返回血缘前驱那条历史行（TaskParentID 指向的行）
+// 与它在模型里的节点。
+//
+// issues/243 甲案：这道判据**只此一份实现**——复活腿 rollbackToParent 与引擎写前置位
+// checkRollbackPossible 共用它（java 侧同形：ProcessInstance.checkRejectable，rejectTask 只留复活腿）。
+// 报错即零写入要求它必须排在 prepareExecuteTask（内部 CompleteTask 会把当前行办结）之前。
+//
+// 报的两档（逐字文案见 rollbackNoLineageMsg／rollbackGuardFailMsg）：
+//   - 无血缘：parent 为 nil 或 0（含 issues/121 P1 之前落的老行）、parent 指向的行读不到；
+//   - 守卫不过：当前节点或前驱节点在模型里找不到、canRejected 跨不过 fork/join/start（含会签、
+//     加签链那种"parent 与自己同节点"的旁支血缘）。
+func (e *EngineImpl) checkRejectable(ctx context.Context, flow *model.FlowModel,
+	task *model.ProcessTask) (*model.ProcessTask, *model.FlowNode, error) {
 	var parentID int64
 	if task.ParentTaskID != nil {
 		parentID = *task.ParentTaskID
 	}
 	if parentID == 0 {
-		return fmt.Errorf(noLineage)
+		return nil, nil, fmt.Errorf(rollbackNoLineageMsg)
 	}
 	his, err := e.repo.FindTaskByID(ctx, parentID)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if his == nil {
-		return fmt.Errorf(noLineage)
+		return nil, nil, fmt.Errorf(rollbackNoLineageMsg)
 	}
 	prev := findNode(flow, his.TaskName)
 	if prev == nil || !canRejected(flow, task.TaskName, prev.ID) {
-		return fmt.Errorf(guardFail)
+		return nil, nil, fmt.Errorf(rollbackGuardFailMsg)
+	}
+	return his, prev, nil
+}
+
+// rollbackToParent 退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的
+// TaskParentID，复活那条历史行；不按模型入边拓扑推（拓扑版在分支/回环流会回到本实例
+// 没走过的节点）。两道判据在 checkRejectable（issues/243 甲案：引擎把那道守卫排在任何状态变更
+// 之前，本方法只在守卫已过之后负责复活）；对外 msg 用固定中文文案、不含引擎内部码。
+func (e *EngineImpl) rollbackToParent(ctx context.Context, flow *model.FlowModel,
+	inst *model.ProcessInstance, task *model.ProcessTask, operator string) error {
+	his, prev, err := e.checkRejectable(ctx, flow, task)
+	if err != nil {
+		return err
 	}
 	// 首任务节点那条由发起人提交 ⇒ 参与者取该行 u_userId；其余取该行办结人。
 	// 老行没这个键 ⇒ 按 false 处理（宁可派给该行 ActorID，也不用带"仅进行中"判定的现算值）。
@@ -672,7 +730,7 @@ func (e *EngineImpl) rollbackToParent(ctx context.Context, flow *model.FlowModel
 		}
 	}
 	if actor == "" {
-		return fmt.Errorf(noLineage)
+		return fmt.Errorf(rollbackNoLineageMsg)
 	}
 	var carry int64
 	if his.ParentTaskID != nil {
