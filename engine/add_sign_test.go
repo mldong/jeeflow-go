@@ -583,7 +583,7 @@ func TestAddSignRollbackOnChainIsForbidden(t *testing.T) {
 	if err == nil {
 		t.Fatal("加签链上退回上一步必须被守卫拦下（同节点血缘、模型无自环边）")
 	}
-	if !strings.Contains(err.Error(), "无法驳回至上一步处理") {
+	if !strings.Contains(err.Error(), "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务") {
 		t.Errorf("应落到既有 20010008 那一档文案，实得 %q", err.Error())
 	}
 	// 守卫不过 ⇒ 绝不给本节点点亮新行（同节点续办不走"退回"这条路）
