@@ -507,6 +507,11 @@ func (e *EngineImpl) loadFlowForTask(ctx context.Context, task *model.ProcessTas
 	if err := json.Unmarshal(def.Content, &flow); err != nil {
 		return nil, err
 	}
+	// 解析期硬校验的第三个落点（见 add_sign.go 头注"为什么落在每一处解析点"）：
+	// 这一处喂的是退回/跳转准入判定读的那份模型。
+	if err := e.validateAddSignFlow(&flow); err != nil {
+		return nil, err
+	}
 	return &flow, nil
 }
 

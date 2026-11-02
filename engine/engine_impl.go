@@ -94,6 +94,12 @@ func (e *EngineImpl) startProcessInstanceByIDInner(ctx context.Context, defineID
 	if err := json.Unmarshal(def.Content, &flow); err != nil {
 		return nil, fmt.Errorf("parse flow: %w", err)
 	}
+	// 后加签两开关的解析期硬校验（规范 02 §4.3／spec 04 语义边界表）——本栈没有 java 那个
+	// 独立解析阶段，等价点就是"定义 JSON → FlowModel"这一跳（另两处在 prepareExecuteTask、
+	// loadFlowForTask，三处合起来覆盖 start 与四条执行族入口）。
+	if err := e.validateAddSignFlow(&flow); err != nil {
+		return nil, err
+	}
 	vars := mergeVars(args, nil)
 	e.addUserInfo(operator, vars)
 	e.addAutoGenTitle(def.DisplayName, vars)
@@ -150,6 +156,13 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 
 func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
 	args = stripReserved(args)
+	// 后加签：本次请求点名的加签办理人，**在这里**（合并变量之前）取一次，显式带进推进闸。
+	// 等价于 java `Execution#addSignOperators`（JeeflowEngineImpl.prepareExecution 里
+	// `exec.setAddSignOperators(AddSignSupport.operators(args))`）。
+	// 为什么不能到闸里读 vars/inst.Variables：vars 是"请求参数 ← 任务变量 ← 实例变量"的合并体，
+	// 上一轮提交里的 tf_addSignOperators 会随实例变量复活 ⇒ 凭空多建一条本节点待办
+	// （spec 04「流程变量约定」末注点名的病；根因那一腿在 saveInstance，两腿都要）。
+	addSignOps := addSignOperatorsFrom(args)
 	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil &&
 		pre.TaskState == model.TaskStateDoing && reapplyOf(pre.Variables) != nil {
 		return e.executeReapply(ctx, pre, operator, args)
@@ -277,6 +290,22 @@ func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, 
 				}
 			}
 		}
+		// 后加签档的推进闸（java TaskModel.exec 三档闸的 go 等价位置：会签档之后、流出边之前）。
+		// 会签节点配 allowAddSign 已在解析期拦死，所以这一档与上面 ct 各档互不重叠。
+		if allowSign, aerr := parseAllowAddSign(curNode.Properties[PropAllowAddSign], curNode.ID); aerr != nil {
+			return nil, aerr
+		} else if allowSign {
+			merged, aerr := e.execAddSignGate(ctx, flow, inst, curNode, task, operator, addSignOps)
+			if aerr != nil {
+				return nil, aerr
+			}
+			if !merged {
+				// 令牌停留本节点：既不流出边，也不废弃同圈兄弟待办（它们正是"还没到放行"的事实）
+				inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
+				return inst, nil
+			}
+			// merged ⇒ 落穿到下面的流出边（与"全部完成"走同一出口）
+		}
 		// issues/91：会签节点 merged 后（ONE_VOTE_VETO 否决 / 全部完成任一路径），
 		// 废弃该节点剩余 DOING 任务（对齐内置引擎 abandonProcessTask）：
 		// SEQUENTIAL 后续成员任务尚未创建天然 no-op；PARALLEL 全员预创建，否决时废弃其余
@@ -339,13 +368,17 @@ func (e *EngineImpl) executeAndJumpToEndInner(ctx context.Context, taskID int64,
 	}
 	// §11.7 边界 2：跳转·回退档不挂抄送钩子（cc 钩子传 nil）——tf_ccActors 在这一档不建 cc、
 	// 不发 CC_CREATE，与 Java executeAndJumpToEnd（无 handleCcActors）同形。
-	_, inst, _, _, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
+	task, inst, flow, _, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
 	if err != nil {
+		return nil, err
+	}
+	// 拒绝结束：本节点未完成的加签任务一并废弃，不留孤儿待办（spec 04 · 后加签 语义边界表）
+	if err := e.abandonAddSignOnNode(ctx, flow, inst, task.TaskName, operator); err != nil {
 		return nil, err
 	}
 	// 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
 	inst.Reject(time.Now())
-	if err := e.repo.UpdateInstance(ctx, inst); err != nil {
+	if err := e.saveInstance(ctx, inst); err != nil {
 		return nil, err
 	}
 	// 实例终态统一 PROCESS_INSTANCE_END(2)，靠载荷 state 分（§11.6：旧 EventProcessReject
@@ -453,6 +486,10 @@ func (e *EngineImpl) executeAndJumpToFirstTaskNodeInner(ctx context.Context, tas
 	if err != nil {
 		return nil, err
 	}
+	// 退回发起人：本节点未完成的加签任务一并废弃，不留孤儿待办（spec 04 · 后加签 语义边界表）
+	if err := e.abandonAddSignOnNode(ctx, flow, inst, task.TaskName, operator); err != nil {
+		return nil, err
+	}
 	if direct {
 		if sourceNode.Type != model.TypeTask {
 			return nil, fmt.Errorf("节点[%s]不是普通审批任务，不支持重提直返", sourceNode.ID)
@@ -517,8 +554,20 @@ func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, opera
 	def, _ := e.repo.FindDefineByID(ctx, inst.DefineID)
 	if def != nil {
 		json.Unmarshal(def.Content, &flow)
+		// 解析期硬校验（与发起腿同一把尺子，覆盖四条执行族入口；java ModelParser 每次执行都走）
+		if err := e.validateAddSignFlow(&flow); err != nil {
+			return nil, nil, nil, nil, err
+		}
 	}
 	args = filterFieldByPerm(args, findNode(&flow, task.TaskName))
+
+	// 后加签写入口四判据（互斥／开关未开／加给自己／超上限，spec 06 §2.7＋文末失败文案表）。
+	// **必须排在 CompleteTask 之前**：本栈内存仓与 java 一样没有回滚，先办结再判错就留下
+	// 一条已完成却无人能改的任务行（"报错且零写入"是这条链的硬要求，基准位置
+	// JeeflowEngineImpl.prepareExecution 里 validateSubmission 就钉在 completeTask 前一行）。
+	if err := validateAddSignSubmission(findNode(&flow, task.TaskName), task, args, operator); err != nil {
+		return nil, nil, nil, nil, err
+	}
 
 	// issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
 	// 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
@@ -565,7 +614,7 @@ func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, opera
 
 	// issues/97：实例变量写回排除操作人 u_*，保留 start 注入的发起人 u_*（u_realName 恒为发起人）
 	inst.Variables = mergeExecIntoInstance(baseVars, vars)
-	if err := e.repo.UpdateInstance(ctx, inst); err != nil {
+	if err := e.saveInstance(ctx, inst); err != nil {
 		return nil, nil, nil, nil, err
 	}
 	return task, inst, &flow, vars, nil
@@ -936,7 +985,7 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 		}
 		// issues/97：结束节点写回同样排除操作人 u_*（保留发起人 u_*，与 prepareExecuteTask 一致）
 		inst.Variables = mergeExecIntoInstance(inst.Variables, vars)
-		if err := e.repo.UpdateInstance(ctx, inst); err != nil {
+		if err := e.saveInstance(ctx, inst); err != nil {
 			return err
 		}
 		// PROCESS_INSTANCE_END(2)：实例 state 落库（20 办结 / 45 拒绝）之后 fire，
@@ -1199,7 +1248,7 @@ func (e *EngineImpl) execCustomNode(ctx context.Context, flow *model.FlowModel, 
 				inst.Variables = map[string]interface{}{}
 			}
 			inst.Variables[varKey] = ret
-			if err := e.repo.UpdateInstance(ctx, inst); err != nil {
+			if err := e.saveInstance(ctx, inst); err != nil {
 				return err
 			}
 		}
@@ -1451,6 +1500,13 @@ func mergeVars(args map[string]interface{}, base map[string]interface{}) map[str
 // （prepareExecution 只 merge instance.variables + args），Go 侧因会签簿记共用 exec 变量池
 // （prepareExecuteTask 把 task.Variables 并入 vars），若不挡就会凭空给实例加一个逐节点漂移的
 // isFirstTaskNode —— 那属于 P1 承诺"行为零变化"之外的副作用。
+//
+// ⚠️ `tf_*` 控制键**不在这里剔**（后加签轮移植 java 31f43b0 那条根因时先落在这里、后挪到落库边界，
+// 挪的理由记在 saveInstance）：本函数的产物同时是"当次请求内存里那一份"，
+// spec 09-persist §SYNC 的「tf_ 去前缀冗余到业务表列」腿读的就是它——内存也一并剔掉会让
+// 业务表的 opinion 那类列静默变 NULL（persist 全链路取证格当场拦下）。
+// 复活面掐在**落库那一份**（见 saveInstance），当次请求内照常可读，这才是
+// 「tf_* 只在当次请求与已完成任务行可读」（spec 06 §2.7）的形状。
 func mergeExecIntoInstance(base, exec map[string]interface{}) map[string]interface{} {
 	out := make(map[string]interface{})
 	for k, v := range base {
@@ -1473,6 +1529,43 @@ func mergeExecIntoInstance(base, exec map[string]interface{}) map[string]interfa
 		out[k] = v
 	}
 	return out
+}
+
+// instanceVarsForSave 落库那一份实例变量：控制类 `tf_*` 一律剔除
+// （spec 04「流程变量约定」末注；java 参考实现 31f43b0 那笔根因的 go 腿）。
+// 整包并进去会让上一轮的控制键**跨请求复活**：tf_addSignOperators 使后续办结凭空多建一条
+// 本节点待办，tf_nextNodeOperator 同病（直返腿为此在 executeReapply 里显式 delete 那一枚），
+// tf_approvalComment 则把某个人的审批意见污染成全流程可读的变量。
+// 任务行留痕不受影响（ProcessTask.Finish 仍收整包 vars），当次请求内存里也照常可读
+// （persist SYNC 的 tf_ 冗余腿读的就是内存那份，见 mergeExecIntoInstance 注）。
+// 剔在 base 上同样生效 ⇒ 存量行里历史遗留的 tf_ 会在第一次办理落库时被清掉。
+func instanceVarsForSave(vars map[string]interface{}) map[string]interface{} {
+	if vars == nil {
+		return nil
+	}
+	out := make(map[string]interface{}, len(vars))
+	for k, v := range vars {
+		if strings.HasPrefix(k, "tf_") {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// saveInstance 执行族里**实例落库的唯一出口**（四处 UpdateInstance 全走这里）：
+// 复制一份聚合、把变量换成剔过 tf_ 的那份再交给仓储。
+// 为什么不在合并点（mergeExecIntoInstance）就剔干净：内存里那一份当次请求还要被读
+// （SYNC 的 tf_ 冗余腿、到期表达式与决策表达式都可能引用），只在落库边界掐才算"复活面清零"；
+// 也为什么不能逐个调用点各写一遍：四腿漏一条就是跨仓分叉（java 那边正是把规则写在
+// completeTask 单点，go 的等价单点是这里）。
+func (e *EngineImpl) saveInstance(ctx context.Context, inst *model.ProcessInstance) error {
+	if inst == nil {
+		return e.repo.UpdateInstance(ctx, inst)
+	}
+	cp := *inst
+	cp.Variables = instanceVarsForSave(inst.Variables)
+	return e.repo.UpdateInstance(ctx, &cp)
 }
 
 func getCsState(vars map[string]interface{}, nodeID string) ([]string, int) {
