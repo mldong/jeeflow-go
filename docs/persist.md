@@ -41,7 +41,7 @@ eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}}
 - 拦截器挂在引擎全局 Extensions；内部按「结束节点 + 实例 Done + submitType=AGREE」过滤，
   仅对流程定义顶层声明了 `relTableName`（缺省回落流程 name）的流程生效
 - 语义：实例 `f_` 字段（去前缀）+ 流程上下文（`process_instance_id`/`apply_user_id`/`apply_dept_id`）
-  + 系统字段写入业务表；`process_instance_id` 幂等（先查后插）+ 同链内存标记（1.6.3，共享 inst.Variables，不落库）；用户列默认取 operator（1.6.3）；表不存在 panic（配置错误快速失败）；
+  + 系统字段写入业务表；`process_instance_id` 幂等（先查后插）+ 同链内存标记（1.6.3，共享 inst.Variables，不落库）；用户列默认取 operator（1.6.3）；**表不存在 = 静默跳过**（不写/不报错/不阻断，2026-11-03 owner 拍板，与 java `insert` 列集为空 return null 同档）；**表存在但写入失败（约束/类型/连接）仍 panic**（issues/169）；
   不同意/退回不入库
 - 引擎对齐（1.6.2）：任务完成后结束节点统一走 `executeNode`，拦截器在流程结束时完整触发
 
@@ -50,7 +50,7 @@ eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}}
 
 | 字段 | 取值 | 语义 |
 |------|------|------|
-| `relTableName` | 表名 | 业务表名——数据写入哪张表；**缺省回落流程 `name`**；表不存在 = 配置错误显性报错 |
+| `relTableName` | 表名 | 业务表名——数据写入哪张表；**缺省回落流程 `name`**；表不存在 = 静默跳过（不写不报错；表在但写入失败仍 panic，issues/169） |
 | `persistMode` | `ARCHIVE` / `SYNC`（缺省 `ARCHIVE`） | 持久化模式——`ARCHIVE`：流程结束且同意落库一次；`SYNC`：发起即入库 → 节点推进 → 结束定稿，全程留痕。非 `SYNC` 值回落 `ARCHIVE` |
 
 

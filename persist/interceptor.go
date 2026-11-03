@@ -35,6 +35,13 @@ const (
 // 状态字段值：任务节点统一写 DOING（任务推进状态），结束节点写实例最终状态
 var stateDoing = int(model.InstanceStateDoing)
 
+// tableExister 可选探测接口：实现了它的 writer 才获得"缺表静默"能力。
+// 刻意不并进 DynamicTableWriter——加方法会让集成方自定义实现编译不过。
+type tableExister interface {
+	// TableExists 业务表是否存在（纯读；缺表返回 false, nil，探测失败返回 error）
+	TableExists(ctx context.Context, tableName string) (bool, error)
+}
+
 // ─── PersistPostInterceptor ────────────────────────────────────────────────────
 
 // PersistPostInterceptor 工作流业务数据入库适配拦截器（issues/18）——
@@ -109,8 +116,15 @@ func (p *PersistPostInterceptor) handleArchive(ctx context.Context, node *model.
 	if !p.markChain(node, inst) {
 		return
 	}
+	// 缺表静默（owner 2026-11-03 拍板）：业务表不存在 ⇒ 不写、不报错、不阻断流程。
+	// 边界：探测本身失败（err != nil，连接/权限/语法）仍按原档 panic（issues/169 的可观测性）。
+	if ok, err := p.tableReady(ctx, tableName); err != nil {
+		panic(fmt.Errorf("persist: %w", err))
+	} else if !ok {
+		return
+	}
 	// 幂等：以 process_instance_id 为键，先查后插。
-	// 表不存在等探测失败是配置错误，必须显性暴露（与 Java/Python 抛异常一致）
+	// 走到这里表已确认存在；Exists/Insert 的任何失败都是"表在但读/写不对"，必须显性暴露。
 	exists, err := p.Writer.Exists(ctx, tableName, "process_instance_id", inst.ID)
 	if err != nil {
 		panic(fmt.Errorf("persist: %w", err))
@@ -134,6 +148,13 @@ func (p *PersistPostInterceptor) handleArchive(ctx context.Context, node *model.
 func (p *PersistPostInterceptor) handleSync(ctx context.Context, node *model.FlowNode, inst *model.ProcessInstance, tableName string) {
 	if !p.markChain(node, inst) {
 		return // 同链同节点不重复（节点级，issues/19 演进）
+	}
+	// 缺表静默（owner 2026-11-03 拍板）：两条腿同档——表不存在就整段不写；
+	// 探测本身失败仍 panic（issues/169：不得把连接/权限错误当缺表吞掉）。
+	if ok, err := p.tableReady(ctx, tableName); err != nil {
+		panic(fmt.Errorf("persist: %w", err))
+	} else if !ok {
+		return
 	}
 	exists, err := p.Writer.Exists(ctx, tableName, "process_instance_id", inst.ID)
 	if err != nil {
@@ -174,6 +195,24 @@ func (p *PersistPostInterceptor) handleSync(ctx context.Context, node *model.Flo
 }
 
 // ─── 公共 ──────────────────────────────────────────────────────────────────────
+
+// tableReady 缺表探测（owner 2026-11-03 拍板）：流程定义指向的业务表不存在时静默跳过——
+// 不写、不报错、不阻断流程，与 java 参考实现 JdbcDynamicTableWriter.insert「列集为空
+// return null」同档；不做部署期校验。
+//
+// 边界（issues/169 立的"不得静默丢写错"，本笔不放宽）：
+//   - 只吞"表不存在"这一档：writer 侧折成 (false, nil)，这里返回 !ok ⇒ 调用方静默 return；
+//   - 探测本身失败（连接/权限/语法）返回 err ⇒ 调用方照旧 panic；
+//   - 表存在但写入失败（约束/类型/连接）不经此判，仍由 Insert/Update 的 panic 档拦下；
+//   - writer 未实现可选接口 tableExister ⇒ 返回 true（不为未知实现新增静默面，
+//     沿用原来的显式报错路径）。
+func (p *PersistPostInterceptor) tableReady(ctx context.Context, tableName string) (bool, error) {
+	e, ok := p.Writer.(tableExister)
+	if !ok {
+		return true, nil
+	}
+	return e.TableExists(ctx, tableName)
+}
 
 // resolveDefine 从流程定义 content 顶层解析 relTableName / persistMode（缺省回落流程 name）
 func (p *PersistPostInterceptor) resolveDefine(ctx context.Context, inst *model.ProcessInstance) (string, string, error) {

@@ -12,6 +12,7 @@ package persist
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -57,6 +58,14 @@ type columnMeta struct {
 	name          string // 表列原名（UPPER）
 	primaryKey    bool
 	autoIncrement bool
+}
+
+// tableNotFoundError 表结构探测"查不到任何列"这一档（＝表不存在）。
+// 只有这一档可以被上层折成"缺表"；连接/权限/语法等探测错误仍是普通 error，必须原样上抛。
+type tableNotFoundError struct{ table string }
+
+func (e *tableNotFoundError) Error() string {
+	return fmt.Sprintf("persist: table %q not found", e.table)
 }
 
 // JdbcDynamicTableWriter 是 DynamicTableWriter 的 *sql.DB 默认实现
@@ -165,7 +174,7 @@ func (w *JdbcDynamicTableWriter) tableColumns(ctx context.Context, tableName str
 		return nil, err
 	}
 	if len(metas) == 0 {
-		return nil, fmt.Errorf("persist: table %q not found", tableName)
+		return nil, &tableNotFoundError{table: tableName}
 	}
 
 	w.mu.Lock()
@@ -274,6 +283,31 @@ func (w *JdbcDynamicTableWriter) FilterColumns(ctx context.Context, tableName st
 		}
 	}
 	return kept, nil
+}
+
+// TableExists 业务表是否存在（纯读探测；可选接口 tableExister 的实现，不进 DynamicTableWriter）。
+//
+// 语义（owner 2026-11-03 拍板）：缺表返回 (false, nil)——上层据此静默跳过，不写、不报错、
+// 不阻断流程（与 java 参考实现 JdbcDynamicTableWriter.insert「列集为空 return null」同档），
+// 不做部署期校验。
+//
+// 边界（issues/169 的"不得静默丢写错"不因本次放宽）：只把"表结构探测查不到任何列"这一档
+// 折成 false；连接/权限/语法/表名非法等错误原样返回 error，上层仍按原档 panic。
+//
+// 刻意不进 DynamicTableWriter 接口：加方法会让集成方自定义实现编译不过，故由拦截器按
+// 可选接口探测（writer 未实现 ⇒ 视为存在，不新增静默面）。
+func (w *JdbcDynamicTableWriter) TableExists(ctx context.Context, tableName string) (bool, error) {
+	if err := checkTableName(tableName); err != nil {
+		return false, err
+	}
+	if _, err := w.tableColumns(ctx, tableName); err != nil {
+		var nf *tableNotFoundError
+		if errors.As(err, &nf) {
+			return false, nil // 缺表：折成"不存在"，不是错误
+		}
+		return false, err // 探测本身失败：原样上抛
+	}
+	return true, nil
 }
 
 // Insert 参数化 INSERT（列过滤 + 值过滤，防注入；写入用表列原名，issues/20；

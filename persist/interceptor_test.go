@@ -191,7 +191,12 @@ func TestNoWriterSkip(t *testing.T) {
 	}
 }
 
-// ④ 未配置 relTableName → 缺省回落流程 name（simple）→ 表不存在 → 显性报错（panic，配置错误快速失败）
+// ④ 未配置 relTableName → 缺省回落流程 name（simple）→ 表不存在 → 静默跳过
+//
+// 2026-11-03 owner 拍板改语义：缺表不写、不报错、不阻断流程（与 java 参考实现
+// JdbcDynamicTableWriter.insert 列集为空 return null 同档）。本格旧断言"缺表必须 panic"
+// 正是被拍板推翻的那一档，故改判为"不 panic + 走终态 + 零行"；边界（表在但写失败仍 panic）
+// 由 ⑫ 守，issues/169 不因此放宽。
 func TestNoTableNameSkip(t *testing.T) {
 	repo := memory.New()
 	db, w := newWriter(t)
@@ -201,12 +206,15 @@ func TestNoTableNameSkip(t *testing.T) {
 	eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}})
 
 	def := registerPersistFlow(repo, false)
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("table not found should panic (config error)")
-		}
-	}()
-	runFlow(t, eng, repo, def.ID, true)
+	inst := runFlowNoPanic(t, eng, repo, def.ID)
+	// 读回持久实例（引擎返回的聚合对象不承载终态迁移）
+	got, err := repo.FindInstanceByID(context.Background(), inst.ID)
+	if err != nil || got == nil {
+		t.Fatalf("读回实例 %d: %v", inst.ID, err)
+	}
+	if got.State != model.InstanceStateDone {
+		t.Fatalf("缺表不该阻断流程：实例应走到终态 %d，实得 %d", model.InstanceStateDone, got.State)
+	}
 	if n := countRows(t, db); n != 0 {
 		t.Fatalf("no table name should not persist, rows=%d", n)
 	}
@@ -755,4 +763,201 @@ type mockMetaReader struct{}
 
 func (m *mockMetaReader) ReadByProcessInstance(tableName string, processInstanceID interface{}) (interface{}, error) {
 	return map[string]interface{}{"tableName": tableName, "title": "业务数据"}, nil
+}
+
+// ─── 缺表静默（owner 2026-11-03 拍板）＋ issues/169 边界 ───────────────────────
+
+// registerArchiveFlowAt 只注入 relTableName（ARCHIVE 缺省），用于缺表/约束两条腿
+func registerArchiveFlowAt(repo *memory.Repository, tableName string) *model.ProcessDefine {
+	data, err := os.ReadFile(filepath.Join(flowsutil.Dir(), "01-simple.json"))
+	if err != nil {
+		panic(err.Error())
+	}
+	content := replaceFirst(string(data), `"type": "approval"`,
+		`"type": "approval", "relTableName": "`+tableName+`"`)
+	def := &model.ProcessDefine{ID: 1, Name: "simple", DisplayName: "01-simple.json", Type: "approval", State: 1, Version: 1, Content: []byte(content)}
+	repo.AddDefine(def)
+	return def
+}
+
+// runFlowNoPanic 跑完整流程，并把"不应出现的 panic"转成测试失败
+func runFlowNoPanic(t *testing.T, eng *engine.EngineImpl, repo *memory.Repository, defineID int64) (inst *model.ProcessInstance) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("缺表应静默跳过（owner 2026-11-03 拍板：不写/不报错/不阻断），实得 panic: %v", r)
+		}
+	}()
+	return runFlow(t, eng, repo, defineID, true)
+}
+
+// emptyDB 开一个空 SQLite（不建任何业务表）——"表本来就不存在"这一档
+func emptyDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite failed: %v", err)
+	}
+	return db
+}
+
+// ⑩ ARCHIVE 腿：relTableName 指向不存在的表 → 不 panic、不报错、实例走到终态、零写入
+func TestMissingTableSilentSkipArchive(t *testing.T) {
+	repo := memory.New()
+	db := emptyDB(t)
+	defer db.Close()
+	w := persist.NewJdbcDynamicTableWriter(db)
+	ic := persist.NewPersistPostInterceptor(w, repo.FindDefineByID)
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}})
+
+	def := registerArchiveFlowAt(repo, "biz_absent")
+	inst := runFlowNoPanic(t, eng, repo, def.ID)
+
+	got, err := repo.FindInstanceByID(context.Background(), inst.ID)
+	if err != nil || got == nil {
+		t.Fatalf("读回实例 %d: %v", inst.ID, err)
+	}
+	if got.State != model.InstanceStateDone {
+		t.Fatalf("缺表不该阻断流程：实例应走到终态 %d，实得 %d", model.InstanceStateDone, got.State)
+	}
+	// 主判据是"没报错"；本表本就不存在，任何写入都无从谈起（下方再确认它仍然不存在）
+	var n int
+	if err := db.QueryRow("SELECT COUNT(1) FROM biz_absent").Scan(&n); err == nil {
+		t.Fatalf("不该凭空建出业务表，rows=%d", n)
+	}
+}
+
+// ⑪ SYNC 腿：发起 INSERT → 任务推进 → 结束定稿全程缺表 ⇒ 同样静默，流程照常走完
+func TestMissingTableSilentSkipSync(t *testing.T) {
+	repo := memory.New()
+	db := emptyDB(t)
+	defer db.Close()
+	w := persist.NewJdbcDynamicTableWriter(db)
+	ic := persist.NewPersistPostInterceptor(w, repo.FindDefineByID)
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}})
+	registerSyncFlow(repo, "biz_absent_sync") // relTableName 未建表
+
+	inst := func() (inst *model.ProcessInstance) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("SYNC 缺表应静默跳过，实得 panic: %v", r)
+			}
+		}()
+		i, err := eng.StartProcessInstanceByID(context.Background(), 2, "user1",
+			map[string]interface{}{"f_title": "缺表单", "f_amount": 800.0, "u_deptId": "D01"})
+		if err != nil {
+			t.Fatalf("缺表不该阻断发起: %v", err)
+		}
+		doing, _ := repo.FindDoingTasks(context.Background(), i.ID, nil)
+		repo.AddTaskActor(context.Background(), doing[0].ID, []string{"user1"})
+		doing[0].ActorIDs = append(doing[0].ActorIDs, "user1")
+		if _, err = eng.ExecuteProcessTask(context.Background(), doing[0].ID, "user1",
+			map[string]interface{}{engine.KeySubmitType: int(model.SubmitTypeApply)}); err != nil {
+			t.Fatalf("缺表不该阻断 apply: %v", err)
+		}
+		doing, _ = repo.FindDoingTasks(context.Background(), i.ID, nil)
+		repo.AddTaskActor(context.Background(), doing[0].ID, []string{"leader"})
+		doing[0].ActorIDs = append(doing[0].ActorIDs, "leader")
+		if _, err = eng.ExecuteProcessTask(context.Background(), doing[0].ID, "leader",
+			map[string]interface{}{engine.KeySubmitType: int(model.SubmitTypeAgree)}); err != nil {
+			t.Fatalf("缺表不该阻断定稿: %v", err)
+		}
+		return i
+	}()
+	got, err := repo.FindInstanceByID(context.Background(), inst.ID)
+	if err != nil || got == nil {
+		t.Fatalf("读回实例 %d: %v", inst.ID, err)
+	}
+	if got.State != model.InstanceStateDone {
+		t.Fatalf("实例应走到终态 %d，实得 %d", model.InstanceStateDone, got.State)
+	}
+}
+
+// ⑫ 边界（issues/169 不因本次放宽）：表存在、但数据违反约束 ⇒ 仍然 panic
+func TestExistingTableConstraintViolationStillPanics(t *testing.T) {
+	repo := memory.New()
+	db := emptyDB(t)
+	defer db.Close()
+	// 表在：amount 列带 CHECK；runFlow 传 f_amount=800 ⇒ 插入必违反约束
+	if _, err := db.Exec(`CREATE TABLE biz_strict (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		title TEXT,
+		amount REAL CHECK (amount > 1000),
+		process_instance_id INTEGER,
+		apply_user_id TEXT,
+		apply_dept_id TEXT,
+		create_time TEXT,
+		create_user TEXT,
+		update_time TEXT,
+		update_user TEXT,
+		is_deleted INTEGER
+	)`); err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+	w := persist.NewJdbcDynamicTableWriter(db)
+	ic := persist.NewPersistPostInterceptor(w, repo.FindDefineByID)
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}})
+
+	def := registerArchiveFlowAt(repo, "biz_strict")
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("表存在但写入违反约束必须 panic（issues/169：不得静默丢写错）")
+			}
+			msg := fmt.Sprint(r)
+			t.Logf("panic 原文：%s", msg)
+			for _, want := range []string{"业务表写入失败", "biz_strict", "constraint"} {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("panic 文案应含 %q，实得 %q", want, msg)
+				}
+			}
+		}()
+		runFlow(t, eng, repo, def.ID, true)
+	}()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(1) FROM biz_strict").Scan(&n); err != nil {
+		t.Fatalf("count failed: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("写失败不该留下半行，rows=%d", n)
+	}
+}
+
+// ⑬ 边界：探测本身失败（不是缺表，如连接/权限）⇒ 仍按原档 panic，保留 169 的可观测性
+type failProbeWriter struct {
+	*persist.JdbcDynamicTableWriter
+}
+
+func (f *failProbeWriter) TableExists(ctx context.Context, tableName string) (bool, error) {
+	return false, fmt.Errorf("probe connection refused")
+}
+
+func TestProbeFailureStillPanics(t *testing.T) {
+	repo := memory.New()
+	db := emptyDB(t)
+	defer db.Close()
+	w := &failProbeWriter{JdbcDynamicTableWriter: persist.NewJdbcDynamicTableWriter(db)}
+	ic := persist.NewPersistPostInterceptor(w, repo.FindDefineByID)
+	eng := engine.New(repo, &testUserProv{}, &testIDGen{}, &testExprEval{})
+	eng.SetExtensions(&engine.Extensions{Interceptors: []engine.FlowInterceptor{ic}})
+
+	def := registerArchiveFlowAt(repo, "biz_probe")
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("探测失败（非缺表）必须 panic——不得把连接/权限错误当成缺表吞掉")
+			}
+			msg := fmt.Sprint(r)
+			t.Logf("panic 原文：%s", msg)
+			if !strings.Contains(msg, "probe connection refused") {
+				t.Fatalf("panic 应带探测错误原文，实得 %q", msg)
+			}
+		}()
+		runFlow(t, eng, repo, def.ID, true)
+	}()
 }
