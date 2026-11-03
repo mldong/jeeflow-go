@@ -418,6 +418,11 @@ func (e *EngineImpl) executeAndJumpTaskInner(ctx context.Context, taskID int64, 
 		if err := e.checkRollbackPossible(ctx, snapshot); err != nil {
 			return nil, err
 		}
+	} else {
+		// issues/243 §8-2：命名跳转的「找不到节点模型」同一族缺口，同规矩前置。
+		if err := e.checkJumpTargetExists(ctx, snapshot, targetTaskName); err != nil {
+			return nil, err
+		}
 	}
 	// §11.7 边界 2：JUMP/ROLLBACK 两档都不建 cc（cc 钩子传 nil），与 Java executeAndJumpTask 同形
 	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
@@ -432,10 +437,12 @@ func (e *EngineImpl) executeAndJumpTaskInner(ctx context.Context, taskID int64, 
 			return nil, err
 		}
 	} else {
-		// issues/79：对齐 Java——目标节点不存在显式报错（前端 JUMP 无效 taskName 不再静默空操作）
+		// issues/79：对齐 Java——目标节点不存在显式报错（前端 JUMP 无效 taskName 不再静默空操作）。
+		// issues/243 §8-2 后这道判据另有一份排在 prepareExecuteTask 之前（checkJumpTargetExists），
+		// 这里那份保留：前置守卫对"任务不在 DOING／取不到实例或定义"是放行的，仍要到这一处兜底。
 		target := findNode(flow, targetTaskName)
 		if target == nil {
-			return nil, fmt.Errorf("根据节点名称[%s]无法找到节点模型", targetTaskName)
+			return nil, fmt.Errorf(jumpNodeNotFoundMsgFmt, targetTaskName)
 		}
 		// 对齐 Java isFirstTaskName：跳首任务节点（start 直接后继）assignee 强制为发起人
 		if target.Type == model.TypeTask && e.isFirstTaskNode(flow, target) {
@@ -643,12 +650,16 @@ func isRejectSubmitType(v interface{}) bool {
 	return false
 }
 
-// 退回上一步两道守卫的固定文案（规范 04 · 退回上一步）。逐字不许改、不许新增第二种文案：
+// 跳转/退回两族守卫的固定文案（规范 04）。逐字不许改、不许新增第二种文案：
 // 对外 msg 用固定中文文案、不含引擎内部码（本栈 error 无码位，出口统一 99999999），
-// 对应 java 的 20010007／20010008 两档。
+// 前两句对应 java 的 20010007／20010008 两档。
 const (
 	rollbackNoLineageMsg = "上一步任务ID为空，无法驳回至上一步处理"
 	rollbackGuardFailMsg = "无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务"
+	// jumpNodeNotFoundMsgFmt 命名跳转（submitType=4）目标节点不存在那一档的固定文案
+	// （issues/79 定的那一句，逐字未改；issues/243 §8-2 后由写前置守卫
+	// checkJumpTargetExists 与办结之后的既有判据共用，防止两处各写一份而漂字）。
+	jumpNodeNotFoundMsgFmt = "根据节点名称[%s]无法找到节点模型"
 )
 
 // checkRollbackPossible 退回上一步（targetTaskName 空 ⇒ 血缘腿）的**写前置**守卫（issues/243 甲案）。
@@ -671,6 +682,36 @@ func (e *EngineImpl) checkRollbackPossible(ctx context.Context, current *model.P
 	}
 	_, _, err = e.checkRejectable(ctx, flow, current)
 	return err
+}
+
+// checkJumpTargetExists 命名跳转（targetTaskName 非空 ⇒ 按节点名跳）的**写前置**守卫
+// （issues/243 §8-2，与 checkRollbackPossible 同族同规矩）。
+//
+// 只做一件事：把"这个节点名在模型里存不存在"那一档判据提到任何状态变更之前。它自己**只读**
+// （task → instance → define → 解析模型 ⇒ findNode）。
+// 从前这句"根据节点名称[X]无法找到节点模型"是 prepareExecuteTask（内部 CompleteTask + UpdateTask
+// 已把当前行办结）之后才抛的，本栈内存仓储同样没有回滚 ⇒ 节点名写错一次就把办理人的待办弄丢
+// （真库有动作级事务整笔回滚，观察不到差别 ⇒ 这一档只有内存仓储照得出来）。
+//
+// **不**在这里报"任务不存在／不在进行中""无权办理"，也不新增第二种文案——那几档留给
+// prepareExecuteTask 的 loadAndCheck 用既有固定错报（它们本来就排在 CompleteTask 之前）；
+// 任务取不到／不在 DOING、取不到实例或定义（loadFlowForTask 报错）一律放行。
+// 抛的仍是原来那一句（jumpNodeNotFoundMsgFmt，与办结之后那一处同一把尺子）。
+// 这里多读一次仓储只为把判据排到写之前（该腿罕见），不为省这一次读去动位序。
+func (e *EngineImpl) checkJumpTargetExists(ctx context.Context, current *model.ProcessTask, targetTaskName string) error {
+	if current == nil || current.TaskState != model.TaskStateDoing {
+		return nil
+	}
+	flow, err := e.loadFlowForTask(ctx, current)
+	if err != nil || flow == nil {
+		// 取不到实例／定义／模型（或模型没过解析期硬校验）⇒ 放行：
+		// prepareExecuteTask 会用它自己的既有错在同一位序（办结之前）报出来，文案与档号都不变。
+		return nil
+	}
+	if findNode(flow, targetTaskName) == nil {
+		return fmt.Errorf(jumpNodeNotFoundMsgFmt, targetTaskName)
+	}
+	return nil
 }
 
 // checkRejectable 退回上一步的两道守卫（规范 04 · 退回上一步）：**只读判据，不碰任何状态**——

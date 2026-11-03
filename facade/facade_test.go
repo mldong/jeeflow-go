@@ -1976,6 +1976,27 @@ func startMultiTaskAt(t *testing.T, f *facade.Facade, repo *memory.Repository, n
 	return instanceID
 }
 
+// jTaskRowCount 实例下**全部**任务行数（含进行中／办结／废弃，＝java 的 getTasks().size()）。
+// issues/243 §8-2 的零写入判据之一：失败的 JUMP 既不许办结当前行，也不许凭空建单。
+func jTaskRowCount(t *testing.T, repo *memory.Repository, instanceID int64) int {
+	t.Helper()
+	rows, err := repo.FindHistoryTasks(context.Background(), instanceID)
+	if err != nil {
+		t.Fatalf("读实例 %d 的任务行: %v", instanceID, err)
+	}
+	return len(rows)
+}
+
+// jInstanceState 读回实例状态（持久值，不用聚合根内存对象）。
+func jInstanceState(t *testing.T, repo *memory.Repository, instanceID int64) model.InstanceState {
+	t.Helper()
+	inst, err := repo.FindInstanceByID(context.Background(), instanceID)
+	if err != nil || inst == nil {
+		t.Fatalf("读实例 %d: err=%v inst=%v", instanceID, err, inst)
+	}
+	return inst.State
+}
+
 // TestExecuteSubmitTypeBehavior issues/79：submitType 3/4/5/6 + 负向（对齐 Java 参考实现断言）
 func TestExecuteSubmitTypeBehavior(t *testing.T) {
 	f, repo, _ := setupFacade()
@@ -2029,6 +2050,8 @@ func TestExecuteSubmitTypeBehavior(t *testing.T) {
 	jn := startMultiTaskAt(t, f, repo, "task2")
 	t2n := doingTaskID(t, repo, jn, "task2")
 	repo.AddTaskActor(ctx, t2n, []string{"manager"})
+	jRowsBefore := jTaskRowCount(t, repo, jn)
+	jStateBefore := jInstanceState(t, repo, jn)
 	jr := f.Flow("processTask/execute", map[string]interface{}{
 		"processTaskId": t2n, "operator": "manager", "submitType": 4, "taskName": "no-such-node",
 	})
@@ -2037,6 +2060,19 @@ func TestExecuteSubmitTypeBehavior(t *testing.T) {
 	}
 	if !strings.Contains(fmt.Sprintf("%v", jr["msg"]), "无法找到节点模型") {
 		t.Fatalf("JUMP 无效节点应报「无法找到节点模型」: %v", jr["msg"])
+	}
+	// issues/243 §8-2：这一档的节点存在性判据已上提到 prepareExecuteTask（内部 CompleteTask +
+	// UpdateTask 会把当前行办结）之前 ⇒ 报错零写入。修前：本栈内存仓储和 java 一样没有回滚，
+	// 节点名写错一次就把办理人 t2n 那条待办凭空办结、待办就此消失（真库靠动作级事务整笔回滚，
+	// 观察不到差别 ⇒ 这一格只有在内存仓储才有意义）。
+	if still := doingTaskID(t, repo, jn, "task2"); still != t2n {
+		t.Errorf("报错零写入：task2 的待办必须还是报错前那条 %d（既不许被静默办结，也不许新建），实得 %d", t2n, still)
+	}
+	if n := jTaskRowCount(t, repo, jn); n != jRowsBefore {
+		t.Errorf("报错不建单：实例 %d 下任务行总数应仍为 %d，实得 %d", jn, jRowsBefore, n)
+	}
+	if s := jInstanceState(t, repo, jn); s != jStateBefore {
+		t.Errorf("失败的 JUMP 不得改实例状态：期望 %d，实得 %d", jStateBefore, s)
 	}
 
 	// ── submitType=5 RE_APPLY：task1 重新提交（前端 detail 抽屉场景，含 f_ 表单 + tf_nextNodeOperator）
