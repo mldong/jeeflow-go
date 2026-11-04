@@ -72,12 +72,14 @@ const (
 	addSignTimeLayout = "2006-01-02 15:04:05"
 )
 
-// ─── 两开关解析（非法值不得静默当缺省，纪律照 reapplyMode 先例） ──────────────
+// ─── 开关解析（非法值不得静默当缺省，纪律照 reapplyMode 先例） ──────────────
 
-// parseAllowAddSign 缺省 false；非布尔档报配置错误。
+// ParseBoolProp 解析布尔开关（allowAddSign/allowRecall/dynamicCountersign 三开关同尺）：
+// 缺省 false；非布尔档报配置错误。门面（动态会签分流/闸门/撤回/投影）与引擎（解析期校验/
+// 推进闸）共用这一枚（java AddSignSupport.parseAllow 同一枚）。
 // 字符串 "true"/"false"（不分大小写）与空白串按 java `String.valueOf(v).trim()` 同档收下，
 // 其余一律响亮报错——静默落回 false 会让配置者以为开关生效。
-func parseAllowAddSign(value interface{}, nodeID string) (bool, error) {
+func ParseBoolProp(value interface{}, nodeID, keyName string) (bool, error) {
 	if value == nil {
 		return false, nil
 	}
@@ -93,7 +95,29 @@ func parseAllowAddSign(value interface{}, nodeID string) (bool, error) {
 	case "false":
 		return false, nil
 	}
-	return false, fmt.Errorf("节点[%s]的 %s 配置非法: %s", nodeID, PropAllowAddSign, v)
+	return false, fmt.Errorf("节点[%s]的 %s 配置非法: %s", nodeID, keyName, v)
+}
+
+// parseAllowAddSign 缺省 false；非布尔档报配置错误。
+func parseAllowAddSign(value interface{}, nodeID string) (bool, error) {
+	return ParseBoolProp(value, nodeID, PropAllowAddSign)
+}
+
+// ParseAddSignMaxRounds 缺省 0＝不限；非整数或负数报配置错误（门面轮次上限判据与解析期共用）。
+func ParseAddSignMaxRounds(value interface{}, nodeID string) (int, error) {
+	return parseAddSignMaxRounds(value, nodeID)
+}
+
+// OperatorsFromArgs 本次提交点名的加签/征询人（逗号串与数组两形共用 §2.11 那枚归一单点）。
+// 门面动态会签分流与闸门共用（java AddSignSupport.operators 同一枚）；没点人返回空集。
+func OperatorsFromArgs(args map[string]interface{}) []string {
+	return addSignOperatorsFrom(args)
+}
+
+// AddSignRoundKey 轮次键（addSignRound_{节点名}，与 prefixKey 同形）。
+// 征询模式下主办行同步盖戳，门面写主办行时用（java FlowConst.ADD_SIGN_ROUND 拼接同形）。
+func AddSignRoundKey(nodeID string) string {
+	return prefixKey(VarAddSignRound, nodeID)
 }
 
 // parseAddSignMaxRounds 缺省 0＝不限；非整数或负数报配置错误。
@@ -153,14 +177,20 @@ func parseAddSignMaxRounds(value interface{}, nodeID string) (int, error) {
 
 // ─── 解析期硬校验（规范 02 §4.3／spec 04 语义边界表末两行） ────────────────────
 
-// validateAddSignFlow 对流程模型里每个任务节点做三件事：
-//  1. 两开关逐个解析——非法值报错，不得静默当缺省（java TaskParser 里 parseAllow/parseMaxRounds
-//     是**无条件**调的，所以"没开开关的节点配了脏值"同样要红，不能只在 allow==true 时校）；
-//  2. 会签节点（performType=1）配 allowAddSign ⇒ 报错：会签池内加人与会签之后加人是两种语义，
-//     merged 判据会打架；
-//  3. 首任务节点（申请节点）配 allowAddSign ⇒ 报错：申请节点的办理是发起/重提语义，与加签路由打架。
+// validateAddSignFlow 对流程模型里每个任务节点做解析期硬校验（java ModelParser.parse 尾部
+// 三段循环的合体，逐节点内层顺序照 java 的循环顺序：后加签两条 → 已办撤回两条 → 动态会签三条）：
+//  1. 三开关逐个解析——非法值报错，不得静默当缺省（java TaskParser 里 parseAllow/parseMaxRounds
+//     是**无条件**调的，所以"没开开关的节点配了脏值"同样要红，不能只在开关为 true 时校）；
+//  2. 会签节点（performType=1）配 allowAddSign ⇒ 报错：会签池内加人与会签之后加人是两种语义；
+//  3. 首任务节点（申请节点）配 allowAddSign ⇒ 报错：申请节点的办理是发起/重提语义；
+//  4. 会签节点配 allowRecall ⇒ 报错：撤"谁的一票"语义不清（issues/246）；
+//  5. 首任务节点配 allowRecall ⇒ 报错：申请节点走实例撤回＋重新发起（issues/246）；
+//  6. allowAddSign 与 dynamicCountersign 双开 ⇒ 报错：两档共用 tf_addSignOperators，行为歧义
+//     （issues/247）；
+//  7. 会签节点配 dynamicCountersign ⇒ 报错：会签池推进语义与征询挂起语义打架（issues/247）；
+//  8. 首任务节点配 dynamicCountersign ⇒ 报错：申请节点不需要征询挂起（issues/247）。
 //
-// 为什么不在运行时降级：静默跑下去会让配置者以为开关生效，实际两档推进闸各裁各的
+// 为什么不在运行时降级：静默跑下去会让配置者以为开关生效，实际各档推进闸各裁各的
 // （java ModelParser 同一条理由，原文注释在 ModelParser.java 那一段）。
 //
 // 为什么落在"每一处解析点"：go 没有 java 的独立解析阶段，定义 JSON → FlowModel 这一跳散在
@@ -182,14 +212,40 @@ func (e *EngineImpl) validateAddSignFlow(flow *model.FlowModel) error {
 		if _, err := parseAddSignMaxRounds(node.Properties[PropAddSignMaxRounds], node.ID); err != nil {
 			return err
 		}
-		if !allow {
-			continue
+		recallOn, err := ParseBoolProp(node.Properties[PropAllowRecall], node.ID, PropAllowRecall)
+		if err != nil {
+			return err
 		}
-		if IsCountersign(node.Properties["performType"]) {
-			return fmt.Errorf("会签节点[%s]不允许配置 allowAddSign：会签池内加人与会签之后加人是两种语义，推进闸会打架", node.ID)
+		collectOn, err := ParseBoolProp(node.Properties[PropDynamicCountersign], node.ID, PropDynamicCountersign)
+		if err != nil {
+			return err
 		}
-		if e.isFirstTaskNode(flow, node) {
-			return fmt.Errorf("首任务节点[%s]不允许配置 allowAddSign：申请节点的办理是发起/重提语义，与加签路由打架", node.ID)
+		if allow {
+			if IsCountersign(node.Properties["performType"]) {
+				return fmt.Errorf("会签节点[%s]不允许配置 allowAddSign：会签池内加人与会签之后加人是两种语义，推进闸会打架", node.ID)
+			}
+			if e.isFirstTaskNode(flow, node) {
+				return fmt.Errorf("首任务节点[%s]不允许配置 allowAddSign：申请节点的办理是发起/重提语义，与加签路由打架", node.ID)
+			}
+		}
+		if recallOn {
+			if IsCountersign(node.Properties["performType"]) {
+				return fmt.Errorf("会签节点[%s]不允许配置 allowRecall：撤\"谁的一票\"语义不清", node.ID)
+			}
+			if e.isFirstTaskNode(flow, node) {
+				return fmt.Errorf("首任务节点[%s]不允许配置 allowRecall：申请节点走实例撤回＋重新发起，不需要同实例复活", node.ID)
+			}
+		}
+		if collectOn {
+			if allow {
+				return fmt.Errorf("节点[%s]不允许同时配置 allowAddSign 与 dynamicCountersign：两档共用 tf_addSignOperators，行为靠节点属性分流，双开＝行为歧义", node.ID)
+			}
+			if IsCountersign(node.Properties["performType"]) {
+				return fmt.Errorf("会签节点[%s]不允许配置 dynamicCountersign：会签池推进语义与征询挂起语义打架", node.ID)
+			}
+			if e.isFirstTaskNode(flow, node) {
+				return fmt.Errorf("申请节点[%s]不允许配置 dynamicCountersign：申请节点那手走实例撤回＋重新发起，不需要征询挂起", node.ID)
+			}
 		}
 	}
 	return nil
@@ -392,8 +448,10 @@ func appendAddSignHistory(task *model.ProcessTask, operator string, toActors []s
 
 // ─── 废弃未完成加签任务（拒绝／退回发起人） ───────────────────────────────────
 
-// abandonAddSignOnNode 废弃本节点未完成的加签任务，不留孤儿待办（spec 04 语义边界表 2/3 行）。
-// 只对开了 allowAddSign 的节点动手——会签节点的兄弟任务由既有会签腿管，不在此扩面。
+// abandonAddSignOnNode 废弃本节点未完成的加签任务，不留孤儿待办（spec 04 语义边界表 2/3 行；
+// issues/247：征询成员行同属本节点 DOING，实例撤回/退回路径一并清场——**废弃腿条件扩成
+// allowAddSign 或 dynamicCountersign 双开关**，java abandonDoingOnNode 同判据）。
+// 会签节点的兄弟任务由既有会签腿管，不在此扩面。
 // 持久化形状逐字照会签 merged 后那段废弃腿（engine_impl.go 现读）：逐条 UpdateTask ＋
 // syncTaskToAggregate，否则内存里废弃了、真库那一行仍是 DOING。
 func (e *EngineImpl) abandonAddSignOnNode(ctx context.Context, flow *model.FlowModel,
@@ -409,7 +467,11 @@ func (e *EngineImpl) abandonAddSignOnNode(ctx context.Context, flow *model.FlowM
 	if err != nil {
 		return err
 	}
-	if !allow {
+	collectOn, err := ParseBoolProp(node.Properties[PropDynamicCountersign], node.ID, PropDynamicCountersign)
+	if err != nil {
+		return err
+	}
+	if !allow && !collectOn {
 		return nil
 	}
 	remaining, err := e.repo.FindDoingTasks(ctx, inst.ID, []string{nodeID})

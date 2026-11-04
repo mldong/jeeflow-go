@@ -83,8 +83,13 @@ const (
 	// issues/134 档也记着"本栈引擎不产出 40"）⇒ 码位与载荷形状先立好，**触发源缺席故无 fire 点**，
 	// 待补终止 action 时在写 40 落库之后 fire（严禁拿 99 废弃 / 45 拒绝顶这一支）。
 	EventInstanceTerminated EventType = 9
+	// EventTaskRecall 10 已办任务撤回发生（issues/246；规范 11 码 10）：撤回动作落库之后
+	// fire **一次**，只发 10 不补发 5/6——撤回不是办结也不是拒绝（同 8 不补发 2 的理由）。
+	// sourceId＝被撤回的旧行（TaskID 字段承载）；载荷 instanceId/taskId/operator；
+	// 复活行自己的待办另走码 3。
+	EventTaskRecall EventType = 10
 
-	// 10+ 预留：超时催办 / 超时自动通过 …（§11.3「本轮不发，仅占号防分叉」）。
+	// 11+ 预留：超时催办 / 超时自动通过 …（§11.3「本轮不发，仅占号防分叉」）。
 	// 八栈都没有时钟扫描器，发了没有触发源——严禁在本表里私自发号。
 )
 
@@ -111,6 +116,7 @@ var specNameByEventType = map[EventType]string{
 	EventTaskTransfer:         "TASK_TRANSFER",
 	EventTaskWithdraw:         "TASK_WITHDRAW",
 	EventInstanceTerminated:   "INSTANCE_TERMINATED",
+	EventTaskRecall:           "TASK_RECALL",
 }
 
 // SpecName 规范名（§11.3）；未登记码返回 "UNKNOWN(<code>)"，绝不猜名。
@@ -135,7 +141,7 @@ func EventTypeBySpecName(name string) (EventType, bool) {
 //
 // 承载形态各栈自定（§11.3 注：java 是 ProcessEvent{eventType, sourceId, ccActorId, data}），
 // 本栈用强类型字段 + Payload() 单源派生规范载荷 map，契约只钉"必须能拿到 §11.3 那些键"。
-// InstanceID 即"sourceId 指向"列：任务类码（3/5/6/7）另带 TaskID，其余（含 4）以 InstanceID 为 sourceId。
+// InstanceID 即"sourceId 指向"列：任务类码（3/5/6/7/10）另带 TaskID，其余（含 4）以 InstanceID 为 sourceId。
 type ProcessEvent struct {
 	Type       EventType
 	InstanceID int64

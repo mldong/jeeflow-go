@@ -306,6 +306,24 @@ func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, 
 			}
 			// merged ⇒ 落穿到下面的流出边（与"全部完成"走同一出口）
 		}
+		// 征询档推进闸（issues/247，java TaskModel.exec 第三档）：**复用后加签闸**——
+		// 带人的提交在门面分流（不办结主办行，到不了这里）；能走进执行闸的只有成员行办结
+		// 与主办行收齐后的拍板：主办还 DOING ⇒ merged=false 节点不动；主办办结且成员清零
+		// ⇒ 放行出边。直接带 tf_addSignOperators 走引擎的提交已被 validateAddSignSubmission
+		// 以「未开启 allowAddSign」拦下（解析期双开互斥 ⇒ 征询节点必非加签节点），故 ops 恒空。
+		if collectOn, cerr := ParseBoolProp(curNode.Properties[PropDynamicCountersign], curNode.ID, PropDynamicCountersign); cerr != nil {
+			return nil, cerr
+		} else if collectOn {
+			merged, aerr := e.execAddSignGate(ctx, flow, inst, curNode, task, operator, nil)
+			if aerr != nil {
+				return nil, aerr
+			}
+			if !merged {
+				inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
+				return inst, nil
+			}
+			// merged ⇒ 落穿到下面的流出边
+		}
 		// issues/91：会签节点 merged 后（ONE_VOTE_VETO 否决 / 全部完成任一路径），
 		// 废弃该节点剩余 DOING 任务（对齐内置引擎 abandonProcessTask）：
 		// SEQUENTIAL 后续成员任务尚未创建天然 no-op；PARALLEL 全员预创建，否决时废弃其余

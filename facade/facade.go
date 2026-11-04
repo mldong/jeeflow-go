@@ -171,7 +171,11 @@ func (f *Facade) dispatch(ctx context.Context, action string, args map[string]in
 	case "processInstance/withdraw":
 		err = f.withdraw(ctx, args)
 	case "processTask/execute":
-		err = f.execute(ctx, args)
+		data, err = f.execute(ctx, args)
+	case "processTask/recall":
+		data, err = f.taskRecall(ctx, args) // issues/246 已办撤回
+	case "processTask/revokeDynamicCountersign":
+		data, err = f.taskRevokeCountersign(ctx, args) // issues/247 撤回动态会签
 	case "processTask/todoList":
 		data, err = f.todoList(ctx, args)
 	case "processTask/doneList":
@@ -521,10 +525,10 @@ func (f *Facade) canWithdrawInstance(ctx context.Context, inst *model.ProcessIns
 
 // ═══ 流程任务 ═══
 
-func (f *Facade) execute(ctx context.Context, args map[string]interface{}) error {
+func (f *Facade) execute(ctx context.Context, args map[string]interface{}) (interface{}, error) {
 	taskID, err := toInt64(args["processTaskId"])
 	if err != nil {
-		return fmt.Errorf("processTaskId 缺失或非法: %v", err)
+		return nil, fmt.Errorf("processTaskId 缺失或非法: %v", err)
 	}
 	operator := operatorArg(args)
 	submitType, err := toInt(args["submitType"])
@@ -539,6 +543,18 @@ func (f *Facade) execute(ctx context.Context, args map[string]interface{}) error
 		flowArgs[k] = v
 	}
 	flowArgs["submitType"] = submitType
+	// ── 动态会签分流与闸门（issues/247）——判据全部排在任何状态变更之前 ──
+	collect, err := f.tryDynamicCountersign(ctx, taskID, operator, flowArgs)
+	if err != nil {
+		return nil, err
+	}
+	if collect != nil {
+		// 征询模式带 tf_addSignOperators：只建成员行、不办结主办行（响应带 marker 供前端提示）
+		return collect, nil
+	}
+	if err := f.gateDynamicCountersign(ctx, taskID, flowArgs); err != nil {
+		return nil, err
+	}
 	// boot3 execute 分发（spec §11.2）
 	switch submitType {
 	case 2: // REJECT
@@ -555,7 +571,7 @@ func (f *Facade) execute(ctx context.Context, args map[string]interface{}) error
 	default: // 0 APPLY / 1 AGREE / 5 重新提交
 		_, err = f.engine.ExecuteProcessTask(ctx, taskID, operator, flowArgs)
 	}
-	return err
+	return nil, err
 }
 
 // ═══ 流程设计（需扩展仓储） ═══
@@ -1657,6 +1673,18 @@ func (f *Facade) taskDetail(ctx context.Context, args map[string]interface{}) (i
 						}
 						if v, ok := n.Properties["field"]; ok {
 							tm["ext"] = v
+						}
+						// 动态会签投影（issues/247）：征询主办行 ext.dynamicCountersign 从成员行现算，
+						// 跳过 99 废弃行；无成员行 ⇒ 不写键。解析/读数失败 ⇒ 跳过投影（java 该段
+						// 整体 try-catch-ignored 同形：投影是增强面，不打断 detail 主腿）。
+						if n.Type == model.TypeTask {
+							if dynOn, derr := engine.ParseBoolProp(n.Properties[engine.PropDynamicCountersign], n.ID, engine.PropDynamicCountersign); derr == nil && dynOn {
+								if allTasks, terr := f.repo.FindHistoryTasks(ctx, inst.ID); terr == nil {
+									if dc := engine.CollectBuildProjection(allTasks, task); dc != nil {
+										tExt["dynamicCountersign"] = dc
+									}
+								}
+							}
 						}
 						vo["taskModel"] = tm
 						break

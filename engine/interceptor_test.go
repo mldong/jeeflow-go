@@ -21,9 +21,10 @@ func TestFireEventListenerPanicIsolated(t *testing.T) {
 
 // ─── 规范 11-events §11.3 码表 / §11.5 订阅形状（issues/127＋132 事件代码腿）───
 
-// TestEventTypeCodeTableA A 套整型码钉死：1..9 逐一对齐 spec §11.3，10+ 只占号不发。
+// TestEventTypeCodeTableA A 套整型码钉死：1..10 逐一对齐 spec §11.3，11+ 只占号不发。
 // issues/132 §1 的"码值三套并存"就是这一格缺失导致的；写反（5/6 互换、CcCreate 留在 5）
-// 必须由本格报红，不是靠集成层猜。
+// 必须由本格报红，不是靠集成层猜。issues/246 起码 10 TASK_RECALL 入表（java 参考实现
+// ProcessEventTypeEnum 同批登记）。
 func TestEventTypeCodeTableA(t *testing.T) {
 	cases := []struct {
 		got  EventType
@@ -39,6 +40,7 @@ func TestEventTypeCodeTableA(t *testing.T) {
 		{EventTaskTransfer, 7, "TASK_TRANSFER"},
 		{EventTaskWithdraw, 8, "TASK_WITHDRAW"},
 		{EventInstanceTerminated, 9, "INSTANCE_TERMINATED"},
+		{EventTaskRecall, 10, "TASK_RECALL"},
 	}
 	for _, c := range cases {
 		if int(c.got) != c.code {
@@ -59,10 +61,10 @@ func TestEventTypeCodeTableA(t *testing.T) {
 		t.Errorf("兼容别名未随 A 套重排: start=%d create=%d complete=%d cc=%d finish=%d reject=%d",
 			EventProcessStart, EventTaskCreate, EventTaskComplete, EventCCCreate, EventProcessFinish, EventProcessReject)
 	}
-	// 号段不外溢：登记表里只允许 1..9（10+ 是"占号不发"，私自发号＝养出第四套码值）
+	// 号段不外溢：登记表里只允许 1..10（11+ 是"占号不发"，私自发号＝养出第四套码值）
 	for code := range specNameByEventType {
-		if code < 1 || code > 9 {
-			t.Errorf("契约外码值 %d 进了规范名表（本轮只发 1..9）", code)
+		if code < 1 || code > 10 {
+			t.Errorf("契约外码值 %d 进了规范名表（本轮只发 1..10）", code)
 		}
 	}
 	// 未登记码不许猜名
