@@ -280,6 +280,10 @@ type TaskRow struct {
 	DefineVersion            int                    `json:"defineVersion"`
 	InstanceVariable         string                 `json:"instanceVariable"`
 	InstanceCreateTime       time.Time              `json:"instanceCreateTime"`
+	// InstanceState 所属流程实例的状态（issues/250，10/20/30/40/45/50/99）——前端据此把
+	// 「实例已非进行中」的已办行撤回按钮置灰。任务行自身的 TaskState 照不出这一格。
+	// 用指针让「实例不在场」投 JSON null，不硬造 0（0 不是合法状态）。
+	InstanceState *int `json:"instanceState"`
 }
 
 // ─── 统计 DTO（v1.8.25，issues/103，对齐 Java InstanceStatsRow/TaskStatsRow） ─

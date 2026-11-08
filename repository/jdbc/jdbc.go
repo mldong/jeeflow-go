@@ -1100,7 +1100,7 @@ func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bo
 	cols := "DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, t.task_type, t.perform_type," +
 		" t.task_state, t.operator, t.finish_time, t.expire_time, t.form_key, t.task_parent_id, t.variable," +
 		" t.create_time, t.create_user, t.update_time, t.update_user," +
-		" pd.name, pd.display_name, pd.version, pi.variable, pi.create_time"
+		" pd.name, pd.display_name, pd.version, pi.variable, pi.create_time, pi.state"
 	sqlStr := "SELECT " + cols + where + " ORDER BY t.id DESC LIMIT ? OFFSET ?"
 	args = append(args, pageSize, (pageNum-1)*pageSize)
 	rows, err := r.conn(ctx).QueryContext(ctx, sqlStr, args...)
@@ -1127,6 +1127,8 @@ func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bo
 		// 备注：task_state 这一列在两条分页谓词（`= 10` / `<> 10`，见 filterWhere）下 NULL 行根本
 		// 进不了结果集，收它属防御性同口径（谓词一改就是同一个雷），不为它单独造夹具。
 		var taskType, performType, taskState, defineVersion sql.NullInt64
+		// issues/250：实例态走同一套 NullInt64 接收（LEFT JOIN 未命中即 NULL），再折成 *int 投 null。
+		var instState sql.NullInt64
 		if err := rows.Scan(&row.ID, &row.ProcessInstanceID, &row.TaskName, &row.DisplayName,
 			&taskType, &performType, &taskState, &taskOperator,
 			&nullTimePtrScan{&row.FinishTime}, &nullTimePtrScan{&row.ExpireTime},
@@ -1134,13 +1136,20 @@ func (r *Repository) pageTasks(ctx context.Context, query spi.PageQuery, done bo
 			&nullTimeScan{&row.CreateTime}, &nullStrScan{&row.CreateUser},
 			&nullTimeScan{&row.UpdateTime}, &nullStrScan{&row.UpdateUser},
 			&defineName, &defineDisplayName,
-			&defineVersion, &instVariable, &nullTimeScan{&row.InstanceCreateTime}); err != nil {
+			&defineVersion, &instVariable, &nullTimeScan{&row.InstanceCreateTime},
+			&instState); err != nil {
 			return nil, 0, err
 		}
 		row.TaskType = int(taskType.Int64)
 		row.PerformType = int(performType.Int64)
 		row.TaskState = model.TaskState(taskState.Int64)
 		row.DefineVersion = int(defineVersion.Int64)
+		// issues/250：实例不在场 ⇒ 不造 0，保持 nil 投 JSON null（0 不是合法状态，
+		// 前端「有值且非 10 才置灰」的判据会被 0 误导）。
+		if instState.Valid {
+			instStateVal := int(instState.Int64)
+			row.InstanceState = &instStateVal
+		}
 		row.Operator = nullStrToPtr(taskOperator)
 		row.FormKey = nullStrToPtr(taskFormKey)
 		row.ProcessDefineName = nullStrToPtr(defineName)

@@ -2902,6 +2902,8 @@ func taskRowToMap(r *model.TaskRow) map[string]interface{} {
 		"updateTime": fmtTimeV(r.UpdateTime), "updateUser": r.UpdateUser,
 		"processDefineName": nullOut(r.ProcessDefineName), "processDefineDisplayName": nullOut(r.ProcessDefineDisplayName),
 		"instanceCreateTime": fmtTimeV(r.InstanceCreateTime),
+		// issues/250：所属实例的状态（整数或 null）——待办/已办共用本转换，两个列表都带。
+		"instanceState": r.InstanceState,
 		"ext":                ext, "instanceExt": instanceExt, "version": r.DefineVersion,
 		"taskFormData": formDataOf(r.Variables, "tf_"), // issues/15
 	}
