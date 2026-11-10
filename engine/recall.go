@@ -50,6 +50,10 @@ const (
 	// 旧行**变量上（原行不改写＝历史即审批记录，账本是唯一追加痕迹）；recalledTaskId 指向复活新行
 	// （从历史记录可一步跳到唯一活待办）。tf_ 前缀使 lineageVars（退回复活腿）天然剔掉它。
 	KeyRecallHistory = "tf_recallHistory"
+	// KeyAllowRecall 已办撤回节点开关快照（issues/251）：办理时由引擎从节点属性盖到本行
+	// 变量，值＝办理时刻的 allowRecall 定义值；查询出口搬运成行顶层 allowRecall 供前端
+	// 预判置灰（只投已办行）。撤回校验仍以现读定义为权威，快照仅供预判（漂移为设计内）。
+	KeyAllowRecall = "tf_allowRecall"
 
 	// MsgRecallWindow 窗口判据：下游已办结 ⇒ 拦（宽口径的反面档）。
 	MsgRecallWindow = "任务[%s]的后续节点已办理，不能撤回"
@@ -263,4 +267,21 @@ func (e *EngineImpl) recallTaskInner(ctx context.Context, taskID int64, operator
 	e.fireEvent(ctx, ProcessEvent{Type: EventTaskRecall, InstanceID: inst.ID, TaskID: target.ID,
 		Operator: operator})
 	return resurrected, nil
+}
+
+// StampAllowRecall 办理时把当前节点的 allowRecall 开关快照进行变量（issues/251）：
+// 已办行置灰的"节点开关"预判从行上读，查询出口只搬运不解析定义。本栈实例变量全量写
+// （CompleteTask p.Variables=vars），下游待办行会残留上一手键——与内置 Java/Python/
+// Node 线同形状，出口 DOING 守卫统一无害化。节点属性经 ParseBoolProp 解析（与撤回
+// 校验同一把尺子），解析异常保守 false（撤回时校验还会报原文案，快照只影响预判）。
+// 非 task 节点（start/end/decision 等不办理的节点）与 nil args 均静默跳过。
+func StampAllowRecall(args map[string]interface{}, node *model.FlowNode) {
+	if args == nil || node == nil || node.Type != model.TypeTask {
+		return
+	}
+	allow, err := ParseBoolProp(node.Properties[PropAllowRecall], node.ID, PropAllowRecall)
+	if err != nil {
+		allow = false
+	}
+	args[KeyAllowRecall] = allow
 }

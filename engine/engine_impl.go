@@ -2,11 +2,11 @@ package engine
 
 import (
 	"context"
-	"sync"
 	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mldong/jeeflow-go/model"
@@ -602,6 +602,12 @@ func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, opera
 	if err := validateAddSignSubmission(findNode(&flow, task.TaskName), task, args, operator); err != nil {
 		return nil, nil, nil, nil, err
 	}
+
+	// issues/251：办理时把本节点的 allowRecall 开关快照进行变量（tf_allowRecall）——
+	// prepareExecuteTask 是全部办结路径的公共序言，一处盖键全路径覆盖。本栈实例变量
+	// 全量写（CompleteTask p.Variables=vars），下游待办行会残留上一手键——与内置
+	// Java/Python/Node 线同形状，出口 DOING 守卫统一无害化；撤回校验仍以现读定义为权威。
+	StampAllowRecall(args, findNode(&flow, task.TaskName))
 
 	// issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
 	// 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。

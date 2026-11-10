@@ -372,10 +372,10 @@ func TestRecallParseBans(t *testing.T) {
 // 格 9（java test9）消息常量与 spec 06 逐字文案一致性自证（防常量被改后测试仍绿）。
 func TestRecallPinnedMessages(t *testing.T) {
 	pinned := map[string]string{
-		engine.MsgRecallWindow:         "任务[%s]的后续节点已办理，不能撤回",
-		engine.MsgRecallSwitchOff:      "节点[%s]未开启 allowRecall，不能撤回",
-		engine.MsgRecallNotFinished:    "任务非已完成状态，不可撤回",
-		engine.MsgRecallNoPermission:   "无权限撤回该任务",
+		engine.MsgRecallWindow:           "任务[%s]的后续节点已办理，不能撤回",
+		engine.MsgRecallSwitchOff:        "节点[%s]未开启 allowRecall，不能撤回",
+		engine.MsgRecallNotFinished:      "任务非已完成状态，不可撤回",
+		engine.MsgRecallNoPermission:     "无权限撤回该任务",
 		engine.MsgRecallInstanceNotDoing: "流程实例非进行中状态，不可撤回",
 	}
 	for got, want := range pinned {
@@ -440,5 +440,58 @@ func TestRecallFiresTaskRecallEvent(t *testing.T) {
 	}
 	if starts != 1 {
 		t.Errorf("复活行待办应走既有建单腿 fire 一次码 3，实得 %d", starts)
+	}
+}
+
+// 格 18（issues/251）办理时盖 tf_allowRecall 快照：两态/待办无键/发起腿禁配。
+func TestRecallStampsAllowRecallSnapshot(t *testing.T) {
+	eng, repo, iid := asStartToReview(t, rcOn)
+	// 待办 review 行无快照键（go 建单只写 isFirstTaskNode、不灌 args/实例变量——与 jeeflow
+	// 同形；内置 Java/Python/Node 线建单灌 args 故待办行残留，出口 DOING 守卫统一无害化）
+	doing, err := repo.FindDoingTasks(context.Background(), iid, nil)
+	if err != nil {
+		t.Fatalf("读待办: %v", err)
+	}
+	var review *model.ProcessTask
+	for _, r := range doing {
+		if r.TaskName == "review" {
+			review = r
+		}
+	}
+	if review == nil {
+		t.Fatal("应停在 review")
+	}
+	if _, ok := review.Variables[engine.KeyAllowRecall]; ok {
+		t.Fatal("待办行不应带快照键")
+	}
+	// 办结 review → 本手快照 true
+	if _, err := eng.ExecuteProcessTask(context.Background(), review.ID, "userA",
+		map[string]interface{}{"submitType": rcAgree}); err != nil {
+		t.Fatalf("办结 review: %v", err)
+	}
+	row := asMustRow(t, repo, review.ID)
+	if v, ok := row.Variables[engine.KeyAllowRecall].(bool); !ok || !v {
+		t.Fatalf("review 行快照应 true，got %v", row.Variables[engine.KeyAllowRecall])
+	}
+	// final（未配置节点）→ false（缺省档）
+	var final *model.ProcessTask
+	doing, _ = repo.FindDoingTasks(context.Background(), iid, nil)
+	for _, r := range doing {
+		if r.TaskName == "final" {
+			final = r
+		}
+	}
+	if _, err := eng.ExecuteProcessTask(context.Background(), final.ID, "userF",
+		map[string]interface{}{"submitType": rcAgree}); err != nil {
+		t.Fatalf("办结 final: %v", err)
+	}
+	row = asMustRow(t, repo, final.ID)
+	if v, _ := row.Variables[engine.KeyAllowRecall].(bool); v {
+		t.Fatal("final 行快照应 false")
+	}
+	// apply 行（发起腿办结，禁配档）
+	applyRow := rcAnyRow(t, repo, iid, "apply")
+	if v, ok := applyRow.Variables[engine.KeyAllowRecall].(bool); !ok || v {
+		t.Fatalf("apply 行快照应 false，got %v", applyRow.Variables[engine.KeyAllowRecall])
 	}
 }

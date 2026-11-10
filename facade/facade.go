@@ -2745,7 +2745,9 @@ func (f *Facade) doneList(ctx context.Context, args map[string]interface{}) (int
 
 // taskVo 任务行 VO（instanceDetail 任务列表用，对齐 Java taskVo）
 func (f *Facade) taskVo(t *model.ProcessTask) map[string]interface{} {
-	return map[string]interface{}{
+	// issues/251：办理时快照的节点开关投成顶层（与分页行同姿势）；只投已办行——
+	// 待办行的键是建单/实例回退灌入的上一手残留（无消费方）；无键不投
+	vo := map[string]interface{}{
 		"id": t.ID, "processInstanceId": t.ProcessInstanceID, "taskName": t.TaskName,
 		"displayName": t.DisplayName, "taskType": t.TaskType, "performType": t.PerformType,
 		"taskState": t.TaskState, "operator": t.ActorID, "finishTime": t.FinishTime,
@@ -2754,6 +2756,14 @@ func (f *Facade) taskVo(t *model.ProcessTask) map[string]interface{} {
 		"updateTime": t.UpdateTime, "updateUser": t.UpdateUser, "taskActorIdList": t.ActorIDs,
 		"taskFormData": formDataOf(t.Variables, "tf_"), // issues/15
 	}
+	if t.TaskState != 10 {
+		if snap, ok := t.Variables[engine.KeyAllowRecall]; ok && snap != nil {
+			if b, isBool := snap.(bool); isBool {
+				vo["allowRecall"] = b
+			}
+		}
+	}
+	return vo
 }
 
 // parseMQuery m_ 前缀查询参数解析（issues/05-5，对齐 Java JeeflowQueryParser）：
@@ -2893,7 +2903,20 @@ func taskRowToMap(r *model.TaskRow) map[string]interface{} {
 			ext[engine.VarReapplyCtx] = reapply
 		}
 	}
-	return map[string]interface{}{
+	// issues/251：办理时快照的节点开关投成顶层标准字段，供前端已办行置灰预判——从原行
+	// 变量取（ext 回退替换不影响）；只投已办行（待办行的键是建单/实例回退灌入的上一手
+	// 残留，无消费方）；无键不投＝存量行＝前端退回可点
+	var allowRecall bool
+	var hasRecall bool
+	if r.TaskState != 10 {
+		if snap, ok := r.Variables[engine.KeyAllowRecall]; ok && snap != nil {
+			if b, isBool := snap.(bool); isBool {
+				allowRecall = b
+				hasRecall = true
+			}
+		}
+	}
+	row := map[string]interface{}{
 		"id": r.ID, "processInstanceId": r.ProcessInstanceID, "taskName": r.TaskName,
 		"displayName": r.DisplayName, "taskType": r.TaskType, "performType": r.PerformType,
 		"taskState": r.TaskState, "operator": nullOut(r.Operator), "finishTime": fmtTime(r.FinishTime),
@@ -2907,6 +2930,10 @@ func taskRowToMap(r *model.TaskRow) map[string]interface{} {
 		"ext":                ext, "instanceExt": instanceExt, "version": r.DefineVersion,
 		"taskFormData": formDataOf(r.Variables, "tf_"), // issues/15
 	}
+	if hasRecall {
+		row["allowRecall"] = allowRecall
+	}
+	return row
 }
 
 // hasOnlyControlKeys 任务变量是否只剩引擎建单必写的控制键（issues/121 P1 的判据体）：
