@@ -163,6 +163,11 @@ func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, 
 	// 上一轮提交里的 tf_addSignOperators 会随实例变量复活 ⇒ 凭空多建一条本节点待办
 	// （spec 04「流程变量约定」末注点名的病；根因那一腿在 saveInstance，两腿都要）。
 	addSignOps := addSignOperatorsFrom(args)
+	// issues/253 推进闸：协办行（task_type=1）办结不产生执行对象、不跑输出变迁
+	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil &&
+		pre.TaskState == model.TaskStateDoing && IsAidantRow(pre) {
+		return e.completeAidantWithoutDrive(ctx, taskID, operator, args)
+	}
 	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil &&
 		pre.TaskState == model.TaskStateDoing && reapplyOf(pre.Variables) != nil {
 		return e.executeReapply(ctx, pre, operator, args)
@@ -216,6 +221,8 @@ func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, 
 			strings.EqualFold(strings.TrimSpace(csCond), "ONE_VOTE_VETO")
 		if ct == "SEQUENTIAL" && !csVeto {
 			doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
+			// issues/253：协办行（task_type=1）不是表决票，不算"本节点还有未完成待办"
+			doing = FilterOutAidant(doing)
 			if len(doing) == 0 {
 				actors, lc := getCsState(vars, curNode.ID)
 				if actors != nil && lc+1 < len(actors) {
@@ -259,7 +266,9 @@ func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, 
 				// 本单同步进聚合，计数是新鲜的）。
 				total, activate, finished := 0, 0, 0
 				for _, t := range inst.Tasks {
-					if t.TaskName != curNode.ID {
+					// issues/253：会签合并判据显式排除协办行（task_type=1）——snaker 按同节点
+					// 同名行全算会把协办行误当表决票挡住合并（spec 04「不计入会签合并计数」）。
+					if t.TaskName != curNode.ID || IsAidantRow(t) {
 						continue
 					}
 					total++
@@ -284,7 +293,8 @@ func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, 
 				// merged ⇒ 落穿到下面的 abandon＋跟进边（与"全部完成"走同一出口）
 			} else {
 				doing, _ := e.repo.FindDoingTasks(ctx, inst.ID, nil)
-				if len(doing) > 0 {
+				// issues/253：协办行不是表决票（同上，合并判据显式排除 task_type=1）
+				if len(FilterOutAidant(doing)) > 0 {
 					inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
 					return inst, nil
 				}
@@ -328,6 +338,13 @@ func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, 
 		// 废弃该节点剩余 DOING 任务（对齐内置引擎 abandonProcessTask）：
 		// SEQUENTIAL 后续成员任务尚未创建天然 no-op；PARALLEL 全员预创建，否决时废弃其余
 		// （刚完成者已 FINISHED 不会误伤）。逐条持久化并回写聚合副本（E25：防 UpdateInstance 级联回写旧状态）
+		// issues/253：离开节点先清场未办结协办行（废弃＋往主办行账本记废弃），再清剩余会签行——
+		// 顺序不能反，先被下面循环置 99 的协办行就记不上账了（java CountersignHandler 同序）。
+		// 本点覆盖四档（会签 merged／加签 merged／征询 merged／普通放行出边）＝java
+		// TaskModel.abandonAidantOnLeave 的四个调用位；上面各"留在本节点"的早返回分支不调。
+		if _, err := e.AbandonAidantOnNode(ctx, inst, curNode.ID, operator); err != nil {
+			return nil, err
+		}
 		if ct != "" {
 			remaining, _ := e.repo.FindDoingTasks(ctx, inst.ID, []string{curNode.ID})
 			for _, t := range remaining {
@@ -381,6 +398,11 @@ func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, oper
 }
 
 func (e *EngineImpl) executeAndJumpToEndInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	// issues/253 推进闸：协办行拒绝同样不驱动流程（任何 submitType 都只办结自己那一行）
+	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil &&
+		pre.TaskState == model.TaskStateDoing && IsAidantRow(pre) {
+		return e.completeAidantWithoutDrive(ctx, taskID, operator, args)
+	}
 	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil && pre.TaskState == model.TaskStateDoing && reapplyOf(pre.Variables) != nil {
 		return nil, fmt.Errorf("带重提直返标记的申请待办不允许拒绝，只接受重新提交(submitType=5)")
 	}
@@ -391,6 +413,10 @@ func (e *EngineImpl) executeAndJumpToEndInner(ctx context.Context, taskID int64,
 		return nil, err
 	}
 	// 拒绝结束：本节点未完成的加签任务一并废弃，不留孤儿待办（spec 04 · 后加签 语义边界表）
+	// issues/253：离开节点先清场未办结协办行（废弃＋账本记废弃），再走后加签/征询的既有废弃腿
+	if _, err := e.AbandonAidantOnNode(ctx, inst, task.TaskName, operator); err != nil {
+		return nil, err
+	}
 	if err := e.abandonAddSignOnNode(ctx, flow, inst, task.TaskName, operator); err != nil {
 		return nil, err
 	}
@@ -425,6 +451,11 @@ func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, opera
 
 func (e *EngineImpl) executeAndJumpTaskInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
 	snapshot, _ := e.repo.FindTaskByID(ctx, taskID)
+	// issues/253 推进闸：两路同闸（照 snaker，别只堵 executeTask 一路）——协办行跳转/退回
+	// 同样不驱动流程，且必须排在血缘/目标守卫之前，免得协办行被守卫的文案误拦。
+	if snapshot != nil && snapshot.TaskState == model.TaskStateDoing && IsAidantRow(snapshot) {
+		return e.completeAidantWithoutDrive(ctx, taskID, operator, args)
+	}
 	// 带直返上下文的进行中申请待办只接受重新提交(5)：命名跳转/退回上一步都在改状态前拒绝
 	if snapshot != nil && snapshot.TaskState == model.TaskStateDoing && reapplyOf(snapshot.Variables) != nil {
 		return nil, fmt.Errorf("带重提直返标记的申请待办不允许跳转，只接受重新提交(submitType=5)")
@@ -445,6 +476,10 @@ func (e *EngineImpl) executeAndJumpTaskInner(ctx context.Context, taskID int64, 
 	// §11.7 边界 2：JUMP/ROLLBACK 两档都不建 cc（cc 钩子传 nil），与 Java executeAndJumpTask 同形
 	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
 	if err != nil {
+		return nil, err
+	}
+	// issues/253：跳转/退回离开本节点 ⇒ 未办结协办行随废弃腿清场（账本记废弃）
+	if _, err := e.AbandonAidantOnNode(ctx, inst, task.TaskName, operator); err != nil {
 		return nil, err
 	}
 	if targetTaskName == "" {
@@ -497,6 +532,11 @@ func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID i
 
 func (e *EngineImpl) executeAndJumpToFirstTaskNodeInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
 	args = stripReserved(args)
+	// issues/253 推进闸：协办行退回发起人同样不驱动流程
+	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil &&
+		pre.TaskState == model.TaskStateDoing && IsAidantRow(pre) {
+		return e.completeAidantWithoutDrive(ctx, taskID, operator, args)
+	}
 	// 校验放在任何状态变更之前：带直返上下文的申请待办不得再次退回
 	if pre, _ := e.repo.FindTaskByID(ctx, taskID); pre != nil && pre.TaskState == model.TaskStateDoing && reapplyOf(pre.Variables) != nil {
 		return nil, fmt.Errorf("带重提直返标记的申请待办不允许再次退回，只接受重新提交(submitType=5)")
@@ -521,6 +561,10 @@ func (e *EngineImpl) executeAndJumpToFirstTaskNodeInner(ctx context.Context, tas
 		return nil, err
 	}
 	// 退回发起人：本节点未完成的加签任务一并废弃，不留孤儿待办（spec 04 · 后加签 语义边界表）
+	// issues/253：退回发起人离开本节点 ⇒ 未办结协办行随废弃腿清场（账本记废弃）
+	if _, err := e.AbandonAidantOnNode(ctx, inst, task.TaskName, operator); err != nil {
+		return nil, err
+	}
 	if err := e.abandonAddSignOnNode(ctx, flow, inst, task.TaskName, operator); err != nil {
 		return nil, err
 	}
@@ -608,6 +652,13 @@ func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, opera
 	// 全量写（CompleteTask p.Variables=vars），下游待办行会残留上一手键——与内置
 	// Java/Python/Node 线同形状，出口 DOING 守卫统一无害化；撤回校验仍以现读定义为权威。
 	StampAllowRecall(args, findNode(&flow, task.TaskName))
+
+	// issues/253 等待闸：waitCompletion=true 的主办行办结前判"不存在 DOING 协办行"，
+	// 未齐 ⇒ 逐字文案报错、零写入。同样必须排在 CompleteTask 之前（内存仓储无回滚）。
+	// 协办行自身不受本闸约束（它办结本来就不驱动流程）；缺省 false 原样放行。
+	if err := GateAidantWait(inst.Tasks, task); err != nil {
+		return nil, nil, nil, nil, err
+	}
 
 	// issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
 	// 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。

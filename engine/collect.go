@@ -48,6 +48,8 @@ const (
 // ─── 成员行识别（纯函数） ─────────────────────────────────────────────────────
 
 // CollectMemberRows 成员行＝parent 指向主办行**且同节点同名**的行（成员不能再拉人 ⇒ 无更深层级）。
+// issues/253：协办行（task_type=1）也满足 parent＋同名，但它属另一族——征询收齐闸只数征询
+// 成员行（task_type=0），两闸各数各的（spec 04「与征询允许同节点并存」）。
 func CollectMemberRows(tasks []*model.ProcessTask, host *model.ProcessTask) []*model.ProcessTask {
 	var out []*model.ProcessTask
 	if host == nil {
@@ -55,7 +57,7 @@ func CollectMemberRows(tasks []*model.ProcessTask, host *model.ProcessTask) []*m
 	}
 	for _, t := range tasks {
 		if host.ID != 0 && t.ParentTaskID != nil && *t.ParentTaskID == host.ID &&
-			t.TaskName == host.TaskName {
+			t.TaskName == host.TaskName && !IsAidantRow(t) {
 			out = append(out, t)
 		}
 	}
@@ -63,8 +65,12 @@ func CollectMemberRows(tasks []*model.ProcessTask, host *model.ProcessTask) []*m
 }
 
 // IsCollectMemberRow 成员行判定：parent 指向**同节点同名**行（成员行禁带拉人参数的判据）。
+// issues/253：协办行（task_type=1）不是征询成员行——两族靠 task_type 分辨。
 func IsCollectMemberRow(tasks []*model.ProcessTask, row *model.ProcessTask) bool {
 	if row == nil || row.ParentTaskID == nil || *row.ParentTaskID == 0 {
+		return false
+	}
+	if IsAidantRow(row) {
 		return false
 	}
 	for _, t := range tasks {

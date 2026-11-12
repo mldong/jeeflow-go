@@ -176,6 +176,8 @@ func (f *Facade) dispatch(ctx context.Context, action string, args map[string]in
 		data, err = f.taskRecall(ctx, args) // issues/246 已办撤回
 	case "processTask/revokeDynamicCountersign":
 		data, err = f.taskRevokeCountersign(ctx, args) // issues/247 撤回动态会签
+	case "processTask/aidant":
+		err = f.taskAidant(ctx, args) // issues/253 动态协办（data → null）
 	case "processTask/todoList":
 		data, err = f.todoList(ctx, args)
 	case "processTask/doneList":
@@ -1683,6 +1685,15 @@ func (f *Facade) taskDetail(ctx context.Context, args map[string]interface{}) (i
 									if dc := engine.CollectBuildProjection(allTasks, task); dc != nil {
 										tExt["dynamicCountersign"] = dc
 									}
+								}
+							}
+							// 动态协办投影（issues/253）：主办行 ext.aidant 从 task_parent_id＋
+							// task_type=1 现算，不落新存储。**无节点开关**——协办档只由运行期派生，
+							// 任何任务节点都可能有（故不套 dynOn 那层判据）。读数失败 ⇒ 跳过投影
+							// （与征询投影同口径：投影是增强面，不打断 detail 主腿）。
+							if allTasks, terr := f.repo.FindHistoryTasks(ctx, inst.ID); terr == nil {
+								if ap := engine.AidantBuildProjection(allTasks, task); ap != nil {
+									tExt["aidant"] = ap
 								}
 							}
 						}

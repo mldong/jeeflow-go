@@ -51,11 +51,12 @@ func TestNewActionsRideExecuteCode(t *testing.T) {
 		[]string{"wf:processTask:removeTaskActor"}, "哨兵 removeTaskActor")
 }
 
-// TestTableShapeMatchesJava 把两张表的条目数钉住（与 java OR_RULES 7 条／NO_PERM_ACTIONS 11 条对齐）。
+// TestTableShapeMatchesJava 把两张表的条目数钉住（与 java OR_RULES 8 条／NO_PERM_ACTIONS 11 条对齐）。
 // 这里刻意写死数字：它不是"会漂的读数"，而是跨栈契约的形状锚——加一条规则要八栈同批改。
+// issues/253 动态协办 processTask/aidant 复用 execute 码进 OR 表 ⇒ 7→8（本轮同批 +1）。
 func TestTableShapeMatchesJava(t *testing.T) {
-	if len(actionPermOrRules) != 7 {
-		t.Fatalf("OR 规则条数应为 7（对齐 java DefaultActionPermissionProvider），现读 %d", len(actionPermOrRules))
+	if len(actionPermOrRules) != 8 {
+		t.Fatalf("OR 规则条数应为 8（对齐 java DefaultActionPermissionProvider），现读 %d", len(actionPermOrRules))
 	}
 	if len(actionPermNoPerm) != 11 {
 		t.Fatalf("放行清单条数应为 11（含统计三条），现读 %d", len(actionPermNoPerm))

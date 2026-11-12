@@ -370,7 +370,10 @@ func (e *EngineImpl) execAddSignGate(ctx context.Context, flow *model.FlowModel,
 		}
 		// 走仓储读而不是聚合副本：与并行会签那一档"还有 doing 就停留"同一把尺子，
 		// 且并发腿里另一支刚建的新行只有读回值能看到。
-		return len(doing) == 0, nil
+		// issues/253：协办行（task_type=1）不算"兄弟待办"——它不驱动流程、不是接力链的一环，
+		// 算进来会让 waitCompletion=false 的主办在加签/征询节点上被协办行挡住推进（spec 04
+		// 「缺省 false 主办可随时推进」）。协办行的等待由 GateAidantWait 单独裁决。
+		return len(FilterOutAidant(doing)) == 0, nil
 	}
 
 	round := addSignRoundOf(task, nodeID) + 1
