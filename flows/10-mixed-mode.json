@@ -76,7 +76,7 @@
         "height": 50,
         "form": "review-form",
         "assignee": "reviewer",
-        "taskType": 1,
+        "taskType": 0,
         "performType": 0
       },
       "text": {

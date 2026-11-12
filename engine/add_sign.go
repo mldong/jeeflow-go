@@ -177,8 +177,22 @@ func parseAddSignMaxRounds(value interface{}, nodeID string) (int, error) {
 
 // ─── 解析期硬校验（规范 02 §4.3／spec 04 语义边界表末两行） ────────────────────
 
+// isSecondaryTaskType 节点级 taskType 协办档判定（规范 02 §4.4，issues/252）：本栈建单恒落
+// TaskType=0、没有 java 那枚 taskType codeOf 容错表，判定照 IsCountersign 同尺
+// （%v＋TrimSpace＋ToUpper，大小写不敏感）：1／"1"／"协办"／"SECONDARY" ⇒ 协办。
+// 其余值不算协办——维持既有静默回落主办（issues/245 口径，不扩成 fail-fast）。
+func isSecondaryTaskType(v interface{}) bool {
+	s := strings.ToUpper(strings.TrimSpace(fmt.Sprintf("%v", v)))
+	return s == "1" || s == "SECONDARY" || s == "协办"
+}
+
 // validateAddSignFlow 对流程模型里每个任务节点做解析期硬校验（java ModelParser.parse 尾部
 // 三段循环的合体，逐节点内层顺序照 java 的循环顺序：后加签两条 → 已办撤回两条 → 动态会签三条）：
+//
+//	前置判据（issues/252，规范 02 §4.4）：节点级 taskType=1（协办）⇒ 报错——协办档只由运行期
+//	processTask/aidant 派生（issues/253），snaker 原义下协办节点办结不驱动且跳转同闸，
+//	节点级配了就是流程悬挂陷阱；其余不可识别 taskType 值维持静默回落主办。
+//
 //  1. 三开关逐个解析——非法值报错，不得静默当缺省（java TaskParser 里 parseAllow/parseMaxRounds
 //     是**无条件**调的，所以"没开开关的节点配了脏值"同样要红，不能只在开关为 true 时校）；
 //  2. 会签节点（performType=1）配 allowAddSign ⇒ 报错：会签池内加人与会签之后加人是两种语义；
@@ -204,6 +218,11 @@ func (e *EngineImpl) validateAddSignFlow(flow *model.FlowModel) error {
 		node := &flow.Nodes[i]
 		if node.Type != model.TypeTask {
 			continue
+		}
+		// 节点级协办禁配（issues/252）：java 同判据在 TaskParser 读 taskType 处（先于各开关解析），
+		// 本栈解析期单点即本循环，故排在逐节点校验之首。
+		if isSecondaryTaskType(node.Properties["taskType"]) {
+			return fmt.Errorf("节点[%s]不允许配置协办任务类型（taskType=1）", node.ID)
 		}
 		allow, err := parseAllowAddSign(node.Properties[PropAllowAddSign], node.ID)
 		if err != nil {
