@@ -186,6 +186,36 @@ func isSecondaryTaskType(v interface{}) bool {
 	return s == "1" || s == "SECONDARY" || s == "协办"
 }
 
+// aidantBanError 节点级协办禁配逐字文案（issues/252 §5-1，规范 02 §4.4）：deploy 腿与
+// 运行期 validateAddSignFlow 共用单点，防文案漂移（跨栈统一文案表）。
+func aidantBanError(nodeID string) error {
+	return fmt.Errorf("节点[%s]不允许配置协办任务类型（taskType=1）", nodeID)
+}
+
+// ValidateAidantBan 部署/解析期节点级协办禁配（issues/253 复核修复，对齐 java
+// deploy→ModelParser.parse 内的 TaskParser 禁配刀）：门面 deploy/redeploy/designRedeploy
+// 腿在落库前调用，taskType 折值落 SECONDARY(1) 的任务节点一律报错、零写入——别只挂运行期
+// parse（python/node 隔离库 T2 暴露的同形缺口）。
+//
+// 只判协办这一档：其余不可识别 taskType 值维持静默回落主办（issues/252 §5-3，不扩 fail-fast）；
+// custom 节点（RECORD(2) 留痕）非 TypeTask，不经本判据（L2-34 不变量）。其余开关的解析期
+// 校验仍走运行期 validateAddSignFlow（与既有 246/247 测试断言位一致，本轮不扩面）。
+func (e *EngineImpl) ValidateAidantBan(flow *model.FlowModel) error {
+	if flow == nil {
+		return nil
+	}
+	for i := range flow.Nodes {
+		node := &flow.Nodes[i]
+		if node.Type != model.TypeTask {
+			continue
+		}
+		if isSecondaryTaskType(node.Properties["taskType"]) {
+			return aidantBanError(node.ID)
+		}
+	}
+	return nil
+}
+
 // validateAddSignFlow 对流程模型里每个任务节点做解析期硬校验（java ModelParser.parse 尾部
 // 三段循环的合体，逐节点内层顺序照 java 的循环顺序：后加签两条 → 已办撤回两条 → 动态会签三条）：
 //
@@ -220,9 +250,9 @@ func (e *EngineImpl) validateAddSignFlow(flow *model.FlowModel) error {
 			continue
 		}
 		// 节点级协办禁配（issues/252）：java 同判据在 TaskParser 读 taskType 处（先于各开关解析），
-		// 本栈解析期单点即本循环，故排在逐节点校验之首。
+		// 本栈解析期单点即本循环，故排在逐节点校验之首。文案与 deploy 腿共用 aidantBanError。
 		if isSecondaryTaskType(node.Properties["taskType"]) {
-			return fmt.Errorf("节点[%s]不允许配置协办任务类型（taskType=1）", node.ID)
+			return aidantBanError(node.ID)
 		}
 		allow, err := parseAllowAddSign(node.Properties[PropAllowAddSign], node.ID)
 		if err != nil {

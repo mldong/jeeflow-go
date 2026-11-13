@@ -314,6 +314,13 @@ func (f *Facade) deploy(ctx context.Context, args map[string]interface{}) (inter
 		// issues/139：对外 msg 为固定文案，原始异常只留在错误对象链（Unwrap），不进 msg
 		return nil, fixedMsgError(msgReadFlowDefineJSONFailed, err)
 	}
+	// issues/253 复核：deploy 解析期节点级协办禁配（对齐 java deploy→ModelParser.parse→TaskParser），
+	// 报错即零写入——别只挂运行期 parse（python/node 隔离库 T2 暴露的同形缺口）。
+	if f.engine != nil {
+		if err := f.engine.ValidateAidantBan(&flow); err != nil {
+			return nil, err
+		}
+	}
 	if flow.Name == "" {
 		return nil, errors.New("流程定义缺少 name")
 	}
@@ -354,6 +361,12 @@ func (f *Facade) redeploy(ctx context.Context, args map[string]interface{}) erro
 	if err := json.Unmarshal(content, &flow); err != nil {
 		// issues/139：对外 msg 为固定文案，原始异常只留在错误对象链（Unwrap），不进 msg
 		return fixedMsgError(msgReadFlowDefineJSONFailed, err)
+	}
+	// issues/253 复核：redeploy 解析期节点级协办禁配（对齐 java redeploy→ModelParser.parse），零写入。
+	if f.engine != nil {
+		if err := f.engine.ValidateAidantBan(&flow); err != nil {
+			return err
+		}
 	}
 	// audit8 R5/spec 06：redeploy 是原地替换内容——先读再写保留原 state/version（对齐 rust 参考实现）
 	def := &model.ProcessDefine{
@@ -922,6 +935,12 @@ func (f *Facade) designRedeploy(ctx context.Context, args map[string]interface{}
 	if err := json.Unmarshal(content, &flow); err != nil {
 		// issues/139：对外 msg 为固定文案，原始异常只留在错误对象链（Unwrap），不进 msg
 		return nil, fixedMsgError(msgReadFlowDefineJSONFailed, err)
+	}
+	// issues/253 复核：designRedeploy 解析期节点级协办禁配（对齐 java designRedeploy→ModelParser.parse），零写入。
+	if f.engine != nil {
+		if err := f.engine.ValidateAidantBan(&flow); err != nil {
+			return nil, err
+		}
 	}
 	if flow.Name == "" {
 		return nil, errors.New("流程定义缺少 name")

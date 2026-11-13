@@ -1123,22 +1123,82 @@ func TestAidantPermissionCodeRidesExecute(t *testing.T) {
 }
 
 // 节点级 taskType=1 仍解析期禁配（issues/252 不因本轮运行期派生而放宽）。
-// 判据落在**解析期**＝发起/执行时 parse 模型那一刀（java ModelParser.parse、本栈
-// validateAddSignFlow），deploy 只存内容不解析 ⇒ 断言点在 startAndExecute。
+// issues/253 复核修复：禁配必须在 **deploy 解析期**生效（对齐 java deploy→ModelParser.parse
+// →TaskParser 那一刀），报错即零写入。旧版本栈 deploy 只存内容不解析、禁配只挂运行期
+// startAndExecute（python/node 隔离库 T2 暴露的同形真缺口），现已把协办禁配单点挂进
+// deploy/redeploy/designRedeploy 三腿（engine.ValidateAidantBan）。
 func TestAidantNodeLevelSecondaryStillBanned(t *testing.T) {
 	fx := adSetup(t, "")
 	name := fmt.Sprintf("aidant_ban_%d", dcSeqAdd(1))
 	// review 节点的 taskType 由 0 改 1（只替换 review 那一处，apply 的 form 键不同名不会误伤）
 	content := strings.Replace(dcFlow(name, ""), `"form":"form-r","taskType":0`,
 		`"form":"form-r","taskType":1`, 1)
-	defID := dcDeploy(t, fx.f, name, content)
-	r := fx.f.Flow("processDefine/startAndExecute", map[string]interface{}{
-		"processDefineId": fmt.Sprintf("%d", defID), "operator": "applicant",
-	})
+	r := fx.f.Flow("processDefine/deploy", map[string]interface{}{"content": content, "operator": "system"})
 	if code, _ := r["code"].(int); code == 0 {
-		t.Fatalf("节点级协办配置必须解析期报错")
+		t.Fatalf("节点级协办配置必须 deploy 解析期报错")
 	}
 	if msg, _ := r["msg"].(string); !strings.Contains(msg, "不允许配置协办任务类型") {
 		t.Errorf("禁配文案不符，实得 %q", msg)
+	}
+	// 零写入：禁配报错则 getLastByName 查不到 define（出口 code≠0）
+	g := fx.f.Flow("processDefine/getLastByName", map[string]interface{}{"processDefineName": name})
+	if code, _ := g["code"].(int); code == 0 {
+		t.Errorf("禁配报错但落了 define 行（违零写入）: %v", g)
+	}
+}
+
+// issues/253 复核修复补覆盖：deploy 腿节点级协办禁配——折成 SECONDARY 的全部输入形
+// （1／"1"／"协办"／"SECONDARY" 大小写不敏感，照 java 三套）逐字报错＋零写入；
+// 回落形（0／"Major"／缺省／未知值 "Aidant"）仍部署成功（不扩 fail-fast，issues/252 §5-3）；
+// custom 记录节点（非 TypeTask）不经禁配判据、部署照常（RECORD 历史行不被误伤，L2-34 不变量）。
+func TestAidantDeployBanFormsAndFallback(t *testing.T) {
+	fx := adSetup(t, "")
+	const banMsg = "不允许配置协办任务类型（taskType=1）"
+	// 禁配五形（含大小写变体）：deploy 报错＋逐字文案＋零写入
+	for _, form := range []string{`1`, `"1"`, `"协办"`, `"SECONDARY"`, `"secondary"`} {
+		name := fmt.Sprintf("aidant_db_%d", dcSeqAdd(1))
+		content := strings.Replace(dcFlow(name, ""), `"form":"form-r","taskType":0`,
+			`"form":"form-r","taskType":`+form, 1)
+		r := fx.f.Flow("processDefine/deploy", map[string]interface{}{"content": content, "operator": "system"})
+		if code, _ := r["code"].(int); code == 0 {
+			t.Fatalf("禁配形 %s deploy 竟然成功（禁配没挂 deploy 腿）", form)
+		}
+		if msg, _ := r["msg"].(string); !strings.Contains(msg, banMsg) {
+			t.Errorf("禁配形 %s 文案不符，实得 %q", form, msg)
+		}
+		g := fx.f.Flow("processDefine/getLastByName", map[string]interface{}{"processDefineName": name})
+		if code, _ := g["code"].(int); code == 0 {
+			t.Errorf("禁配形 %s 报错但落了 define（违零写入）", form)
+		}
+	}
+	// 回落四形：0／"Major"／未知值 "Aidant"／缺省不写键 ⇒ 仍部署成功（串形折 0 回落主办）
+	for _, form := range []string{`0`, `"Major"`, `"Aidant"`, `__OMIT__`} {
+		name := fmt.Sprintf("aidant_df_%d", dcSeqAdd(1))
+		var content string
+		if form == `__OMIT__` {
+			content = strings.Replace(dcFlow(name, ""), `"form":"form-r","taskType":0`, `"form":"form-r"`, 1)
+		} else {
+			content = strings.Replace(dcFlow(name, ""), `"form":"form-r","taskType":0`,
+				`"form":"form-r","taskType":`+form, 1)
+		}
+		r := fx.f.Flow("processDefine/deploy", map[string]interface{}{"content": content, "operator": "system"})
+		if code, _ := r["code"].(int); code != 0 {
+			t.Errorf("回落形 %s deploy 失败（不应误拦，issues/252 §5-3）: %v", form, r)
+		}
+	}
+	// custom 记录节点（带 taskType:2 属性）不经协办禁配（非 TypeTask）⇒ 部署照常、不误伤 RECORD 行
+	cname := fmt.Sprintf("aidant_dc_%d", dcSeqAdd(1))
+	custom := `{"name":"` + cname + `","displayName":"custom 回归","type":"approval","nodes":[` +
+		`{"id":"start","type":"snaker:start","x":0,"y":0,"properties":{},"text":{"value":"开始"}},` +
+		`{"id":"apply","type":"snaker:task","x":0,"y":0,"properties":{"form":"apply-form","taskType":0,"performType":0,"assignee":"applicant"},"text":{"value":"发起申请"}},` +
+		`{"id":"rec1","type":"snaker:custom","x":0,"y":0,"properties":{"taskType":2,"clazz":"com.mldong.jeeflow.gate.NotRegistered142"},"text":{"value":"留痕"}},` +
+		`{"id":"end","type":"snaker:end","x":0,"y":0,"properties":{},"text":{"value":"结束"}}` +
+		`],"edges":[` +
+		`{"id":"e1","sourceNodeId":"start","targetNodeId":"apply","properties":{}},` +
+		`{"id":"e2","sourceNodeId":"apply","targetNodeId":"rec1","properties":{}},` +
+		`{"id":"e3","sourceNodeId":"rec1","targetNodeId":"end","properties":{}}]}`
+	rc := fx.f.Flow("processDefine/deploy", map[string]interface{}{"content": custom, "operator": "system"})
+	if code, _ := rc["code"].(int); code != 0 {
+		t.Errorf("custom 记录节点（taskType:2）部署被协办禁配误伤: %v", rc)
 	}
 }
