@@ -387,6 +387,14 @@ func (e *EngineImpl) aidantTaskInner(ctx context.Context, taskID int64, actorIds
 	if err := e.lockInstanceRow(ctx, host.ProcessInstanceID); err != nil {
 		return nil, err
 	}
+	// 锁内重读：先读后锁的窗口里主机行可能已被办结/废弃
+	if locked, lerr := e.repo.FindTaskByID(ctx, taskID); lerr != nil {
+		return nil, lerr
+	} else if locked == nil {
+		return nil, errors.New(MsgAidantTaskNotFound)
+	} else {
+		host = locked
+	}
 	// 禁递归：协办行携带派生参数 ⇒ 报错（spec 04 派生规则 4）
 	if IsAidantRow(host) {
 		return nil, errors.New(MsgAidantNoRecursion)

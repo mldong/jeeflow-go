@@ -634,13 +634,15 @@ func (e *EngineImpl) executeAndJumpToFirstTaskNodeInner(ctx context.Context, tas
 // "办理抄送只算 executeProcessTask 一条"，把钩子做成调用方注入而不是写死在公共序言里，
 // 覆盖面就钉在类型上：新加一条走 prepareExecuteTask 的动作默认不带 cc。
 func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, onTaskUpdated func(ctx context.Context, instanceID int64) error) (*model.ProcessTask, *model.ProcessInstance, *model.FlowModel, map[string]interface{}, error) {
+	// 实例级事务排他（spec 04 · 并发保护）：必须先锁**再读**任务状态——先读后锁的窗口里，
+	// 另一事务可能已办结同一行，锁内拿到的旧对象会被二次推进。taskID→instanceID 用一次只读定位。
+	if pre, err := e.repo.FindTaskByID(ctx, taskID); err == nil && pre != nil {
+		if err := e.lockInstanceRow(ctx, pre.ProcessInstanceID); err != nil {
+			return nil, nil, nil, nil, err
+		}
+	}
 	task, inst, err := e.loadAndCheck(ctx, taskID, operator)
 	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-	// 实例级事务排他（spec 04 · 并发保护）：人工办理与自动办理共用同一把锁，
-	// 数据库仓储以实例行锁实现；未实现的仓储退化为进程内互斥（既有 lockInstanceByTask）。
-	if err := e.lockInstanceRow(ctx, inst.ID); err != nil {
 		return nil, nil, nil, nil, err
 	}
 	// issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）

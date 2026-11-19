@@ -24,6 +24,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/mldong/jeeflow-go/model"
@@ -216,6 +217,14 @@ func (e *EngineImpl) CreateCollectMemberRows(ctx context.Context, flow *model.Fl
 	// 实例级事务排他（spec 04 · 并发保护）：征询成员建行与主办办结共用同一把锁
 	if err := e.lockInstanceRow(ctx, inst.ID); err != nil {
 		return nil, err
+	}
+	// 锁内重读主办行：先读后锁的窗口里主办可能已被办结（成员行只能挂在进行中的主办上）
+	if locked, lerr := e.repo.FindTaskByID(ctx, host.ID); lerr != nil {
+		return nil, lerr
+	} else if locked == nil || !locked.IsDoing() {
+		return nil, errors.New("主办任务已办结，不能继续征询")
+	} else {
+		host = locked
 	}
 	// 征询节点不可能是首任务节点（解析期已拦），沿用现成判据算，不写死 false——与后加签腿同形
 	isFirst := e.isFirstTaskNode(flow, node)

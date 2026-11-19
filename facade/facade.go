@@ -448,13 +448,14 @@ func (f *Facade) withdraw(ctx context.Context, args map[string]interface{}) erro
 	if operator == "" {
 		return errors.New("operator 必填")
 	}
+	// 实例级事务排他（spec 04 · 并发保护）：先锁再读，避免"读后锁前"被另一事务改写
+	// （撤回与人工/自动办理共用同一把锁）。
+	if err := f.engine.LockInstance(ctx, instanceID); err != nil {
+		return err
+	}
 	inst, err := f.repo.FindInstanceByID(ctx, instanceID)
 	if err != nil || inst == nil {
 		return errors.New("流程实例不存在")
-	}
-	// 实例级事务排他（spec 04 · 并发保护）：撤回与人工/自动办理共用同一把锁
-	if err := f.engine.LockInstance(ctx, instanceID); err != nil {
-		return err
 	}
 	// 撤回：全部 doing 任务置 Withdraw(30) + 实例置 30（v1.0.1：updateInstance 级联落库）
 	// 注意：FindInstanceByID 现水合 Tasks（issues/110），此处仍按实例单独查 doing 任务撤回，

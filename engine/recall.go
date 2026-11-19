@@ -167,6 +167,18 @@ func (e *EngineImpl) RecallTask(ctx context.Context, taskID int64, operator stri
 }
 
 func (e *EngineImpl) recallTaskInner(ctx context.Context, taskID int64, operator string) (*model.ProcessTask, error) {
+	// 先锁实例再读判据（spec 04 · 并发保护）：taskID→instanceID 先只读定位，
+	// 锁内重读目标行，避免"读后锁前"被另一事务改写（如人工刚办结/另一次撤回）。
+	pre, err := e.repo.FindTaskByID(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if pre == nil {
+		return nil, errors.New(MsgRecallNotFinished)
+	}
+	if err := e.lockInstanceRow(ctx, pre.ProcessInstanceID); err != nil {
+		return nil, err
+	}
 	// 判据 1：目标行存在且已办结
 	target, err := e.repo.FindTaskByID(ctx, taskID)
 	if err != nil {
@@ -180,11 +192,7 @@ func (e *EngineImpl) recallTaskInner(ctx context.Context, taskID int64, operator
 	if !privileged && !contains(target.ActorIDs, operator) {
 		return nil, errors.New(MsgRecallNoPermission)
 	}
-	// 判据 3/4：实例存在且 DOING
-	// 实例级事务排他（spec 04 · 并发保护）：撤回与人工/自动办理共用同一把锁
-	if err := e.lockInstanceRow(ctx, target.ProcessInstanceID); err != nil {
-		return nil, err
-	}
+	// 判据 3/4：实例存在且 DOING（实例行已在上面加锁）
 	inst, err := e.repo.FindInstanceByID(ctx, target.ProcessInstanceID)
 	if err != nil {
 		return nil, err
