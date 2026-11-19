@@ -18,7 +18,6 @@ import (
 	"context"
 	"log"
 	"strings"
-	"time"
 
 	"github.com/mldong/jeeflow-go/model"
 	"github.com/mldong/jeeflow-go/spi"
@@ -79,7 +78,7 @@ func (e *EngineImpl) applySurrogateToTask(ctx context.Context, nt *model.Process
 	if !e.SurrogateAutoApply() || e.surrogateRepo == nil || nt == nil || len(nt.ActorIDs) == 0 {
 		return false
 	}
-	now := time.Now()
+	now := e.now()
 	// 快照解析出的原始参与者：只对这批人各查一次委托，被委托人不再级联查自己的委托
 	// （A→B 且 B→C 不会把 C 也拉进来，与规范"每个 actor 查一次"一致，同时天然免疫环委托）
 	base := append([]string(nil), nt.ActorIDs...)
@@ -108,11 +107,20 @@ func (e *EngineImpl) applySurrogateToTask(ctx context.Context, nt *model.Process
 	return added
 }
 
-// saveNewTask 新任务落库唯一入口：先应用生效委托并入参与者，再 SaveTask。
-// 调用点（createTask / createTaskWithActors / 顺序会签推进）都已通过
-// inst.CreateTask(e.nextID(), …) 拿到非零 taskId，故并入的是将要真实落库的集合，
+// taskTimeMeta 建单时携带的时限动作上下文（spec 04 · 任务时限动作）：
+// node/inst 用于读节点四键与实例变量；actions=false 表示按规范不继承动作的行（协办/征询成员）。
+type taskTimeMeta struct {
+	node    *model.FlowNode
+	inst    *model.ProcessInstance
+	actions bool
+}
+
+// saveNewTask 新任务落库唯一入口：先应用生效委托并入参与者，再 SaveTask，
+// 最后在同事务内登记时限动作行（autoExecute/reminderTime）。
+// 调用点（createTask / createTaskWithActors / 顺序会签推进 / 加签/协办/征询/回退/撤回复活）
+// 都已通过 inst.CreateTask(e.nextID(), …) 拿到非零 taskId，故并入的是将要真实落库的集合，
 // 不存在"打在空 id 上静默无效"的时序坑。
-func (e *EngineImpl) saveNewTask(ctx context.Context, nt *model.ProcessTask, processName string) error {
+func (e *EngineImpl) saveNewTask(ctx context.Context, nt *model.ProcessTask, processName string, meta taskTimeMeta) error {
 	e.applySurrogateToTask(ctx, nt, processName)
 	if err := e.repo.SaveTask(ctx, nt); err != nil {
 		return err
@@ -120,7 +128,7 @@ func (e *EngineImpl) saveNewTask(ctx context.Context, nt *model.ProcessTask, pro
 	// audit8 R92（spec04 §完成任务）：唯一建单口＝执行族产出列表的唯一追加口
 	// （基准＝java exec.getProcessTaskList()，由建单处每次追加）。见 engine/new_tasks.go。
 	appendNewTask(ctx, nt)
-	return nil
+	return e.scheduleTimeActions(ctx, nt, meta.node, meta.inst, meta.actions)
 }
 
 // surrogateProcessName 委托查询用的流程名（规范 06 §4.5 条款 1.1）：**先 trim 再判空**

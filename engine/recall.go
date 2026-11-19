@@ -181,6 +181,10 @@ func (e *EngineImpl) recallTaskInner(ctx context.Context, taskID int64, operator
 		return nil, errors.New(MsgRecallNoPermission)
 	}
 	// 判据 3/4：实例存在且 DOING
+	// 实例级事务排他（spec 04 · 并发保护）：撤回与人工/自动办理共用同一把锁
+	if err := e.lockInstanceRow(ctx, target.ProcessInstanceID); err != nil {
+		return nil, err
+	}
 	inst, err := e.repo.FindInstanceByID(ctx, target.ProcessInstanceID)
 	if err != nil {
 		return nil, err
@@ -227,11 +231,15 @@ func (e *EngineImpl) recallTaskInner(ctx context.Context, taskID int64, operator
 		return nil, err
 	}
 	// ── 判据全过，以下才允许写 ──
-	now := time.Now()
+	now := e.now()
 	// 写 1：下游全部 DOING 行废弃（后加签/征询成员行、并行分支多支自然覆盖）
 	for _, t := range doingDescendants {
 		t.Abandon(now)
 		if err := e.repo.UpdateTask(ctx, t); err != nil {
+			return nil, err
+		}
+		// 废弃行不再有时限动作（spec 04 · 失效联动）
+		if err := e.cancelTaskTimeActions(ctx, t.ID); err != nil {
 			return nil, err
 		}
 		syncTaskToAggregate(inst, t)
@@ -244,9 +252,9 @@ func (e *EngineImpl) recallTaskInner(ctx context.Context, taskID int64, operator
 	roster := append([]string{}, target.ActorIDs...)
 	resurrected := inst.CreateTaskWithActors(e.nextID(), node.ID, target.DisplayName, roster,
 		operator, formKeyOf(node), now, parentID, e.isFirstTaskNode(&flow, node))
-	applyExpireTime(resurrected, expireExprOf(node), inst.Variables)
+	e.applyExpireTime(resurrected, expireExprOf(node), inst.Variables)
 	// 复活行走既有建单腿（saveNewTask：委托并入＋参与者落库＋产出列表），落库后 fire 码 3
-	if err := e.saveNewTask(ctx, resurrected, e.surrogateProcessName(ctx, &flow, inst)); err != nil {
+	if err := e.saveNewTask(ctx, resurrected, e.surrogateProcessName(ctx, &flow, inst), taskTimeMeta{node: node, inst: inst, actions: true}); err != nil {
 		return nil, err
 	}
 	e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: resurrected.ID,

@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/mldong/jeeflow-go/model"
 )
@@ -463,7 +462,7 @@ func (e *EngineImpl) createTaskAtNode(ctx context.Context, flow *model.FlowModel
 	inst *model.ProcessInstance, operator string, vars map[string]interface{}, parentTaskID int64,
 	scopes []branchScope, reapply map[string]interface{}) (*model.ProcessTask, error) {
 	actors := e.resolveActors(node, inst, operator, vars)
-	now := time.Now()
+	now := e.now()
 	form := formKeyOf(node)
 	expr := expireExprOf(node)
 	isFirst := e.isFirstTaskNode(flow, node)
@@ -475,7 +474,7 @@ func (e *EngineImpl) createTaskAtNode(ctx context.Context, flow *model.FlowModel
 	if len(actors) > 1 {
 		nt.ActorIDs = actors
 	}
-	applyExpireTime(nt, expr, inst.Variables)
+	e.applyExpireTime(nt, expr, inst.Variables)
 	if scopes == nil {
 		scopes = []branchScope{}
 	}
@@ -484,7 +483,7 @@ func (e *EngineImpl) createTaskAtNode(ctx context.Context, flow *model.FlowModel
 		putTaskVars(nt, map[string]interface{}{VarReapplyCtx: reapply})
 	}
 	pn := e.surrogateProcessName(ctx, flow, inst)
-	if err := e.saveNewTask(ctx, nt, pn); err != nil {
+	if err := e.saveNewTask(ctx, nt, pn, taskTimeMeta{node: node, inst: inst, actions: true}); err != nil {
 		return nil, err
 	}
 	e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID,

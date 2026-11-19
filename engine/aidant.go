@@ -307,7 +307,7 @@ func (e *EngineImpl) AbandonAidantOnNode(ctx context.Context, inst *model.Proces
 			byHost[p] = append(byHost[p], t)
 		}
 	}
-	now := time.Now()
+	now := e.now()
 	abandoned := 0
 	for _, p := range order {
 		rows := byHost[p]
@@ -383,6 +383,10 @@ func (e *EngineImpl) aidantTaskInner(ctx context.Context, taskID int64, actorIds
 	if host == nil {
 		return nil, errors.New(MsgAidantTaskNotFound)
 	}
+	// 实例级事务排他（spec 04 · 并发保护）：协办变更与人工/自动办理共用同一把锁
+	if err := e.lockInstanceRow(ctx, host.ProcessInstanceID); err != nil {
+		return nil, err
+	}
 	// 禁递归：协办行携带派生参数 ⇒ 报错（spec 04 派生规则 4）
 	if IsAidantRow(host) {
 		return nil, errors.New(MsgAidantNoRecursion)
@@ -446,7 +450,7 @@ func (e *EngineImpl) aidantTaskInner(ctx context.Context, taskID int64, actorIds
 		}
 	}
 	// ── 判据全过，以下才允许写 ──
-	now := time.Now()
+	now := e.now()
 	round := AidantLastRound(host) + 1
 	isFirst := e.isFirstTaskNode(&flow, node)
 	pn := e.surrogateProcessName(ctx, &flow, inst)
@@ -461,10 +465,10 @@ func (e *EngineImpl) aidantTaskInner(ctx context.Context, taskID int64, actorIds
 		if reason != "" {
 			putTaskVars(nt, map[string]interface{}{KeyAidantReason: reason})
 		}
-		applyExpireTime(nt, expr, inst.Variables)
+		e.applyExpireTime(nt, expr, inst.Variables)
 		// 分支归属与每一次普通建单同一条腿（照征询成员行）：并行范围内的协办行继承父任务归属
 		e.attachBranchCtx(&flow, inst, nt, node.ID, host.ID)
-		if err := e.saveNewTask(ctx, nt, pn); err != nil {
+		if err := e.saveNewTask(ctx, nt, pn, taskTimeMeta{node: node, inst: inst, actions: false}); err != nil {
 			return nil, err
 		}
 		e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID,

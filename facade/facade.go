@@ -452,6 +452,10 @@ func (f *Facade) withdraw(ctx context.Context, args map[string]interface{}) erro
 	if err != nil || inst == nil {
 		return errors.New("流程实例不存在")
 	}
+	// 实例级事务排他（spec 04 · 并发保护）：撤回与人工/自动办理共用同一把锁
+	if err := f.engine.LockInstance(ctx, instanceID); err != nil {
+		return err
+	}
 	// 撤回：全部 doing 任务置 Withdraw(30) + 实例置 30（v1.0.1：updateInstance 级联落库）
 	// 注意：FindInstanceByID 现水合 Tasks（issues/110），此处仍按实例单独查 doing 任务撤回，
 	// 且必须把聚合副本重置为仅被撤回项（见下方 inst.Tasks = doing），防级联回写多余任务
@@ -488,6 +492,10 @@ func (f *Facade) withdraw(ctx context.Context, args map[string]interface{}) erro
 	inst.UpdateUser = operator
 	inst.Tasks = doing
 	if err := f.repo.UpdateInstance(ctx, inst); err != nil {
+		return err
+	}
+	// 实例终态 ⇒ 取消该实例全部 pending 时限动作（spec 04 · 失效联动）
+	if err := f.engine.CancelInstanceTimeActions(ctx, instanceID); err != nil {
 		return err
 	}
 	// TASK_WITHDRAW(8) / spec §11.3 码 8：撤回把实例 state 写 30 **落库之后** fire，

@@ -112,9 +112,10 @@ type txKey struct{}
 
 // Repository 是 ProcessRepository 的 JDBC 实现。
 type Repository struct {
-	db      *sql.DB
-	idGen   spi.IDGenerator
-	phStyle string // "?" 原生 / "$n"（PostgreSQL）
+	db         *sql.DB
+	idGen      spi.IDGenerator
+	phStyle    string // "?" 原生 / "$n"（PostgreSQL）
+	driverName string // 驱动类型名（字符串匹配；LockInstance 判 SQLite 单写者用）
 	// statsClock 逾期判据的时间来源；nil ⇒ time.Now。
 	// issues/125：SQL 里的 NOW() 取的是**数据库会话时区**那把钟（一个 SET time_zone 就平移 8 小时），
 	// 而 expire_time 是引擎钟写进去的裸墙钟 ⇒ 两把钟。这里把 now 收回引擎侧，SQL 文本不再出现时间函数。
@@ -127,12 +128,31 @@ type Repository struct {
 // 需要自定义（如雪花）时用 NewWithIDGen。
 // 占位符风格按驱动自动检测（mysql → `?`；pgx 等 → `$n`）。
 func New(db *sql.DB) *Repository {
-	return &Repository{db: db, idGen: &tsIDGen{}, phStyle: detectPlaceholder(db)}
+	return &Repository{db: db, idGen: &tsIDGen{}, phStyle: detectPlaceholder(db), driverName: fmt.Sprintf("%T", db.Driver())}
 }
 
 // NewWithIDGen 构造仓储并注入 ID 生成器（占位符风格同样自动检测）。
 func NewWithIDGen(db *sql.DB, idGen spi.IDGenerator) *Repository {
-	return &Repository{db: db, idGen: idGen, phStyle: detectPlaceholder(db)}
+	return &Repository{db: db, idGen: idGen, phStyle: detectPlaceholder(db), driverName: fmt.Sprintf("%T", db.Driver())}
+}
+
+// LockInstance 实例级事务排他保护（spec 04 · 并发保护）：对实例行加 SELECT … FOR UPDATE，
+// 锁随最外层 COMMIT/ROLLBACK 释放。必须在 WithTx 内调用；无事务上下文时行锁随语句即释放，
+// 这里直接跳过（引擎侧此时只有进程内互斥，不得宣称跨进程保护）。SQLite 单写者，无需行锁。
+func (r *Repository) LockInstance(ctx context.Context, instanceID int64) error {
+	if instanceID == 0 || strings.Contains(r.driverName, "sqlite") {
+		return nil
+	}
+	if _, ok := ctx.Value(txKey{}).(*sql.Tx); !ok {
+		return nil
+	}
+	var id int64
+	err := r.conn(ctx).QueryRowContext(ctx,
+		r.ph("SELECT id FROM wf_process_instance WHERE id = ? FOR UPDATE"), instanceID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // 实例不存在由调用方既有判据报错，这里不新造失败面
+	}
+	return err
 }
 
 // statsNow 取统计判据用的"现在"（引擎进程钟）。默认 time.Now，测试可经 statsClock 注入固定值。

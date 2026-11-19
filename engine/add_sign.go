@@ -407,7 +407,7 @@ func (e *EngineImpl) execAddSignGate(ctx context.Context, flow *model.FlowModel,
 	}
 
 	round := addSignRoundOf(task, nodeID) + 1
-	now := time.Now()
+	now := e.now()
 	form := formKeyOf(node)
 	expr := expireExprOf(node)
 	isFirst := e.isFirstTaskNode(flow, node) // 加签节点不可能是首任务节点（解析期已拦），沿用现成判据算，不写死 false
@@ -418,17 +418,17 @@ func (e *EngineImpl) execAddSignGate(ctx context.Context, flow *model.FlowModel,
 		nt := inst.CreateTaskWithActors(e.nextID(), nodeID, node.Text.Value, []string{actor},
 			operator, form, now, task.ID, isFirst)
 		putTaskVars(nt, map[string]interface{}{prefixKey(VarAddSignRound, nodeID): round})
-		applyExpireTime(nt, expr, inst.Variables)
+		e.applyExpireTime(nt, expr, inst.Variables)
 		// 分支归属与每一次普通建单同一条腿：并行范围内的加签任务必须继承父任务归属，
 		// 否则汇合判据读不到这一支（缺省按父任务血缘＋模型静态范围推导）。
 		e.attachBranchCtx(flow, inst, nt, nodeID, task.ID)
-		if err := e.saveNewTask(ctx, nt, pn); err != nil {
+		if err := e.saveNewTask(ctx, nt, pn, taskTimeMeta{node: node, inst: inst, actions: true}); err != nil {
 			return false, err
 		}
 		e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID,
 			NodeID: nodeID, Operator: operator, Actors: nt.ActorIDs})
 	}
-	appendAddSignHistory(task, operator, ops, round, time.Now())
+	appendAddSignHistory(task, operator, ops, round, e.now())
 	// 账本写在已完成那条行上，而 prepareExecuteTask 已经把该行 update 过一次 ⇒ 必须再落一次，
 	// 否则内存测试绿、真库里那一格永远没有 history（issues/142 §6.2 第 1 条同族病灶）。
 	if err := e.repo.UpdateTask(ctx, task); err != nil {
@@ -530,10 +530,14 @@ func (e *EngineImpl) abandonAddSignOnNode(ctx context.Context, flow *model.FlowM
 	if err != nil {
 		return err
 	}
-	now := time.Now()
+	now := e.now()
 	for _, t := range remaining {
 		t.Abandon(now)
 		if err := e.repo.UpdateTask(ctx, t); err != nil {
+			return err
+		}
+		// 废弃行不再有时限动作（spec 04 · 失效联动）
+		if err := e.cancelTaskTimeActions(ctx, t.ID); err != nil {
 			return err
 		}
 		syncTaskToAggregate(inst, t)

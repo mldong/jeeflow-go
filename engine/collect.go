@@ -210,9 +210,13 @@ func collectAppendHistory(host *model.ProcessTask, entry map[string]interface{},
 func (e *EngineImpl) CreateCollectMemberRows(ctx context.Context, flow *model.FlowModel,
 	inst *model.ProcessInstance, node *model.FlowNode, host *model.ProcessTask,
 	operator string, ops []string, round int, reason string) ([]*model.ProcessTask, error) {
-	now := time.Now()
+	now := e.now()
 	form := formKeyOf(node)
 	expr := expireExprOf(node)
+	// 实例级事务排他（spec 04 · 并发保护）：征询成员建行与主办办结共用同一把锁
+	if err := e.lockInstanceRow(ctx, inst.ID); err != nil {
+		return nil, err
+	}
 	// 征询节点不可能是首任务节点（解析期已拦），沿用现成判据算，不写死 false——与后加签腿同形
 	isFirst := e.isFirstTaskNode(flow, node)
 	pn := e.surrogateProcessName(ctx, flow, inst)
@@ -224,11 +228,11 @@ func (e *EngineImpl) CreateCollectMemberRows(ctx context.Context, flow *model.Fl
 		if reason != "" {
 			putTaskVars(nt, map[string]interface{}{KeyAddSignReason: reason})
 		}
-		applyExpireTime(nt, expr, inst.Variables)
+		e.applyExpireTime(nt, expr, inst.Variables)
 		// 分支归属与每一次普通建单同一条腿（并行范围内的成员行必须继承父任务归属，
 		// 否则汇合判据读不到这一支）——照后加签建单腿。
 		e.attachBranchCtx(flow, inst, nt, node.ID, host.ID)
-		if err := e.saveNewTask(ctx, nt, pn); err != nil {
+		if err := e.saveNewTask(ctx, nt, pn, taskTimeMeta{node: node, inst: inst, actions: false}); err != nil {
 			return nil, err
 		}
 		e.fireEvent(ctx, ProcessEvent{Type: EventProcessTaskStart, InstanceID: inst.ID, TaskID: nt.ID,

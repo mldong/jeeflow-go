@@ -55,6 +55,11 @@ const (
 //   - Java 毫秒档只认 `Long`；Go 里 JSON 数字一律解成 float64 ⇒ 整数值（含 int/int64/整值 float64）
 //     同档处理，非整数值（Java 的 Double 档）按"类型不认识"落穿，与 Java 对 Double 的行为一致。
 func ProcessTime(expr string, args map[string]interface{}) *time.Time {
+	return ProcessTimeAt(expr, args, time.Now())
+}
+
+// ProcessTimeAt 同 ProcessTime，但相对档锚点由调用方给（引擎注入时钟用；测试可固定基准）。
+func ProcessTimeAt(expr string, args map[string]interface{}, now time.Time) *time.Time {
 	if strings.TrimSpace(expr) == "" {
 		return nil
 	}
@@ -80,7 +85,7 @@ func ProcessTime(expr string, args map[string]interface{}) *time.Time {
 		}
 	}
 	// ② 相对档
-	if t, ok := relativeTime(expr, time.Now()); ok {
+	if t, ok := relativeTime(expr, now); ok {
 		return &t
 	}
 	// ③ 绝对档
@@ -140,11 +145,11 @@ func relativeTime(expr string, base time.Time) (time.Time, bool) {
 //   - 建单三处（普通 / 串行会签首位 / 并行会签全员）＝**实例变量** inst.Variables
 //     （＝ Java this.variables ＝ boot2 的 execution.getArgs()）
 //   - 回退/跳转新建＝**随行拷贝那份变量**（＝ boot2 的 hisVariable）
-func applyExpireTime(task *model.ProcessTask, expr string, args map[string]interface{}) {
+func (e *EngineImpl) applyExpireTime(task *model.ProcessTask, expr string, args map[string]interface{}) {
 	if task == nil || strings.TrimSpace(expr) == "" {
 		return
 	}
-	task.ExpireTime = ProcessTime(expr, args)
+	task.ExpireTime = ProcessTimeAt(expr, args, e.now())
 }
 
 // applyInstanceExpireTime **实例级** expire_time 的写点（issues/137 A · 批二 §3-4，A 案：
@@ -177,11 +182,11 @@ func applyExpireTime(task *model.ProcessTask, expr string, args map[string]inter
 //
 // 求值器与任务级四处写点**共用同一个** ProcessTime（判据 5），档位顺序与语义一字未改；
 // owner 2026-09-28 口径「实例的处理方式和任务的差不多吧，算法一致」（issues/137 §状态行 A）。
-func applyInstanceExpireTime(inst *model.ProcessInstance, expr string, args map[string]interface{}) {
+func (e *EngineImpl) applyInstanceExpireTime(inst *model.ProcessInstance, expr string, args map[string]interface{}) {
 	if inst == nil || expr == "" {
 		return
 	}
-	inst.ExpireTime = ProcessTime(expr, args)
+	inst.ExpireTime = ProcessTimeAt(expr, args, e.now())
 }
 
 // expireExprOf 读任务节点上配的到期表达式；未配 / 配成 null ⇒ ""（走"保持 NULL"分支）。
