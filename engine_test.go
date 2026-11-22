@@ -1703,3 +1703,306 @@ func TestTaskRejectMutexAndTerminalState(t *testing.T) {
 		})
 	}
 }
+
+// ─── 表单指定用户 → 该用户所属部门经理／分管领导（参照 mldong-fastapi-wf fe9233d）────
+//
+// 语义契约＝执行卡 §3（docs/2026-11-22-form-user-assignment-handler-handoff.md）：
+//   - 注册名逐字等于 Java 顶级类 FQN，排序 70／80；
+//   - 字段查找四档并集：f_<nodeKey> → <nodeKey> → #右半（裸名→f_）→ _NN 去后缀（f_→裸名）；
+//   - 取人＝字段值里第一个非空用户 id → 该用户 deptId → 部门经理／分管领导；
+//   - 字段缺失／用户不存在／无部门／部门无领导／空白值 ⇒ 空结果、不抛异常。
+//
+// ⚠️ 夹具走**内联 JSON**（owner 2026-11-22 拍）：本仓 flows/ 是 java 编辑源的精确镜像，
+// 在这里放孤儿文件会被 flowsutil.resolver 删掉；往共享目录插号还会把八栈 demo 按文件名序
+// 赋的 defineId 整体后移一位（seed_business 明文「同表同值同序勿改」）。
+
+const (
+	fuEmpWithDept  = "empWithDept" // D01 → 经理 leader1,leader2／分管 boss1
+	fuEmpNoDept    = "empNoDept"   // deptId 为空
+	fuEmpEmptyDept = "empEmptyDept" // D99 → 该部门没配领导
+	fuEmpMissing   = "empMissing"  // UserProvider 查无此人
+)
+
+// fuUserProv 按 id 分档的用户桩：覆盖"有部门／无部门／部门无领导／用户不存在"四条失败腿
+type fuUserProv struct{}
+
+func (p *fuUserProv) GetUser(userID string) (*model.UserInfo, error) {
+	dept := ""
+	switch userID {
+	case fuEmpWithDept:
+		dept = "D01"
+	case fuEmpEmptyDept:
+		dept = "D99"
+	case fuEmpNoDept:
+		dept = ""
+	default:
+		return nil, nil
+	}
+	return &model.UserInfo{UserID: userID, RealName: "员工" + userID, DeptID: dept}, nil
+}
+
+// fuNode 一个任务节点：节点唯一编码 + 挂的 assignmentHandler 注册名
+type fuNode struct{ id, handler string }
+
+// fuFlowContent start → 逐节点线性 → end
+func fuFlowContent(name string, nodes ...fuNode) string {
+	nodesJSON := `{"id":"start","type":"snaker:start"},`
+	edges := []string{}
+	prev := "start"
+	for _, n := range nodes {
+		nodesJSON += fmt.Sprintf(`{"id":%q,"type":"snaker:task","properties":{"taskType":0,"performType":0,"assignmentHandler":%q}},`, n.id, n.handler)
+		edges = append(edges, fmt.Sprintf(`{"id":"e%d","sourceNodeId":%q,"targetNodeId":%q,"properties":{}}`, len(edges), prev, n.id))
+		prev = n.id
+	}
+	nodesJSON += `{"id":"end","type":"snaker:end"}`
+	edges = append(edges, fmt.Sprintf(`{"id":"e%d","sourceNodeId":%q,"targetNodeId":"end","properties":{}}`, len(edges), prev))
+	return fmt.Sprintf(`{"name":%q,"displayName":"表单指定用户取部门领导","type":"approval","nodes":[%s],"edges":[%s]}`,
+		name, nodesJSON, strings.Join(edges, ","))
+}
+
+func fuEngine() (*engine.EngineImpl, *memory.Repository) {
+	repo := memory.New()
+	reg := engine.NewHandlerRegistry()
+	engine.RegisterBuiltinAssignments(reg, &fuUserProv{}, &testOrgUserProv{})
+	eng := engine.New(repo, &fuUserProv{}, &testIDGen{}, &testExprEval{})
+	eng.SetRegistry(reg)
+	return eng, repo
+}
+
+func fuEq(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// fuStartActors 以 hr001 发起，返回节点 nodeID 那条待办的**持久参与者行**（不是聚合对象）
+func fuStartActors(t *testing.T, eng *engine.EngineImpl, repo *memory.Repository, defID int64,
+	nodeID string, vars map[string]interface{}) []string {
+	t.Helper()
+	inst, err := eng.StartProcessInstanceByID(context.Background(), defID, "hr001", vars)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, nil)
+	for _, tk := range doing {
+		if tk.TaskName == nodeID {
+			actors, err := repo.FindTaskActors(context.Background(), tk.ID)
+			if err != nil {
+				t.Fatalf("读参与者行失败: %v", err)
+			}
+			return actors
+		}
+	}
+	t.Fatalf("节点 %s 没有进行中待办（doing %d 条）", nodeID, len(doing))
+	return nil
+}
+
+// 正向①：四档查找各命中一次，两个 handler 各自取到经理／分管领导。
+func TestFormUserAssignmentHandlersPositive(t *testing.T) {
+	cases := []struct {
+		name    string
+		nodeID  string
+		vars    map[string]interface{}
+		handler string
+		want    []string
+	}{
+		{"f_前缀主通道", "managerAudit", map[string]interface{}{"f_managerAudit": fuEmpWithDept},
+			engine.HandlerFormUserDeptLeader, []string{"leader1", "leader2"}},
+		{"裸名回落", "mainAudit", map[string]interface{}{"mainAudit": fuEmpWithDept},
+			engine.HandlerFormUserDeptMainLeader, []string{"boss1"}},
+		{"#右半", "deptAudit#f_userId", map[string]interface{}{"f_userId": fuEmpWithDept},
+			engine.HandlerFormUserDeptLeader, []string{"leader1", "leader2"}},
+		{"#右半的f_变体", "deptAudit#userId", map[string]interface{}{"f_userId": fuEmpWithDept},
+			engine.HandlerFormUserDeptLeader, []string{"leader1", "leader2"}},
+		{"_NN去后缀的f_变体", "f_userId_02", map[string]interface{}{"f_userId": fuEmpWithDept},
+			engine.HandlerFormUserDeptMainLeader, []string{"boss1"}},
+		{"_NN去后缀只命中f_形", "userId_01", map[string]interface{}{"f_userId": fuEmpWithDept},
+			engine.HandlerFormUserDeptMainLeader, []string{"boss1"}},
+		{"裸名命中不带f_", "userId", map[string]interface{}{"userId": fuEmpWithDept},
+			engine.HandlerFormUserDeptLeader, []string{"leader1", "leader2"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			eng, repo := fuEngine()
+			def := registerFlowContent(repo, "fu-"+c.nodeID, fuFlowContent("fu-"+c.nodeID, fuNode{c.nodeID, c.handler}))
+			got := fuStartActors(t, eng, repo, def.ID, c.nodeID, c.vars)
+			if !fuEq(got, c.want) {
+				t.Fatalf("参与者 = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// 正向②：HR 代员工提交的完整链路——经理办完才轮到分管领导，两档都从同一表单用户取人。
+func TestFormUserAssignmentHrProxyFlow(t *testing.T) {
+	eng, repo := fuEngine()
+	const flowName = "fu-hr-proxy"
+	// 节点唯一编码用「#<字段>」约定（参照实现 docstring 推荐的写法）
+	const managerNode, mainNode = "managerAudit#f_userId", "mainAudit#f_userId"
+	def := registerFlowContent(repo, flowName, fuFlowContent(flowName,
+		fuNode{managerNode, engine.HandlerFormUserDeptLeader},
+		fuNode{mainNode, engine.HandlerFormUserDeptMainLeader}))
+
+	inst, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "hr001",
+		map[string]interface{}{"f_userId": fuEmpWithDept})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	// 两档都从同一个表单用户 fuEmpWithDept（D01）取人
+	actors := func(nodeID string) []string {
+		doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, []string{nodeID})
+		if len(doing) != 1 {
+			t.Fatalf("%s 应恰好一条待办，实得 %d", nodeID, len(doing))
+		}
+		got, _ := repo.FindTaskActors(context.Background(), doing[0].ID)
+		return got
+	}
+	if got := actors(managerNode); !fuEq(got, []string{"leader1", "leader2"}) {
+		t.Fatalf("经理档参与者 = %q, want [leader1 leader2]", got)
+	}
+
+	doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, []string{managerNode})
+	repo.AddTaskActor(context.Background(), doing[0].ID, []string{"leader1"})
+	if _, err := eng.ExecuteProcessTask(context.Background(), doing[0].ID, "leader1", nil); err != nil {
+		t.Fatalf("经理办结: %v", err)
+	}
+	if got := actors(mainNode); !fuEq(got, []string{"boss1"}) {
+		t.Fatalf("分管档参与者 = %q, want [boss1]", got)
+	}
+
+	doing, _ = repo.FindDoingTasks(context.Background(), inst.ID, []string{mainNode})
+	repo.AddTaskActor(context.Background(), doing[0].ID, []string{"boss1"})
+	if _, err := eng.ExecuteProcessTask(context.Background(), doing[0].ID, "boss1", nil); err != nil {
+		t.Fatalf("分管办结: %v", err)
+	}
+	updated, _ := repo.FindInstanceByID(context.Background(), inst.ID)
+	if updated.State != model.InstanceStateDone {
+		t.Fatalf("两档办结后实例应已完成，实得 %v", updated.State)
+	}
+}
+
+// 负向：六个坏输入形状一律空结果，且待办行照建、实例仍进行中、不 panic。
+func TestFormUserAssignmentHandlersNegative(t *testing.T) {
+	cases := []struct {
+		name string
+		vars map[string]interface{}
+	}{
+		{"无字段", nil},
+		{"字段值为空串", map[string]interface{}{"f_managerAudit": ""}},
+		{"字段值纯空白", map[string]interface{}{"f_managerAudit": "   "}},
+		{"字段值 nil", map[string]interface{}{"f_managerAudit": nil}},
+		{"用户不存在", map[string]interface{}{"f_managerAudit": fuEmpMissing}},
+		{"用户无部门", map[string]interface{}{"f_managerAudit": fuEmpNoDept}},
+		{"部门无领导", map[string]interface{}{"f_managerAudit": fuEmpEmptyDept}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			eng, repo := fuEngine()
+			const flowName = "fu-negative"
+			def := registerFlowContent(repo, flowName, fuFlowContent(flowName,
+				fuNode{"managerAudit", engine.HandlerFormUserDeptLeader},
+				fuNode{"mainAudit", engine.HandlerFormUserDeptMainLeader}))
+			inst, err := eng.StartProcessInstanceByID(context.Background(), def.ID, "hr001", c.vars)
+			if err != nil {
+				t.Fatalf("start: %v", err)
+			}
+			// 空结果不等于不建单：待办行照建、参与者为空、实例仍 state=10（issues/142 不变量）
+			doing, _ := repo.FindDoingTasks(context.Background(), inst.ID, []string{"managerAudit"})
+			if len(doing) != 1 {
+				t.Fatalf("应恰好一条经理待办，实得 %d", len(doing))
+			}
+			actors, _ := repo.FindTaskActors(context.Background(), doing[0].ID)
+			if len(actors) != 0 {
+				t.Fatalf("坏输入应空参与者，实得 %q", actors)
+			}
+			if inst.State != model.InstanceStateDoing {
+				t.Fatalf("实例应停在 state=10，实得 %v", inst.State)
+			}
+		})
+	}
+}
+
+// 优先级：f_ 形与裸名同时存在时 **f_ 形先赢**（第一档），其余档只在前面全落空时才试。
+func TestFormUserAssignmentPrefersFPrefix(t *testing.T) {
+	eng, repo := fuEngine()
+	const flowName = "fu-f-prefix-priority"
+	def := registerFlowContent(repo, flowName, fuFlowContent(flowName,
+		fuNode{"prio", engine.HandlerFormUserDeptLeader}))
+	// f_prio 指向"部门无领导"的员工，裸名 prio 指向有领导的员工 ⇒ 取 f_prio ⇒ 空
+	if got := fuStartActors(t, eng, repo, def.ID, "prio",
+		map[string]interface{}{"f_prio": fuEmpEmptyDept, "prio": fuEmpWithDept}); len(got) != 0 {
+		t.Fatalf("f_ 形必须优先于裸名（实得 %q，说明第一档没生效）", got)
+	}
+}
+
+// 边界：字段是逗号串／数组时只取**第一个**非空 id（多值语义不在本轮承诺，卡 §3.4）。
+func TestFormUserAssignmentTakesFirstIdOnly(t *testing.T) {
+	eng, repo := fuEngine()
+	const flowName = "fu-first-only"
+	def := registerFlowContent(repo, flowName, fuFlowContent(flowName,
+		fuNode{"managerAudit", engine.HandlerFormUserDeptLeader}))
+	// 第一个 id 有效 ⇒ 取它的部门领导；后面的 empMissing 不该参与取数
+	if got := fuStartActors(t, eng, repo, def.ID, "managerAudit",
+		map[string]interface{}{"f_managerAudit": fuEmpWithDept + "," + fuEmpMissing}); !fuEq(got, []string{"leader1", "leader2"}) {
+		t.Fatalf("逗号串只取第一个 id，实得 %q", got)
+	}
+	// 数组同理
+	if got := fuStartActors(t, eng, repo, def.ID, "managerAudit",
+		map[string]interface{}{"f_managerAudit": []interface{}{fuEmpEmptyDept, fuEmpWithDept}}); len(got) != 0 {
+		t.Fatalf("数组取第一个元素（该部门无领导）应为空，实得 %q", got)
+	}
+	// 前导空白元素被跳过：第一个**非空** id 才是取人依据
+	if got := fuStartActors(t, eng, repo, def.ID, "managerAudit",
+		map[string]interface{}{"f_managerAudit": []string{"  ", fuEmpWithDept}}); !fuEq(got, []string{"leader1", "leader2"}) {
+		t.Fatalf("应跳过空白元素取到 leader1,leader2，实得 %q", got)
+	}
+}
+
+// 回归：并集查找只落在两个新类上——现存 handler 的查找/取人行为一字未改。
+func TestFormUserAssignmentDoesNotChangeExistingHandlers(t *testing.T) {
+	eng, repo := fuEngine()
+	const flowName = "fu-regression-formfield"
+	// ① FormFieldAssigneeHandler 仍不认 # 右半（老类走 findFieldValue，没有 # 档）
+	def := registerFlowContent(repo, flowName, fuFlowContent(flowName,
+		fuNode{"audit#f_userId", engine.HandlerFormFieldAssignee}))
+	if got := fuStartActors(t, eng, repo, def.ID, "audit#f_userId",
+		map[string]interface{}{"f_userId": "userA,userB"}); len(got) != 0 {
+		t.Fatalf("FormFieldAssignee 不得因为本轮补了 # 档而改变行为，实得 %q", got)
+	}
+
+	// ② DeptLeaderAssignmentHandler 仍按**操作人**取人：表单里指一个查无此人，也不许改读表单字段
+	eng2, repo2 := fuEngine()
+	const flowName2 = "fu-regression-deptleader"
+	def2 := registerFlowContent(repo2, flowName2, fuFlowContent(flowName2,
+		fuNode{"deptLeaderNode", engine.HandlerDeptLeader}))
+	inst2, err := eng2.StartProcessInstanceByID(context.Background(), def2.ID, fuEmpWithDept,
+		map[string]interface{}{"f_deptLeaderNode": fuEmpMissing})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	doing2, _ := repo2.FindDoingTasks(context.Background(), inst2.ID, []string{"deptLeaderNode"})
+	if len(doing2) != 1 {
+		t.Fatalf("应恰好一条待办，实得 %d", len(doing2))
+	}
+	actors2, _ := repo2.FindTaskActors(context.Background(), doing2[0].ID)
+	if !fuEq(actors2, []string{"leader1", "leader2"}) {
+		t.Fatalf("DeptLeader 必须仍按 operator（empWithDept→D01）取人，实得 %q", actors2)
+	}
+}
+
+// 注册表腿：两个新注册名可被按名解析（跨语言流程 JSON 用的就是这串 Java FQN）
+func TestFormUserAssignmentNamesResolvable(t *testing.T) {
+	reg := engine.NewHandlerRegistry()
+	engine.RegisterBuiltinAssignments(reg, &fuUserProv{}, &testOrgUserProv{})
+	for _, name := range []string{engine.HandlerFormUserDeptLeader, engine.HandlerFormUserDeptMainLeader} {
+		if reg.ResolveAssignment(name) == nil {
+			t.Fatalf("注册名 %s 解析不到处理器", name)
+		}
+	}
+}

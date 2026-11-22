@@ -32,6 +32,10 @@ const (
 	HandlerApplicantDeptMainLeader = orgHandlersPrefix + "ApplicantDeptMainLeaderAssignmentHandler"
 	// TaskRoleAssigneeHandler 任务节点唯一编码关联角色
 	HandlerTaskRoleAssignee = orgHandlersPrefix + "TaskRoleAssigneeHandler"
+	// FormUserDeptLeaderAssignmentHandler 表单指定用户所属部门经理（顶级类，注册名逐字等于 Java FQN）
+	HandlerFormUserDeptLeader = "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler"
+	// FormUserDeptMainLeaderAssignmentHandler 表单指定用户所属部门分管领导（顶级类）
+	HandlerFormUserDeptMainLeader = "com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler"
 )
 
 // 表单字段编号后缀正则（task_01 → task）
@@ -153,6 +157,39 @@ func (h *TaskRoleAssigneeHandler) Assign(node *model.FlowNode, inst *model.Proce
 	return nil
 }
 
+// ─── 表单指定用户 → 该用户所属部门领导 ──────────────────────────────────────────
+//
+// 场景（参照 mldong-fastapi-wf 提交 fe9233d）：HR 代员工提交、代理申请——表单里给出被代理人的
+// 用户 id，取**该员工**所属部门的经理／分管领导，与当前操作人无关。
+// 字段查找走 [findFormUserFieldValue] 的四档并集，取人走 §3.3（user → dept → leader）。
+
+// FormUserDeptLeaderAssignmentHandler 表单指定用户所属部门的经理
+type FormUserDeptLeaderAssignmentHandler struct{ orgBase }
+
+func (h *FormUserDeptLeaderAssignmentHandler) Assign(node *model.FlowNode, inst *model.ProcessInstance, operator string) []string {
+	return h.byFormUser(node, inst, false)
+}
+
+// FormUserDeptMainLeaderAssignmentHandler 表单指定用户所属部门的分管领导
+type FormUserDeptMainLeaderAssignmentHandler struct{ orgBase }
+
+func (h *FormUserDeptMainLeaderAssignmentHandler) Assign(node *model.FlowNode, inst *model.ProcessInstance, operator string) []string {
+	return h.byFormUser(node, inst, true)
+}
+
+// byFormUser 表单字段 → 用户 id → 该用户部门 → 领导（main=true 分管领导）。
+// 字段缺失／值为空／用户不存在／无部门／部门无领导 ⇒ 空结果，不报错（与现存 handler 同形）。
+func (b *orgBase) byFormUser(node *model.FlowNode, inst *model.ProcessInstance, main bool) []string {
+	if node == nil || inst == nil {
+		return nil
+	}
+	userID := firstFormUserId(findFormUserFieldValue(inst.Variables, node.ID))
+	if userID == "" {
+		return nil
+	}
+	return b.byDept(b.deptIdOf(userID), main)
+}
+
 // ─── 注册 ───────────────────────────────────────────────────────────────────────
 
 // RegisterBuiltinAssignments 注册内置通用参与者处理器到注册表。
@@ -166,6 +203,8 @@ func RegisterBuiltinAssignments(reg *HandlerRegistry, userProv spi.UserProvider,
 	reg.RegisterAssignment(HandlerApplicantDeptLeader, &ApplicantDeptLeaderAssignmentHandler{orgBase: base})
 	reg.RegisterAssignment(HandlerApplicantDeptMainLeader, &ApplicantDeptMainLeaderAssignmentHandler{orgBase: base})
 	reg.RegisterAssignment(HandlerTaskRoleAssignee, &TaskRoleAssigneeHandler{orgProv: orgProv})
+	reg.RegisterAssignment(HandlerFormUserDeptLeader, &FormUserDeptLeaderAssignmentHandler{orgBase: base})
+	reg.RegisterAssignment(HandlerFormUserDeptMainLeader, &FormUserDeptMainLeaderAssignmentHandler{orgBase: base})
 }
 
 // ─── 工具 ───────────────────────────────────────────────────────────────────────
@@ -188,6 +227,73 @@ func findFieldValue(vars map[string]interface{}, fieldName string) interface{} {
 		}
 	}
 	return nil
+}
+
+// findFormUserFieldValue 「表单指定用户」两个 handler 专用查找（四档并集，顺序即优先级）：
+//  1. f_<nodeKey>
+//  2. <nodeKey>
+//  3. nodeKey 含 # 时取最后一个 # 之后的 field：先 <field>、再 f_<field>
+//  4. nodeKey 匹配 ^(.+?)_(\d+)$ 时取 base：先 f_<base>、再 <base>
+//
+// 与 [findFieldValue] 的差别只在 3、4 两档补了 f_ 变体（参照实现 mldong-fastapi-wf 没有 f_ 分支，
+// jeeflow 家族变量存 f_ 必须有）。**现存 7 个 handler 仍走 findFieldValue，本函数不改它们的行为。**
+func findFormUserFieldValue(vars map[string]interface{}, nodeKey string) interface{} {
+	if vars == nil || nodeKey == "" {
+		return nil
+	}
+	if v, ok := vars["f_"+nodeKey]; ok {
+		return v
+	}
+	if v, ok := vars[nodeKey]; ok {
+		return v
+	}
+	if i := strings.LastIndex(nodeKey, "#"); i >= 0 {
+		field := nodeKey[i+1:]
+		if v, ok := vars[field]; ok {
+			return v
+		}
+		if v, ok := vars["f_"+field]; ok {
+			return v
+		}
+	}
+	// ⚠️ 判据是 len(m) >= 2：numberSuffixPattern 有两个捕获组，命中时 FindStringSubmatch
+	// 返回「整串 + 两组」＝3 段，写成 == 2 会让这一档永远不生效（老 findFieldValue 里就是这么死的）。
+	if m := numberSuffixPattern.FindStringSubmatch(nodeKey); len(m) >= 2 {
+		if v, ok := vars["f_"+m[1]]; ok {
+			return v
+		}
+		if v, ok := vars[m[1]]; ok {
+			return v
+		}
+	}
+	return nil
+}
+
+// firstFormUserId 从字段值里取**第一个**非空用户 id（逗号串／数组同样只取第一个，多值语义不在本轮承诺）。
+// ⚠️ 判空一律 trim 后比空串，"0" 是合法 id（与 [spi.NormalizeActors] 同一反向哨兵）。
+func firstFormUserId(v interface{}) string {
+	switch t := v.(type) {
+	case []string:
+		for _, s := range t {
+			if id := strings.TrimSpace(s); id != "" {
+				return id
+			}
+		}
+		return ""
+	case []interface{}:
+		for _, s := range t {
+			if id := strings.TrimSpace(toString(s)); id != "" {
+				return id
+			}
+		}
+		return ""
+	}
+	for _, s := range strings.Split(toString(v), ",") {
+		if id := strings.TrimSpace(s); id != "" {
+			return id
+		}
+	}
+	return ""
 }
 
 // addTokens 收集字段值到参与者列表（字符串按逗号分隔、集合逐个展开）
