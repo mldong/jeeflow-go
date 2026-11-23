@@ -220,8 +220,10 @@ func findFieldValue(vars map[string]interface{}, fieldName string) interface{} {
 		return v
 	}
 	// 3) _NN 后缀匹配（task_01 → task，仅查裸名）
+	// ⚠️ 判据是 len(m) >= 2 而不是 == 2：numberSuffixPattern 有两个捕获组，命中时
+	// FindStringSubmatch 返回「整串 + 两组」＝3 段。issues/255 之前这里写 == 2，这一档从写下起就没生效过。
 	m := numberSuffixPattern.FindStringSubmatch(fieldName)
-	if len(m) == 2 {
+	if len(m) >= 2 {
 		if v, ok := vars[m[1]]; ok {
 			return v
 		}
@@ -257,7 +259,7 @@ func findFormUserFieldValue(vars map[string]interface{}, nodeKey string) interfa
 		}
 	}
 	// ⚠️ 判据是 len(m) >= 2：numberSuffixPattern 有两个捕获组，命中时 FindStringSubmatch
-	// 返回「整串 + 两组」＝3 段，写成 == 2 会让这一档永远不生效（老 findFieldValue 里就是这么死的）。
+	// 返回「整串 + 两组」＝3 段，写成 == 2 会让这一档永远不生效（老 findFieldValue 在 issues/255 之前就是这么死的）。
 	if m := numberSuffixPattern.FindStringSubmatch(nodeKey); len(m) >= 2 {
 		if v, ok := vars["f_"+m[1]]; ok {
 			return v
