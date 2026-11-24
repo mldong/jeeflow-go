@@ -2,7 +2,7 @@
 //
 // 集成方只实现一个转发 controller/endpoint：把 body JSON 转成 map 传入 Flow，
 // 所有流程能力按 action（boot2/boot3 端点短名）路由。返回统一结构 {code, msg, data}
-// （code=0 成功 / 99999999 失败）。
+// （code=0 成功 / 99999999 通用失败；引擎具名业务错误保留其 code，如子流程定义缺失 20010002）。
 //
 // 操作人约定：门面不感知登录态，args["operator"] 显式传入。
 //
@@ -121,6 +121,11 @@ func (f *Facade) Flow(action string, args map[string]interface{}) (r map[string]
 		return derr
 	})
 	if err != nil {
+		// issues/257：子流程定义缺失是带业务码的契约错误，不能被通用失败信封压成 99999999。
+		var subErr *engine.SubProcessDefineNotFoundError
+		if errors.As(err, &subErr) {
+			return errorResultWithCode(subErr.Code(), subErr.Error())
+		}
 		// issues/137 §3-1（spec 06-facade.md §2.12）：门面是所有内部 error 的共性通道，
 		// 但"捕获到 ≠ 原文外透"。判别式（isForeignDetail，见 internal_failure.go）判
 		// 「这段文案是谁写的」：引擎自己写的契约文案逐字透出（八栈＋十三壳＋前端 toast 都按原文对齐，
@@ -2492,7 +2497,11 @@ func stringifyIDs(v interface{}) interface{} {
 }
 
 func errorResult(msg string) map[string]interface{} {
-	return map[string]interface{}{"code": 99999999, "msg": msg}
+	return errorResultWithCode(99999999, msg)
+}
+
+func errorResultWithCode(code int, msg string) map[string]interface{} {
+	return map[string]interface{}{"code": code, "msg": msg}
 }
 
 // msgReadFlowDefineJSONFailed 流程定义 JSON 解析失败的**逐字固定**对外文案（issues/139）。
@@ -2888,7 +2897,7 @@ func defineRowToMap(r *model.DefineRow) map[string]interface{} {
 }
 
 // nullOut 把分页行 DTO 的可空字符串列（*string）投成出口值：nil → JSON null，
-// 有值 → 原串（与改动前逐字节一致）。遵 spec 06 §2.4「可空列合法出口为 null/缺键，'' 违规」，
+// 有值 → 原串（与改动前逐字节一致）。遵 spec 06 §2.4「可空列合法出口为 null/缺键，” 违规」，
 // 绝不把 SQL NULL 伪造成空串或 Go 零值串化（"<nil>"）（issues/141 G3）。
 func nullOut(p *string) interface{} {
 	if p == nil {
@@ -2966,7 +2975,7 @@ func taskRowToMap(r *model.TaskRow) map[string]interface{} {
 		"instanceCreateTime": fmtTimeV(r.InstanceCreateTime),
 		// issues/250：所属实例的状态（整数或 null）——待办/已办共用本转换，两个列表都带。
 		"instanceState": r.InstanceState,
-		"ext":                ext, "instanceExt": instanceExt, "version": r.DefineVersion,
+		"ext":           ext, "instanceExt": instanceExt, "version": r.DefineVersion,
 		"taskFormData": formDataOf(r.Variables, "tf_"), // issues/15
 	}
 	if hasRecall {

@@ -1,7 +1,13 @@
 // Package model 域类型定义——对标 Java 版 domain + model 包
 package model
 
-import "time"
+import (
+	"encoding/json"
+	"math"
+	"strconv"
+	"strings"
+	"time"
+)
 
 // ─── Flow Model (LogicFlow JSON) ──────────────────────────────────────────────
 
@@ -45,14 +51,134 @@ type FlowEdge struct {
 // ─── Node Type Constants ──────────────────────────────────────────────────────
 
 const (
-	TypeStart    = "snaker:start"
-	TypeEnd      = "snaker:end"
-	TypeTask     = "snaker:task"
-	TypeDecision = "snaker:decision"
-	TypeFork     = "snaker:fork"
-	TypeJoin     = "snaker:join"
-	TypeCustom   = "snaker:custom"
+	TypeStart      = "snaker:start"
+	TypeEnd        = "snaker:end"
+	TypeTask       = "snaker:task"
+	TypeDecision   = "snaker:decision"
+	TypeFork       = "snaker:fork"
+	TypeJoin       = "snaker:join"
+	TypeCustom     = "snaker:custom"
+	TypeSubProcess = "snaker:subProcess"
 )
+
+// IsSubProcessType 子流程节点的历史类型别名。设计器存量定义使用驼峰与裸小写，
+// 三者归一到同一执行档；id/name 仍只作图内标识与回父定位键。
+func IsSubProcessType(t string) bool {
+	switch t {
+	case TypeSubProcess, "subProcess", "subprocess", "wfSubProcess", "snaker:subprocess", "snaker:wfSubProcess":
+		return true
+	default:
+		return false
+	}
+}
+
+// SubProcessModel 子流程节点契约（issues/257）。Go 的 FlowModel 没有独立 parser 阶段，
+// 该模型在执行入口按 FlowNode 解析，字段与 Java WfSubProcessParser 对齐。
+type SubProcessModel struct {
+	ID          string
+	ProcessName string
+	Version     *int
+	Form        string
+}
+
+func ParseSubProcessModel(node *FlowNode) *SubProcessModel {
+	if node == nil || !IsSubProcessType(node.Type) {
+		return nil
+	}
+	props := node.Properties
+	if props == nil {
+		return &SubProcessModel{ID: node.ID, ProcessName: node.ID}
+	}
+	processName := subProcessStringProp(props, "processName")
+	if strings.TrimSpace(processName) == "" {
+		processName = subProcessStringProp(props, "name")
+	}
+	if strings.TrimSpace(processName) == "" {
+		processName = node.ID
+	}
+	model := &SubProcessModel{ID: node.ID, ProcessName: processName, Form: subProcessStringProp(props, "form")}
+	if v, ok := props["version"]; ok && v != nil {
+		model.Version = subProcessVersion(v)
+	}
+	return model
+}
+
+// subProcessVersion 保留显式版本意图；非法、非整数或超出本机 int 范围的值统一为 -1，
+// 绝不能静默截断/回落成 0 而误启另一版定义。nil/缺省才表示取最新版。
+func subProcessVersion(v interface{}) *int {
+	version := -1
+	switch n := v.(type) {
+	case int:
+		version = n
+	case int8:
+		version = subProcessInt64Version(int64(n))
+	case int16:
+		version = subProcessInt64Version(int64(n))
+	case int32:
+		version = subProcessInt64Version(int64(n))
+	case int64:
+		version = subProcessInt64Version(n)
+	case uint:
+		if uint64(n) <= uint64(^uint(0)>>1) {
+			version = int(n)
+		}
+	case uint8:
+		version = int(n)
+	case uint16:
+		version = int(n)
+	case uint32:
+		if uint64(n) <= uint64(^uint(0)>>1) {
+			version = int(n)
+		}
+	case uint64:
+		if n <= uint64(^uint(0)>>1) {
+			version = int(n)
+		}
+	case float32:
+		version = subProcessFloatVersion(float64(n))
+	case float64:
+		version = subProcessFloatVersion(n)
+	case json.Number:
+		if parsed, err := n.Int64(); err == nil {
+			version = subProcessInt64Version(parsed)
+		} else if parsed, err := n.Float64(); err == nil {
+			version = subProcessFloatVersion(parsed)
+		}
+	case string:
+		if parsed, err := strconv.ParseInt(strings.TrimSpace(n), 10, strconv.IntSize); err == nil {
+			version = subProcessInt64Version(parsed)
+		}
+	}
+	return &version
+}
+
+func subProcessInt64Version(n int64) int {
+	converted := int(n)
+	if int64(converted) != n {
+		return -1
+	}
+	return converted
+}
+
+func subProcessFloatVersion(n float64) int {
+	if math.IsNaN(n) || math.IsInf(n, 0) {
+		return -1
+	}
+	// 先按十进制原值解析，避开 float64→int 的越界实现定义与 2^63 舍入边界。
+	parsed, err := strconv.ParseInt(strconv.FormatFloat(n, 'f', -1, 64), 10, strconv.IntSize)
+	if err != nil {
+		return -1
+	}
+	return subProcessInt64Version(parsed)
+}
+
+func subProcessStringProp(props map[string]interface{}, key string) string {
+	v, ok := props[key].(string)
+	if !ok {
+		return ""
+	}
+	return v
+}
 
 // ─── Domain Types ─────────────────────────────────────────────────────────────
 

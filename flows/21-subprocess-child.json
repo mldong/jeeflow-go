@@ -1,0 +1,58 @@
+{
+  "name": "subprocess-child",
+  "displayName": "父子流程-子",
+  "type": "approval",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "snaker:start",
+      "x": 100,
+      "y": 200,
+      "properties": { "width": 50, "height": 50 },
+      "text": { "value": "开始" }
+    },
+    {
+      "id": "apply",
+      "type": "snaker:task",
+      "x": 220,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "child-apply-form",
+        "assignee": "applicant",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": { "value": "子流程申请" }
+    },
+    {
+      "id": "childReview",
+      "type": "snaker:task",
+      "x": 380,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "child-review-form",
+        "assignee": "leader",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": { "value": "子流程审批" }
+    },
+    {
+      "id": "end",
+      "type": "snaker:end",
+      "x": 540,
+      "y": 200,
+      "properties": { "width": 50, "height": 50 },
+      "text": { "value": "结束" }
+    }
+  ],
+  "edges": [
+    { "id": "e1", "sourceNodeId": "start", "targetNodeId": "apply", "properties": {} },
+    { "id": "e2", "sourceNodeId": "apply", "targetNodeId": "childReview", "properties": {} },
+    { "id": "e3", "sourceNodeId": "childReview", "targetNodeId": "end", "properties": {} }
+  ]
+}

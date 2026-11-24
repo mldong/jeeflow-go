@@ -393,12 +393,22 @@ func (r *Repository) FindDefineByID(ctx context.Context, id int64) (*model.Proce
 	return def, nil
 }
 
-// FindDefineByName 按流程编码查最新一条定义（id 倒序取首条，deploy 版本管理用）
+// FindDefineByName 按流程编码查最新一条定义（version desc,id desc，deploy 版本管理用）。
 func (r *Repository) FindDefineByName(ctx context.Context, name string) (*model.ProcessDefine, error) {
+	return r.FindDefineByNameAndVersion(ctx, name, nil)
+}
+
+// FindDefineByNameAndVersion 子流程定义定位（issues/257）；不附加 state 过滤。
+func (r *Repository) FindDefineByNameAndVersion(ctx context.Context, name string, version *int) (*model.ProcessDefine, error) {
 	c := r.conn(ctx)
-	row := c.QueryRowContext(ctx,
-		"SELECT id, name, display_name, type, state, content, version, create_time, create_user, update_time, update_user FROM wf_process_define WHERE name = ? ORDER BY version DESC LIMIT 1",
-		name)
+	query := "SELECT id, name, display_name, type, state, content, version, create_time, create_user, update_time, update_user FROM wf_process_define WHERE name = ?"
+	args := []interface{}{name}
+	if version != nil {
+		query += " AND version = ?"
+		args = append(args, *version)
+	}
+	query += " ORDER BY version DESC, id DESC LIMIT 1"
+	row := c.QueryRowContext(ctx, query, args...)
 	def := &model.ProcessDefine{}
 	var content []byte
 	err := row.Scan(&def.ID, &def.Name, &def.DisplayName, &nullStrScan{&def.Type}, &def.State, &content, &def.Version,

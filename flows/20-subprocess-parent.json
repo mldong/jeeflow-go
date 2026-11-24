@@ -1,0 +1,73 @@
+{
+  "name": "subprocess-parent",
+  "displayName": "父子流程-父",
+  "type": "approval",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "snaker:start",
+      "x": 100,
+      "y": 200,
+      "properties": { "width": 50, "height": 50 },
+      "text": { "value": "开始" }
+    },
+    {
+      "id": "apply",
+      "type": "snaker:task",
+      "x": 220,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "apply-form",
+        "assignee": "applicant",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": { "value": "发起申请" }
+    },
+    {
+      "id": "childNode",
+      "type": "snaker:subProcess",
+      "x": 360,
+      "y": 200,
+      "properties": {
+        "width": 120,
+        "height": 60,
+        "processName": "subprocess-child",
+        "version": 1,
+        "form": "__no_such_form__"
+      },
+      "text": { "value": "子审批" }
+    },
+    {
+      "id": "parentAfter",
+      "type": "snaker:task",
+      "x": 520,
+      "y": 200,
+      "properties": {
+        "width": 100,
+        "height": 50,
+        "form": "parent-after-form",
+        "assignee": "manager",
+        "taskType": 0,
+        "performType": 0
+      },
+      "text": { "value": "父流程后续审批" }
+    },
+    {
+      "id": "end",
+      "type": "snaker:end",
+      "x": 680,
+      "y": 200,
+      "properties": { "width": 50, "height": 50 },
+      "text": { "value": "结束" }
+    }
+  ],
+  "edges": [
+    { "id": "e1", "sourceNodeId": "start", "targetNodeId": "apply", "properties": {} },
+    { "id": "e2", "sourceNodeId": "apply", "targetNodeId": "childNode", "properties": {} },
+    { "id": "e3", "sourceNodeId": "childNode", "targetNodeId": "parentAfter", "properties": {} },
+    { "id": "e4", "sourceNodeId": "parentAfter", "targetNodeId": "end", "properties": {} }
+  ]
+}

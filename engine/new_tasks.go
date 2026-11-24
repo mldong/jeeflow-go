@@ -20,6 +20,36 @@ import (
 
 type newTasksSinkKey struct{}
 
+// persistedResultSinkKey 是 issues/257 的独立结果通道。子流程启动时，子任务已经由自己的
+// SaveNewTask INSERT 并 fire TASK_START；不得把它们追加进父 execution 的普通 newTasksSink，
+// 否则调用方/聚合收尾会再次持久化（主键冲突/码 3），事件也可能重复。需要 API 返回已持久化
+// 任务时，只在本通道追加副本，绝不进入普通持久化管线。
+type persistedResultSinkKey struct{}
+
+// withExecutionResultSinks 同时挂普通建单与“已由子实例持久化”的两个结果通道。
+// 公开执行 API 最终合并二者返回；持久化仍只认普通建单口的 SaveNewTask。
+func withExecutionResultSinks(ctx context.Context) (context.Context, *[]*model.ProcessTask, *[]*model.ProcessTask) {
+	cctx, newTasks := withNewTasksSink(ctx)
+	persisted := new([]*model.ProcessTask)
+	return context.WithValue(cctx, persistedResultSinkKey{}, persisted), newTasks, persisted
+}
+
+// executionResultTasks 对齐 Java Execution#getResultTasks：普通产出与已持久化子任务合并去重。
+// 子启动快照可能保留初始 DOING 副本，故只对 persisted 通道按主键重新水合；普通流程不增加读放大。
+func (e *EngineImpl) executionResultTasks(ctx context.Context, newTasks, persisted *[]*model.ProcessTask) ([]*model.ProcessTask, error) {
+	persistedTasks := uniquePersistedTasks(*persisted)
+	for i, task := range persistedTasks {
+		fresh, err := e.repo.FindTaskByID(ctx, task.ID)
+		if err != nil {
+			return nil, err
+		}
+		if fresh != nil {
+			persistedTasks[i] = fresh
+		}
+	}
+	return uniquePersistedTasks(newTasksOf(newTasks), persistedTasks), nil
+}
+
 // withNewTasksSink 给一次执行族调用挂上收集器，返回新 ctx 与 sink 句柄。
 func withNewTasksSink(ctx context.Context) (context.Context, *[]*model.ProcessTask) {
 	sink := new([]*model.ProcessTask)

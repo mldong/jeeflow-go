@@ -31,8 +31,8 @@ const unknownWarnMarker = "不在类型表里"
 
 // ─── ① 未知档：日志真发出来，且带 nodeId ＋ 实得类型串原文 ────────────────────
 
-// TestIssue141G4UnknownNodeTypeWarns 四种"不在表里"的实得类型串（子流程驼峰串／裸名／
-// 大小写拼错／缺 type 键），各自必须记**恰好一条**可诊断 WARNING，内容同时含
+// TestIssue141G4UnknownNodeTypeWarns 四种"不在表里"的实得类型串（裸名／大小写拼错／
+// 缺 type 键），各自必须记**恰好一条**可诊断 WARNING，内容同时含
 // 节点 id 与**逐字原文**；且流转行为不因这条日志而变（不打断、不建行、不越过）。
 //
 // 变异对照第 1 组（把日志行注释掉）当场红在这一格——那正是"零条日志"的病灶本身。
@@ -42,9 +42,7 @@ func TestIssue141G4UnknownNodeTypeWarns(t *testing.T) {
 		nodeID string
 		rawTyp string
 	}{
-		// 设计器实际输出的子流程串：spec/02:107-111 owner 2026-10-01 二拍「子流程暂不进契约面」
-		// ⇒ go 六栈按未知档暴露，这条日志就是它现状唯一的可诊断面。
-		{"subProcess驼峰串（go 无此档）", "sub1", "snaker:subProcess"},
+		{"子流程大小写拼错", "sub1", "snaker:subprocesS"},
 		// 裸名：本栈类型表只有 model/types.go:40-46 那七档 snaker:*，没有裸名档。
 		{"裸名 task（go 不剥前缀查表）", "bare", "task"},
 		// 大小写拼错：义务 1 的归一化未落地 ⇒ 仍是未知档，原文要打得出来才可诊断。

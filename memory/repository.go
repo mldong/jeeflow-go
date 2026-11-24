@@ -71,20 +71,28 @@ func (r *Repository) FindDefineByID(ctx context.Context, id int64) (*model.Proce
 	return &cp, nil
 }
 
-// FindDefineByName 按流程编码查最新一条定义（id 倒序取首条）
+// FindDefineByName 按流程编码查最新一条定义（version desc,id desc 取首条）。
+// 历史注释中的 id 倒序与 JDBC 实际 SQL 不一致，issues/257 一并校正两仓判据。
 func (r *Repository) FindDefineByName(ctx context.Context, name string) (*model.ProcessDefine, error) {
+	return r.FindDefineByNameAndVersion(ctx, name, nil)
+}
+
+func (r *Repository) FindDefineByNameAndVersion(ctx context.Context, name string, version *int) (*model.ProcessDefine, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	var latest *model.ProcessDefine
+	var found *model.ProcessDefine
 	for _, d := range r.defines {
-		if d.Name == name && (latest == nil || d.ID > latest.ID) {
-			latest = d
+		if d.Name != name || (version != nil && d.Version != *version) {
+			continue
+		}
+		if found == nil || d.Version > found.Version || (d.Version == found.Version && d.ID > found.ID) {
+			found = d
 		}
 	}
-	if latest == nil {
+	if found == nil {
 		return nil, nil
 	}
-	cp := *latest
+	cp := *found
 	return &cp, nil
 }
 

@@ -76,10 +76,15 @@ func (e *EngineImpl) InTx(ctx context.Context, fn func(ctx context.Context) erro
 // ─── Start ─────────────────────────────────────────────────────────────────────
 
 func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+	return e.startProcessInstance(ctx, defineID, operator, args, nil, "")
+}
+
+func (e *EngineImpl) startProcessInstance(ctx context.Context, defineID int64, operator string,
+	args map[string]interface{}, parentID *int64, parentNodeName string) (*model.ProcessInstance, error) {
 	var inst *model.ProcessInstance
 	err := e.InTx(ctx, func(ctx context.Context) error {
 		var err error
-		inst, err = e.startProcessInstanceByIDInner(ctx, defineID, operator, args)
+		inst, err = e.startProcessInstanceInner(ctx, defineID, operator, args, parentID, parentNodeName)
 		return err
 	})
 	if err != nil {
@@ -88,7 +93,8 @@ func (e *EngineImpl) StartProcessInstanceByID(ctx context.Context, defineID int6
 	return inst, nil
 }
 
-func (e *EngineImpl) startProcessInstanceByIDInner(ctx context.Context, defineID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
+func (e *EngineImpl) startProcessInstanceInner(ctx context.Context, defineID int64, operator string,
+	args map[string]interface{}, parentID *int64, parentNodeName string) (*model.ProcessInstance, error) {
 	def, err := e.repo.FindDefineByID(ctx, defineID)
 	if err != nil || def == nil {
 		return nil, fmt.Errorf("define not found: %d", defineID)
@@ -108,8 +114,10 @@ func (e *EngineImpl) startProcessInstanceByIDInner(ctx context.Context, defineID
 	e.addAutoGenTitle(def.DisplayName, vars)
 
 	now := e.now()
-	// 聚合根工厂创建实例
+	// 聚合根工厂创建实例；子流程启动与顶层发起复用同一实现，只多写父子定位两列。
 	inst := model.NewProcessInstance(e.nextID(), defineID, operator, vars, now)
+	inst.ParentID = parentID
+	inst.ParentNodeName = parentNodeName
 	// issues/137 A · 批二 §3-4（A 案）：实例级 expire_time ＝定义**顶层** expireTime 表达式的
 	// **求值结果**（时刻），不是原串。位置逐字对齐 java JeeflowEngineImpl:93-96——
 	// 聚合根创建之后、saveInstance 之前：发起腿此后不再有第二次 UpdateInstance（DOING 实例），
@@ -145,7 +153,7 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 	defer unlock()
 	// spec04 §完成任务 ⇒ 返回本次动作产出的任务行（基准＝java exec.getProcessTaskList()）。
 	// 收集器挂在进事务前的 ctx 上，InTx 派生的 ctx 一路带到唯一建单口 saveNewTask（见 new_tasks.go）。
-	cctx, sink := withNewTasksSink(ctx)
+	cctx, sink, persisted := withExecutionResultSinks(ctx)
 	err := e.InTx(cctx, func(ctx context.Context) error {
 		var err error
 		_, err = e.executeProcessTaskInner(ctx, taskID, operator, args)
@@ -154,7 +162,7 @@ func (e *EngineImpl) ExecuteProcessTask(ctx context.Context, taskID int64, opera
 	if err != nil {
 		return nil, err
 	}
-	return newTasksOf(sink), nil
+	return e.executionResultTasks(ctx, sink, persisted)
 }
 
 func (e *EngineImpl) executeProcessTaskInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
@@ -392,7 +400,7 @@ func syncTaskToAggregate(inst *model.ProcessInstance, task *model.ProcessTask) {
 // ─── Reject ────────────────────────────────────────────────────────────────────
 
 func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, operator string, args map[string]interface{}) ([]*model.ProcessTask, error) {
-	cctx, sink := withNewTasksSink(ctx)
+	cctx, sink, persisted := withExecutionResultSinks(ctx)
 	err := e.InTx(cctx, func(ctx context.Context) error {
 		var err error
 		_, err = e.executeAndJumpToEndInner(ctx, taskID, operator, args)
@@ -401,7 +409,7 @@ func (e *EngineImpl) ExecuteAndJumpToEnd(ctx context.Context, taskID int64, oper
 	if err != nil {
 		return nil, err
 	}
-	return newTasksOf(sink), nil
+	return e.executionResultTasks(ctx, sink, persisted)
 }
 
 func (e *EngineImpl) executeAndJumpToEndInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
@@ -415,7 +423,7 @@ func (e *EngineImpl) executeAndJumpToEndInner(ctx context.Context, taskID int64,
 	}
 	// §11.7 边界 2：跳转·回退档不挂抄送钩子（cc 钩子传 nil）——tf_ccActors 在这一档不建 cc、
 	// 不发 CC_CREATE，与 Java executeAndJumpToEnd（无 handleCcActors）同形。
-	task, inst, flow, _, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
+	task, inst, flow, vars, err := e.prepareExecuteTask(ctx, taskID, operator, args, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -426,6 +434,19 @@ func (e *EngineImpl) executeAndJumpToEndInner(ctx context.Context, taskID int64,
 	}
 	if err := e.abandonAddSignOnNode(ctx, flow, inst, task.TaskName, operator); err != nil {
 		return nil, err
+	}
+	// issues/257 裁决 C：子流程拒绝也经 EndProcessHandler 同链——先落子终态再播 END，
+	// 随后按 parentId/parentNodeName 回父推进。顶层拒绝保持既有直结形状，避免扩大回归面。
+	if inst.ParentID != nil {
+		endNode := findNodeByType(flow, model.TypeEnd)
+		if endNode == nil {
+			return nil, fmt.Errorf("no end node")
+		}
+		if err := e.endProcessNode(ctx, flow, inst, endNode, operator, vars, taskID); err != nil {
+			return nil, err
+		}
+		inst, _ = e.repo.FindInstanceByID(ctx, inst.ID)
+		return inst, nil
 	}
 	// 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
 	inst.Reject(e.now())
@@ -448,7 +469,7 @@ func (e *EngineImpl) executeAndJumpToEndInner(ctx context.Context, taskID int64,
 // ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）─────
 
 func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) ([]*model.ProcessTask, error) {
-	cctx, sink := withNewTasksSink(ctx)
+	cctx, sink, persisted := withExecutionResultSinks(ctx)
 	err := e.InTx(cctx, func(ctx context.Context) error {
 		var err error
 		_, err = e.executeAndJumpTaskInner(ctx, taskID, operator, args, targetTaskName)
@@ -457,7 +478,7 @@ func (e *EngineImpl) ExecuteAndJumpTask(ctx context.Context, taskID int64, opera
 	if err != nil {
 		return nil, err
 	}
-	return newTasksOf(sink), nil
+	return e.executionResultTasks(ctx, sink, persisted)
 }
 
 func (e *EngineImpl) executeAndJumpTaskInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}, targetTaskName string) (*model.ProcessInstance, error) {
@@ -529,7 +550,7 @@ func (e *EngineImpl) executeAndJumpTaskInner(ctx context.Context, taskID int64, 
 func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID int64, operator string, args map[string]interface{}) ([]*model.ProcessTask, error) {
 	unlock := e.lockInstanceByTask(taskID)
 	defer unlock()
-	cctx, sink := withNewTasksSink(ctx)
+	cctx, sink, persisted := withExecutionResultSinks(ctx)
 	err := e.InTx(cctx, func(ctx context.Context) error {
 		var err error
 		_, err = e.executeAndJumpToFirstTaskNodeInner(ctx, taskID, operator, args)
@@ -538,7 +559,7 @@ func (e *EngineImpl) ExecuteAndJumpToFirstTaskNode(ctx context.Context, taskID i
 	if err != nil {
 		return nil, err
 	}
-	return newTasksOf(sink), nil
+	return e.executionResultTasks(ctx, sink, persisted)
 }
 
 func (e *EngineImpl) executeAndJumpToFirstTaskNodeInner(ctx context.Context, taskID int64, operator string, args map[string]interface{}) (*model.ProcessInstance, error) {
@@ -662,6 +683,11 @@ func (e *EngineImpl) prepareExecuteTask(ctx context.Context, taskID int64, opera
 	// 一条已完成却无人能改的任务行（"报错且零写入"是这条链的硬要求，基准位置
 	// JeeflowEngineImpl.prepareExecution 里 validateSubmission 就钉在 completeTask 前一行）。
 	if err := validateAddSignSubmission(findNode(&flow, task.TaskName), task, args, operator); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	// issues/257：直接出边指向子流程时先查定义。必须排在 CompleteTask/UpdateTask 之前，
+	// 否则内存仓负向会留下“当前任务已办结但子实例没起来”的半提交状态。
+	if err := e.validateSubProcessTargets(ctx, &flow, findNode(&flow, task.TaskName)); err != nil {
 		return nil, nil, nil, nil, err
 	}
 
@@ -907,10 +933,14 @@ func (e *EngineImpl) rollbackToParent(ctx context.Context, flow *model.FlowModel
 	return nil
 }
 
-// canRejected 照 mldong-boot2 NodeModel.canRejected：自 current 的入边回溯，命中 parent 放行；
-// 来源是 fork/join/start 时**跳过该条入边、不再深入**（boot2 是 continue，不是穿透），
-// 其余来源节点递归下去。subprocess 在 boot2 里被注释掉，等同普通节点。
+// canRejected 对齐 SnakerFlow NodeModel.canRejected（issues/257 裁决 B）：自 current 的
+// 入边回溯，命中 parent 放行；fork/join/subprocess/start 来源跳过该入边、不再深入；
+// parent 是会签等非 ANY performType 时不可退。
 func canRejected(flow *model.FlowModel, currentID, parentID string) bool {
+	if parentNode := findNode(flow, parentID); parentNode != nil && parentNode.Type == model.TypeTask &&
+		!isNormalPerformType(parentNode.Properties["performType"]) {
+		return false
+	}
 	for _, edge := range flow.Edges {
 		if edge.TargetNodeID != currentID {
 			continue
@@ -922,7 +952,8 @@ func canRejected(flow *model.FlowModel, currentID, parentID string) bool {
 		if src == nil {
 			continue
 		}
-		if src.Type == model.TypeFork || src.Type == model.TypeJoin || src.Type == model.TypeStart {
+		if src.Type == model.TypeFork || src.Type == model.TypeJoin || src.Type == model.TypeStart ||
+			model.IsSubProcessType(src.Type) {
 			continue
 		}
 		if canRejected(flow, src.ID, parentID) {
@@ -930,6 +961,20 @@ func canRejected(flow *model.FlowModel, currentID, parentID string) bool {
 		}
 	}
 	return false
+}
+
+// isNormalPerformType 对齐 SnakerFlow 的 ANY/普通参与档：缺省与 0/NORMAL/ANY 可退，
+// 会签（1/ALL/COUNTERSIGN）及其他显式非普通档一律不可退。
+func isNormalPerformType(v interface{}) bool {
+	if v == nil {
+		return true
+	}
+	switch strings.ToUpper(strings.TrimSpace(fmt.Sprint(v))) {
+	case "", "0", "NORMAL", "ANY":
+		return true
+	default:
+		return false
+	}
 }
 
 // lineageVars 复活行的变量净化：剔控制类残留，保留 f_*/u_*/autoGenTitle/isFirstTaskNode。
@@ -1094,12 +1139,15 @@ func isKnownNodeType(t string) bool {
 		model.TypeFork, model.TypeJoin, model.TypeCustom:
 		return true
 	}
-	return false
+	return model.IsSubProcessType(t)
 }
 
 // executeNode 节点执行链。parentTaskID ＝本次 execution 刚办结的当前任务 id
 // （建单不变量 ①，逐层透传给 decision/fork/join 落到的任务节点；发起路径传 0）
 func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, inst *model.ProcessInstance, node *model.FlowNode, operator string, vars map[string]interface{}, parentTaskID int64) error {
+	if sub := subProcessModel(node); sub != nil {
+		return e.subProcessStartHandler(ctx, inst, sub, operator, vars)
+	}
 	// ── 未知档可诊断日志 · spec/02-flow-definition.md「类型键的三条义务」第 2 条（issues/141 G4）──
 	// 「类型不在表里时，必须记一条可诊断日志（带节点 id 与实得类型串）再决定跳过，不允许
 	// 『静默丢节点＋连带丢它的出边』」。
@@ -1181,6 +1229,10 @@ func (e *EngineImpl) executeNode(ctx context.Context, flow *model.FlowModel, ins
 		}
 		return nil
 	case model.TypeEnd:
+		if inst.ParentID != nil {
+			return e.endProcessNode(ctx, flow, inst, node, operator, vars, parentTaskID)
+		}
+		// 顶层流程保持既有结束形状；issues/257 的协办清场/回父链只作用于子实例。
 		// 对齐 Java EndProcessHandler：submitType=REJECT → Reject，否则 Finish
 		submitType, ok := inst.Variables[KeySubmitType]
 		if ok && toIntOf(submitType) == int(model.SubmitTypeReject) {
