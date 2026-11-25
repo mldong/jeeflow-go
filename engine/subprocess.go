@@ -137,11 +137,17 @@ func (e *EngineImpl) applyInitialTasks(ctx context.Context, instanceID int64, ap
 		if next := applyArgs[KeyProcessStartNextNodeOperator]; next != nil && fmt.Sprint(next) != "" {
 			applyArgs[KeyNextNodeOperator] = next
 		}
-		newTasks, err := e.ExecuteProcessTask(ctx, task.ID, KeyAutoExecute, applyArgs)
+		// 子任务仍在父事务内未提交，公开 ExecuteProcessTask 的后台查锁会退到 0 号锁并自锁；
+		// 这里复用当前事务的内层执行，结果仍走同一收集器返回。
+		cctx, sink, persisted := withExecutionResultSinks(ctx)
+		if _, err := e.executeProcessTaskInner(cctx, task.ID, KeyAutoExecute, applyArgs); err != nil {
+			return nil, err
+		}
+		tasks, err := e.executionResultTasks(cctx, sink, persisted)
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, newTasks...)
+		result = append(result, tasks...)
 	}
 	return result, nil
 }

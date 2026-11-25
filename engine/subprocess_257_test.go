@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mldong/jeeflow-go/memory"
 	"github.com/mldong/jeeflow-go/model"
@@ -31,6 +32,21 @@ type sub257Repo struct {
 }
 
 type sub257LegacyRepo struct{ spi.ProcessRepository }
+
+type sub257TxRepo struct{ *sub257Repo }
+
+type sub257TxCtxKey struct{}
+
+func (r *sub257TxRepo) WithTx(ctx context.Context, fn func(context.Context) error) error {
+	return fn(context.WithValue(ctx, sub257TxCtxKey{}, true))
+}
+
+func (r *sub257TxRepo) FindTaskByID(ctx context.Context, taskID int64) (*model.ProcessTask, error) {
+	if ctx == context.Background() {
+		return nil, nil
+	}
+	return r.sub257Repo.FindTaskByID(ctx, taskID)
+}
 
 func newSub257Harness() (*EngineImpl, *sub257Repo) {
 	repo := &sub257Repo{Repository: memory.New(), saveCalls: make(map[int64]int)}
@@ -394,6 +410,34 @@ func Test257ParentChildClosedLoopAndPersistedResults(t *testing.T) {
 	if sub257CountEvent(*events, EventProcessTaskStart, parent.ID, "parentAfter") != 1 || repo.saveCalls[parentAfter.ID] != 1 {
 		t.Error("parent outgoing edge/task executed more than once")
 	}
+}
+
+func Test257ChildApplyDoesNotReenterInstanceLock(t *testing.T) {
+	eng, repo := newSub257Harness()
+	sub257AddDefine(repo, "childLock257", 1, 1,
+		sub257Linear("childLock257", "", "start", "apply", "childReview", "end"))
+	parentDef := sub257AddDefine(repo, "parentLock257", 1, 1,
+		sub257Linear("parentLock257", "childLock257", "start", "apply", "subLock257", "parentAfter", "end"))
+	eng.repo = &sub257TxRepo{sub257Repo: repo}
+	parent, apply := sub257StartParent(t, eng, repo, parentDef)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := eng.ExecuteProcessTask(context.Background(), apply.ID, KeyAutoExecute,
+			map[string]interface{}{KeySubmitType: int(model.SubmitTypeApply)})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("execute parent apply: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("child apply reentered the unresolved 0 instance lock")
+	}
+	child := sub257OnlyChild(t, repo, parent.ID, "applicant")
+	sub257Task(t, repo, child.ID, "apply", model.TaskStateDone)
+	sub257Task(t, repo, child.ID, "childReview", model.TaskStateDoing)
 }
 
 func Test257NoApplySelfCompletesFirstTask(t *testing.T) {
