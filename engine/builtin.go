@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 
@@ -36,6 +37,10 @@ const (
 	HandlerFormUserDeptLeader = "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler"
 	// FormUserDeptMainLeaderAssignmentHandler 表单指定用户所属部门分管领导（顶级类）
 	HandlerFormUserDeptMainLeader = "com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler"
+	// FormDeptLeaderAssignmentHandler 表单指定部门负责人（顶级类，注册名逐字等于 Java FQN）
+	HandlerFormDeptLeader = "com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler"
+	// FormDeptMainLeaderAssignmentHandler 表单指定部门分管领导（顶级类）
+	HandlerFormDeptMainLeader = "com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler"
 )
 
 // 表单字段编号后缀正则（task_01 → task）
@@ -190,6 +195,68 @@ func (b *orgBase) byFormUser(node *model.FlowNode, inst *model.ProcessInstance, 
 	return b.byDept(b.deptIdOf(userID), main)
 }
 
+// ─── 表单指定部门 → 各部门负责人／分管领导（issues/258）────────────────────────
+
+// FormDeptLeaderAssignmentHandler 表单指定 1–N 个部门，取这些部门的负责人。
+type FormDeptLeaderAssignmentHandler struct{ orgBase }
+
+func (h *FormDeptLeaderAssignmentHandler) Assign(node *model.FlowNode, inst *model.ProcessInstance, operator string) []string {
+	return h.byFormDept(node, inst, false)
+}
+
+// FormDeptMainLeaderAssignmentHandler 表单指定 1–N 个部门，取这些部门的分管领导。
+type FormDeptMainLeaderAssignmentHandler struct{ orgBase }
+
+func (h *FormDeptMainLeaderAssignmentHandler) Assign(node *model.FlowNode, inst *model.ProcessInstance, operator string) []string {
+	return h.byFormDept(node, inst, true)
+}
+
+// byFormDept 表单字段 → 部门 id 列表 → 各部门领导（main=true 分管领导）。
+// 部门按输入顺序逐个取数，SPI 返回顺序即追加顺序；部门与最终 userId 均保序去重。
+// 字段缺失／值为空／部门无领导／SPI 未注册或返回错误／无节点 ⇒ 空结果，不报错。
+func (b *orgBase) byFormDept(node *model.FlowNode, inst *model.ProcessInstance, main bool) []string {
+	if node == nil || inst == nil || node.ID == "" || b.orgProv == nil {
+		return nil
+	}
+	deptIDs := formDeptIDs(findFormUserFieldValue(inst.Variables, node.ID))
+	if len(deptIDs) == 0 {
+		return nil
+	}
+	var userIDs []string
+	for _, deptID := range deptIDs {
+		userIDs = append(userIDs, b.byDept(deptID, main)...)
+	}
+	return spi.NormalizeActors(userIDs...)
+}
+
+// formDeptIDs 解析部门列表：字符串按英文逗号拆；数组逐元素读取，元素不二次拆逗号。
+// trim 后丢弃空值，"0" 合法；部门 id 去重并保留首次出现顺序。
+func formDeptIDs(v interface{}) []string {
+	var raw []string
+	switch t := v.(type) {
+	case nil:
+		return nil
+	case []string:
+		raw = append(raw, t...)
+	case []interface{}:
+		for _, item := range t {
+			if item != nil {
+				raw = append(raw, toString(item))
+			}
+		}
+	default:
+		rv := reflect.ValueOf(v)
+		if rv.IsValid() && (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) {
+			for i := 0; i < rv.Len(); i++ {
+				raw = append(raw, toString(rv.Index(i).Interface()))
+			}
+		} else {
+			raw = strings.Split(toString(v), ",")
+		}
+	}
+	return spi.NormalizeActors(raw...)
+}
+
 // ─── 注册 ───────────────────────────────────────────────────────────────────────
 
 // RegisterBuiltinAssignments 注册内置通用参与者处理器到注册表。
@@ -205,6 +272,8 @@ func RegisterBuiltinAssignments(reg *HandlerRegistry, userProv spi.UserProvider,
 	reg.RegisterAssignment(HandlerTaskRoleAssignee, &TaskRoleAssigneeHandler{orgProv: orgProv})
 	reg.RegisterAssignment(HandlerFormUserDeptLeader, &FormUserDeptLeaderAssignmentHandler{orgBase: base})
 	reg.RegisterAssignment(HandlerFormUserDeptMainLeader, &FormUserDeptMainLeaderAssignmentHandler{orgBase: base})
+	reg.RegisterAssignment(HandlerFormDeptLeader, &FormDeptLeaderAssignmentHandler{orgBase: base})
+	reg.RegisterAssignment(HandlerFormDeptMainLeader, &FormDeptMainLeaderAssignmentHandler{orgBase: base})
 }
 
 // ─── 工具 ───────────────────────────────────────────────────────────────────────
