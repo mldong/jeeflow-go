@@ -186,6 +186,13 @@ type OrgUserProvider interface {
 	FindByRole(roleCode string) ([]string, error)
 }
 
+// PostUserProvider 岗位成员查询 SPI（可选，issues/259）。
+// 独立于 OrgUserProvider，存量组织 provider 无需增加方法；未注册时岗位处理器返回空参与者。
+type PostUserProvider interface {
+	// FindByPost 按岗位编码取用户 ID 列表；岗位不存在或无成员时返回空列表。
+	FindByPost(postCode string) ([]string, error)
+}
+
 // IDGenerator ID 生成器
 type IDGenerator interface {
 	NextID() int64

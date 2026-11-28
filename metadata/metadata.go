@@ -111,7 +111,7 @@ type HandlerRegistry struct {
 }
 
 // NewHandlerRegistry 构造注册中心（构造即内置通用 AssignmentHandler 元数据：
-// v1.6.0 issues/16 的 7 个 ＋ 表单指定用户两个 ＋ 表单指定部门两个 ＝ 现读 builtinAssignmentMetas 的长度）
+// v1.6.0 issues/16 的 7 个 ＋ 表单指定用户两个 ＋ 表单指定部门两个 ＋ 岗位两个 ＝ 现读 builtinAssignmentMetas 的长度）
 func NewHandlerRegistry() *HandlerRegistry {
 	r := &HandlerRegistry{handlers: map[string][]HandlerMeta{}}
 	r.RegisterAll(builtinAssignmentMetas())
@@ -128,10 +128,12 @@ func builtinAssignmentMetas() []HandlerMeta {
 		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$DeptMainLeaderAssignmentHandler", DisplayName: "当前用户所属部门分管领导", Order: 40},
 		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.FormFieldAssigneeHandler", DisplayName: "根据表单字段值分配参与者", Order: 50},
 		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskRoleAssigneeHandler", DisplayName: "根据任务节点唯一编码关联角色分配参与者", Order: 60},
+		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskPostAssigneeHandler", DisplayName: "根据任务节点唯一编码关联岗位分配参与者", Order: 65},
 		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler", DisplayName: "表单指定用户所属部门经理", Order: 70},
 		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler", DisplayName: "表单指定用户所属部门分管领导", Order: 80},
 		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler", DisplayName: "表单指定部门负责人", Order: 90},
 		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler", DisplayName: "表单指定部门分管领导", Order: 100},
+		{Type: "AssignmentHandler", ClassName: "com.mldong.jeeflow.interceptor.impl.FormPostAssignmentHandler", DisplayName: "表单指定岗位分配参与者", Order: 110},
 	}
 }
 

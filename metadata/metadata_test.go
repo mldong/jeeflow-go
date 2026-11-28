@@ -73,9 +73,9 @@ func TestHandlerRegistry(t *testing.T) {
 	r.Register(HandlerMeta{Type: "FlowInterceptor", ClassName: "com.example.LogInterceptor", DisplayName: "日志记录", Order: 1, Group: "pre"})
 
 	assignments := r.ListHandlers("AssignmentHandler")
-	// 内置 11 个通用 handler（issues/16 的 7 个 ＋ 表单指定用户两个 ＋ 表单指定部门两个）+ 2 个自定义
-	if len(assignments) != 13 {
-		t.Fatalf("assignments = %d, want 13", len(assignments))
+	// 内置 13 个通用 handler（issues/16 的 7 个 ＋ 表单指定用户两个 ＋ 表单指定部门两个 ＋ 岗位两个）+ 2 个自定义
+	if len(assignments) != 15 {
+		t.Fatalf("assignments = %d, want 15", len(assignments))
 	}
 	if assignments[0].ClassName != "com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler" ||
 		assignments[0].DisplayName != "流程发起人" {
@@ -100,25 +100,54 @@ func TestHandlerRegistry(t *testing.T) {
 
 func TestEmptyRegistry(t *testing.T) {
 	r := NewHandlerRegistry()
-	// 构造即内置通用 handler 元数据（issues/16 七个 ＋ 表单指定用户两个 ＋ 表单指定部门两个），空注册表不再为空
+	// 构造即内置通用 handler 元数据（issues/16 七个 ＋ 表单指定用户两个 ＋ 表单指定部门两个 ＋ 岗位两个）。
 	list := r.ListHandlers("AssignmentHandler")
-	if len(list) != 11 {
-		t.Fatalf("want 11 builtin handlers, got %d: %v", len(list), list)
-	}
-	// 四个表单指定类排在 TaskRoleAssignee(60) 之后，注册名逐字等于 Java 顶级类 FQN（跨语言流程 JSON 通用）
 	want := []struct {
 		class, display string
-		order         int
+		order          int
 	}{
+		{"com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler", "流程发起人", -9999},
+		{"com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$ApplicantDeptLeaderAssignmentHandler", "发起人所属部门经理", 10},
+		{"com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$ApplicantDeptMainLeaderAssignmentHandler", "发起人所属部门分管领导", 20},
+		{"com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$DeptLeaderAssignmentHandler", "当前用户所属部门经理", 30},
+		{"com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$DeptMainLeaderAssignmentHandler", "当前用户所属部门分管领导", 40},
+		{"com.mldong.jeeflow.interceptor.impl.FormFieldAssigneeHandler", "根据表单字段值分配参与者", 50},
+		{"com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskRoleAssigneeHandler", "根据任务节点唯一编码关联角色分配参与者", 60},
+		{"com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskPostAssigneeHandler", "根据任务节点唯一编码关联岗位分配参与者", 65},
 		{"com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler", "表单指定用户所属部门经理", 70},
 		{"com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler", "表单指定用户所属部门分管领导", 80},
 		{"com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler", "表单指定部门负责人", 90},
 		{"com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler", "表单指定部门分管领导", 100},
+		{"com.mldong.jeeflow.interceptor.impl.FormPostAssignmentHandler", "表单指定岗位分配参与者", 110},
+	}
+	if len(list) != len(want) {
+		t.Fatalf("want %d builtin handlers, got %d: %v", len(want), len(list), list)
 	}
 	for i, w := range want {
-		m := list[7+i]
+		m := list[i]
 		if m.ClassName != w.class || m.DisplayName != w.display || m.Order != w.order {
-			t.Fatalf("list[%d] = %+v, want {%s %s %d}", 7+i, m, w.class, w.display, w.order)
+			t.Fatalf("list[%d] = %+v, want {%s %s %d}", i, m, w.class, w.display, w.order)
+		}
+	}
+}
+
+func TestPostAssignmentMetadata259(t *testing.T) {
+	list := NewHandlerRegistry().ListHandlers("AssignmentHandler")
+	if len(list) != 13 {
+		t.Fatalf("issues/259 后内置 AssignmentHandler 应为 13 个，实得 %d", len(list))
+	}
+	checks := []struct {
+		index          int
+		class, display string
+		order          int
+	}{
+		{7, "com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskPostAssigneeHandler", "根据任务节点唯一编码关联岗位分配参与者", 65},
+		{12, "com.mldong.jeeflow.interceptor.impl.FormPostAssignmentHandler", "表单指定岗位分配参与者", 110},
+	}
+	for _, c := range checks {
+		m := list[c.index]
+		if m.ClassName != c.class || m.DisplayName != c.display || m.Order != c.order {
+			t.Fatalf("list[%d] = %+v, want {%s %s %d}", c.index, m, c.class, c.display, c.order)
 		}
 	}
 }

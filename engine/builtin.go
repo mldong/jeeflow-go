@@ -33,6 +33,8 @@ const (
 	HandlerApplicantDeptMainLeader = orgHandlersPrefix + "ApplicantDeptMainLeaderAssignmentHandler"
 	// TaskRoleAssigneeHandler 任务节点唯一编码关联角色
 	HandlerTaskRoleAssignee = orgHandlersPrefix + "TaskRoleAssigneeHandler"
+	// TaskPostAssigneeHandler 任务节点唯一编码关联岗位
+	HandlerTaskPostAssignee = orgHandlersPrefix + "TaskPostAssigneeHandler"
 	// FormUserDeptLeaderAssignmentHandler 表单指定用户所属部门经理（顶级类，注册名逐字等于 Java FQN）
 	HandlerFormUserDeptLeader = "com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler"
 	// FormUserDeptMainLeaderAssignmentHandler 表单指定用户所属部门分管领导（顶级类）
@@ -41,6 +43,8 @@ const (
 	HandlerFormDeptLeader = "com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler"
 	// FormDeptMainLeaderAssignmentHandler 表单指定部门分管领导（顶级类）
 	HandlerFormDeptMainLeader = "com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler"
+	// FormPostAssignmentHandler 表单指定岗位分配参与者（顶级类，注册名逐字等于 Java FQN）
+	HandlerFormPostAssignment = "com.mldong.jeeflow.interceptor.impl.FormPostAssignmentHandler"
 )
 
 // 表单字段编号后缀正则（task_01 → task）
@@ -162,6 +166,23 @@ func (h *TaskRoleAssigneeHandler) Assign(node *model.FlowNode, inst *model.Proce
 	return nil
 }
 
+// TaskPostAssigneeHandler 任务节点唯一编码关联岗位（postCode = 节点 ID）。
+// Provider 返回顺序原样保留；节点为空、SPI 未注册、岗位无成员或查询失败均返回空参与者。
+type TaskPostAssigneeHandler struct {
+	postProv spi.PostUserProvider
+}
+
+func (h *TaskPostAssigneeHandler) Assign(node *model.FlowNode, inst *model.ProcessInstance, operator string) []string {
+	if node == nil || node.ID == "" || h.postProv == nil {
+		return nil
+	}
+	ids, err := h.postProv.FindByPost(node.ID)
+	if err != nil || len(ids) == 0 {
+		return nil
+	}
+	return ids
+}
+
 // ─── 表单指定用户 → 该用户所属部门领导 ──────────────────────────────────────────
 //
 // 场景（参照 mldong-fastapi-wf 提交 fe9233d）：HR 代员工提交、代理申请——表单里给出被代理人的
@@ -257,11 +278,124 @@ func formDeptIDs(v interface{}) []string {
 	return spi.NormalizeActors(raw...)
 }
 
+// ─── 表单指定岗位 → 岗位成员（issues/259）──────────────────────────────────────
+
+// FormPostAssignmentHandler 表单指定 1–N 个岗位，按岗位成员分配参与者。
+type FormPostAssignmentHandler struct {
+	postProv spi.PostUserProvider
+}
+
+func (h *FormPostAssignmentHandler) Assign(node *model.FlowNode, inst *model.ProcessInstance, operator string) []string {
+	if node == nil || inst == nil || node.ID == "" || h.postProv == nil {
+		return nil
+	}
+	postCodes := formPostCodes(findFormPostFieldValue(inst.Variables, node.ID))
+	if len(postCodes) == 0 {
+		return nil
+	}
+	var userIDs []string
+	for _, postCode := range postCodes {
+		ids, err := h.postProv.FindByPost(postCode)
+		if err != nil {
+			continue
+		}
+		userIDs = append(userIDs, ids...)
+	}
+	return spi.NormalizeActors(userIDs...)
+}
+
+// formPostCodes 解析岗位编码：字符串按英文逗号拆；数组/切片逐元素读取，元素不二次拆逗号。
+// trim 后丢弃空值，"0" 合法；岗位编码去重并保留首次出现顺序。
+func formPostCodes(v interface{}) []string {
+	var raw []string
+	switch t := v.(type) {
+	case nil:
+		return nil
+	case []string:
+		raw = append(raw, t...)
+	case []interface{}:
+		for _, item := range t {
+			if item != nil {
+				raw = append(raw, toString(item))
+			}
+		}
+	default:
+		rv := reflect.ValueOf(v)
+		if rv.IsValid() && (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) {
+			for i := 0; i < rv.Len(); i++ {
+				item := rv.Index(i)
+				if isNilValue(item) {
+					continue
+				}
+				raw = append(raw, toString(item.Interface()))
+			}
+		} else {
+			raw = strings.Split(toString(v), ",")
+		}
+	}
+	return spi.NormalizeActors(raw...)
+}
+
+// isNilValue 只供岗位数组/切片拆解使用：nil 元素按空编码丢弃，不得 fmt 成 "<nil>"。
+func isNilValue(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
+
+// findFormPostFieldValue 与 Java FormPostAssignSupport 共用的四档查找逐字对齐：
+//  1. f_<nodeKey>
+//  2. <nodeKey>
+//  3. nodeKey 含 # 时取最后一个 # 右侧 field：先裸名、再 f_<field>
+//  4. nodeKey 匹配 ^(.+?)_(\d+)$ 时取 base：先 f_<base>、再 <base>
+//
+// 键存在即命中，null 也命中后折空。本函数独立于旧 handler 的查找函数，确保 issues/259
+// 不改变既有 11 个 handler 的行为（例如旧函数对尾部空 # 字段的兼容语义保持原样）。
+func findFormPostFieldValue(vars map[string]interface{}, nodeKey string) interface{} {
+	if vars == nil || nodeKey == "" {
+		return nil
+	}
+	if v, ok := vars["f_"+nodeKey]; ok {
+		return v
+	}
+	if v, ok := vars[nodeKey]; ok {
+		return v
+	}
+	if i := strings.LastIndex(nodeKey, "#"); i >= 0 {
+		field := nodeKey[i+1:]
+		if field != "" {
+			if v, ok := vars[field]; ok {
+				return v
+			}
+			if v, ok := vars["f_"+field]; ok {
+				return v
+			}
+		}
+	}
+	if m := numberSuffixPattern.FindStringSubmatch(nodeKey); len(m) >= 2 {
+		if v, ok := vars["f_"+m[1]]; ok {
+			return v
+		}
+		if v, ok := vars[m[1]]; ok {
+			return v
+		}
+	}
+	return nil
+}
+
 // ─── 注册 ───────────────────────────────────────────────────────────────────────
 
 // RegisterBuiltinAssignments 注册内置通用参与者处理器到注册表。
 // 组织维度 handler 依赖 userProv/orgProv；纯引擎语义 handler 无需数据源。
-func RegisterBuiltinAssignments(reg *HandlerRegistry, userProv spi.UserProvider, orgProv spi.OrgUserProvider) {
+// postProv 为可选岗位 SPI：省略或传 nil 时两枚岗位处理器仍注册，但取人结果为空。
+func RegisterBuiltinAssignments(reg *HandlerRegistry, userProv spi.UserProvider, orgProv spi.OrgUserProvider, postProv ...spi.PostUserProvider) {
+	var provider spi.PostUserProvider
+	if len(postProv) > 0 {
+		provider = postProv[0]
+	}
 	reg.RegisterAssignment(HandlerOperatorAssignment, &OperatorAssignmentHandler{})
 	reg.RegisterAssignment(HandlerFormFieldAssignee, &FormFieldAssigneeHandler{})
 	base := orgBase{userProv: userProv, orgProv: orgProv}
@@ -270,10 +404,12 @@ func RegisterBuiltinAssignments(reg *HandlerRegistry, userProv spi.UserProvider,
 	reg.RegisterAssignment(HandlerApplicantDeptLeader, &ApplicantDeptLeaderAssignmentHandler{orgBase: base})
 	reg.RegisterAssignment(HandlerApplicantDeptMainLeader, &ApplicantDeptMainLeaderAssignmentHandler{orgBase: base})
 	reg.RegisterAssignment(HandlerTaskRoleAssignee, &TaskRoleAssigneeHandler{orgProv: orgProv})
+	reg.RegisterAssignment(HandlerTaskPostAssignee, &TaskPostAssigneeHandler{postProv: provider})
 	reg.RegisterAssignment(HandlerFormUserDeptLeader, &FormUserDeptLeaderAssignmentHandler{orgBase: base})
 	reg.RegisterAssignment(HandlerFormUserDeptMainLeader, &FormUserDeptMainLeaderAssignmentHandler{orgBase: base})
 	reg.RegisterAssignment(HandlerFormDeptLeader, &FormDeptLeaderAssignmentHandler{orgBase: base})
 	reg.RegisterAssignment(HandlerFormDeptMainLeader, &FormDeptMainLeaderAssignmentHandler{orgBase: base})
+	reg.RegisterAssignment(HandlerFormPostAssignment, &FormPostAssignmentHandler{postProv: provider})
 }
 
 // ─── 工具 ───────────────────────────────────────────────────────────────────────
